@@ -1,0 +1,28 @@
+# personal capture — real MAC + health data, never commit
+noisefit.pklg
+*.pklg
+# reference source (GPLv3) — not part of this project's release
+gb/
+# python env / artifacts
+venv/
+__pycache__/
+*.pyc
+data/
+dist/
+build/
+*.egg-info/
+# local databases / exports
+*.sqlite
+*.db
+# SDD / superpowers scratch workspace
+.superpowers/
+# internal design docs — embed the real device MAC and personal capture details
+docs/superpowers/
+# legacy RE workbench — superseded by the noiserep package, kept locally only
+/*.py
+proto/
+RE-LOG.md
+CAPTURE.md
+CLAUDE.md
+hr_log.jsonl
+*.jsonl
