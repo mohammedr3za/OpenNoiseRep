@@ -115,3 +115,23 @@ The [Gadgetbridge](https://gadgetbridge.org/) project's Xiaomi device support wa
 an invaluable reference for the transport layer and chunk framing. This project
 ships no Gadgetbridge-derived code; the decoders are written from the observed
 wire format.
+
+## Appendix: command frame bytes (from the capture)
+
+All frames are the Command envelope `f1 = type`, optional `f9` = parameters.
+
+- device info: `08 20`  (type 32)
+- data index:  `08 70 4a 03 e8 01 03`  (type 112, f9 = {f29: 3})
+- series:      `08 <type> 4a 13 0a 11 0a 0d 08 <year> 10 <month> 18 <day> 20 <h> 28 <m> 30 <s> 10 <metric>`
+  (type 113 = `0x71`, 115 = `0x73`; date shown is the fetch-since filter)
+- controls:    `08 75` (117), `08 7b 4a 03 e0 01 01` (123, f9 = {f28: 1}), `08 e8 01` (232)
+
+**Sync choreography** (no handshake): send 112 (index), then for each metric in
+`2,4,8,14,18,19,17,0,21,22,23,26,27,25,11,12` send 113 then 115, then send 123
+and 117 — after which the band pushes its `4097` files unsolicited.
+
+**Also observed (a separate connect/settings session, not the data sync):**
+`16`, `17` (config; 75-byte reply), `48` (time sync — carries a Unix epoch),
+and `4109` (`08 8d 20`) which explicitly requests a named file and gets a `4097`
+reply. These are not needed for the historical fetch but document the wider
+command set for later phases (time sync, targeted file fetch).
