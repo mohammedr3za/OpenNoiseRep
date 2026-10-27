@@ -83,15 +83,68 @@ def _decode(path: str, json_path: str | None) -> int:
     return 0
 
 
+def _parse_since(value):
+    import datetime
+    if value:
+        d = datetime.datetime.strptime(value, "%Y-%m-%d")
+        return d.replace(hour=0, minute=0, second=0, microsecond=0)
+    now = datetime.datetime.now()
+    return now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+async def _run_sync_async(name, since, want_files, debug):
+    from .ble.connection import connect
+    from .sync import run_sync
+    async with connect(name, debug=debug) as band:
+        return await run_sync(band, since, want_files=want_files)
+
+
+def _sync(name, since_str, out, no_files, verbose):
+    import asyncio
+    import datetime
+    from .sync import write_result
+    from .errors import BandNotFound, TransportError
+    since = _parse_since(since_str)
+    try:
+        result = asyncio.run(_run_sync_async(name, since, not no_files, verbose))
+    except BandNotFound as exc:
+        print(f"{exc}. Put the band on its charger, keep the phone's Bluetooth OFF, "
+              f"and retry.", file=sys.stderr)
+        return 3
+    except TransportError as exc:
+        print(f"transport error: {exc}", file=sys.stderr)
+        return 4
+    out_dir = out or f"data/{datetime.datetime.now():%Y%m%d-%H%M%S}"
+    write_result(result, out_dir)
+    if result.device:
+        d = result.device
+        print(f"device: fw {d.firmware}  model {d.model}  mac {d.mac}  serial {d.serial}")
+    if result.index:
+        print(f"index: {len(result.index.records)} records")
+    with_samples = [s for s in result.series if s.samples]
+    print(f"series: {len(result.series)} ({len(with_samples)} with samples)")
+    print(f"files: {len(result.files)}")
+    print(f"wrote {out_dir}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="noiserep")
     sub = parser.add_subparsers(dest="cmd", required=True)
     d = sub.add_parser("decode", help="decode a .pklg capture offline")
     d.add_argument("pklg")
     d.add_argument("--json", dest="json_path", default=None)
+    s = sub.add_parser("sync", help="fetch history from a live band over BLE")
+    s.add_argument("--since", dest="since", default=None, help="YYYY-MM-DD; default today")
+    s.add_argument("--name", dest="name", default="Noise_REP_33E3", help="advertised band name")
+    s.add_argument("--out", dest="out", default=None, help="output dir; default data/<ts>")
+    s.add_argument("--no-files", dest="no_files", action="store_true")
+    s.add_argument("-v", "--verbose", dest="verbose", action="store_true")
     args = parser.parse_args(argv)
     if args.cmd == "decode":
         return _decode(args.pklg, args.json_path)
+    if args.cmd == "sync":
+        return _sync(args.name, args.since, args.out, args.no_files, args.verbose)
     return 2
 
 
