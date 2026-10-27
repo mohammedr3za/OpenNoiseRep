@@ -12,6 +12,7 @@ dependencies = []
 
 [project.optional-dependencies]
 dev = ["pytest>=7"]
+ble = ["bleak>=0.20"]
 
 [project.scripts]
 noiserep = "noiserep.cli:main"
