@@ -1,7 +1,10 @@
 import asyncio
 import struct
 
+import pytest
+
 from noiserep.ble.transport import Band
+from noiserep.errors import TransportError
 
 WRITE = "16186f02-0000-1000-8000-00807f9b34fb"
 ACK_START = bytes([0, 0, 1, 1])
@@ -47,3 +50,42 @@ def test_band_initiated_transfer_reassembles_and_acks():
     assert payload == b"AAABBB"
     sent = [w[1] for w in writes]
     assert ACK_START in sent and ACK_END in sent
+
+
+def test_send_raises_transport_error_on_no_start_ack():
+    band = Band(FakeClient(), WRITE)
+    with pytest.raises(TransportError):
+        asyncio.run(band.send(b"x", timeout=0.05))
+
+
+def test_send_raises_transport_error_on_nack():
+    async def scenario():
+        band = Band(FakeClient(), WRITE)
+        task = asyncio.create_task(band.send(b"x"))
+        await asyncio.sleep(0)
+        await band._handle(WRITE, bytes([0, 0, 1, 2]))
+        with pytest.raises(TransportError):
+            await task
+
+    asyncio.run(scenario())
+
+
+def test_send_multi_chunk_payload():
+    payload = bytes(range(256))[:200] + bytes(100)   # 300 bytes
+    assert len(payload) == 300
+
+    async def scenario():
+        fc = FakeClient()
+        band = Band(fc, WRITE)
+        task = asyncio.create_task(band.send(payload))
+        await asyncio.sleep(0)
+        await band._handle(WRITE, ACK_START)
+        await task
+        return fc.writes
+
+    writes = [w[1] for w in asyncio.run(scenario())]
+    assert len(writes) == 3
+    assert writes[0] == struct.pack("<HBBH", 0, 0, 0, 2)
+    assert writes[1] == struct.pack("<H", 1) + payload[:242]
+    assert writes[2] == struct.pack("<H", 2) + payload[242:]
+    assert len(payload[242:]) == 58

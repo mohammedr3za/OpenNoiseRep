@@ -1,5 +1,6 @@
 """Builders for the confirmed Noise REP command frames. Every frame here was
-lifted byte-for-byte from a real NoiseFit sync and verified live. Frames are
+lifted byte-for-byte from a real NoiseFit sync capture and verified byte-exact
+against it. Frames are
 the protobuf Command envelope: field 1 is the command type, field 9 carries
 parameters."""
 from __future__ import annotations

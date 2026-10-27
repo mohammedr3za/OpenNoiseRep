@@ -104,7 +104,11 @@ def _sync(name, since_str, out, no_files, verbose):
     import datetime
     from .sync import write_result
     from .errors import BandNotFound, TransportError
-    since = _parse_since(since_str)
+    try:
+        since = _parse_since(since_str)
+    except ValueError:
+        print(f"invalid --since '{since_str}': expected YYYY-MM-DD", file=sys.stderr)
+        return 2
     try:
         result = asyncio.run(_run_sync_async(name, since, not no_files, verbose))
     except BandNotFound as exc:
@@ -116,10 +120,10 @@ def _sync(name, since_str, out, no_files, verbose):
         return 4
     out_dir = out or f"data/{datetime.datetime.now():%Y%m%d-%H%M%S}"
     write_result(result, out_dir)
-    if result.device:
+    if result.device is not None:
         d = result.device
         print(f"device: fw {d.firmware}  model {d.model}  mac {d.mac}  serial {d.serial}")
-    if result.index:
+    if result.index is not None:
         print(f"index: {len(result.index.records)} records")
     with_samples = [s for s in result.series if s.samples]
     print(f"series: {len(result.series)} ({len(with_samples)} with samples)")

@@ -14,6 +14,12 @@ def test_sync_reports_band_not_found(monkeypatch, capsys):
     assert "not found" in err and "charger" in err.lower()
 
 
+def test_sync_invalid_since_returns_2(capsys):
+    rc = cli.main(["sync", "--since", "2026-13-40"])
+    assert rc == 2
+    assert "invalid" in capsys.readouterr().err
+
+
 def test_parse_since_defaults_to_today_midnight():
     dt = cli._parse_since(None)
     assert dt.hour == 0 and dt.minute == 0 and dt.second == 0

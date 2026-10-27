@@ -23,9 +23,12 @@ class Band:
         self._nack = False
         self._streams: dict[object, dict] = {}
         self.msgs: asyncio.Queue = asyncio.Queue()
+        self._tasks: set = set()
 
     def on_notify(self, src, data: bytes) -> None:
-        asyncio.create_task(self._handle(src, bytes(data)))
+        t = asyncio.create_task(self._handle(src, bytes(data)))
+        self._tasks.add(t)
+        t.add_done_callback(self._tasks.discard)
 
     async def _handle(self, src, data: bytes) -> None:
         if self.debug:
