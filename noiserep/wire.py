@@ -3,6 +3,8 @@ Command envelope but overloads/extends its nested fields, so decoding is done
 by raw field-walking rather than a fixed schema."""
 from __future__ import annotations
 
+from typing import Iterable
+
 
 def read_varint(buf: bytes, pos: int) -> tuple[int, int]:
     shift = result = 0
@@ -63,3 +65,34 @@ def sub(buf: bytes, *path: int) -> bytes | None:
         if cur is None:
             return None
     return cur if isinstance(cur, (bytes, bytearray)) else None
+
+
+def write_varint(value: int) -> bytes:
+    if value < 0:
+        raise ValueError("varint cannot encode a negative value")
+    out = bytearray()
+    while True:
+        byte = value & 0x7F
+        value >>= 7
+        if value:
+            out.append(byte | 0x80)
+        else:
+            out.append(byte)
+            return bytes(out)
+
+
+def encode(fields: Iterable[tuple[int, "int | bytes"]]) -> bytes:
+    out = bytearray()
+    for fno, val in fields:
+        if isinstance(val, bool):
+            raise TypeError("bool is not a valid field value")
+        if isinstance(val, int):
+            out += write_varint((fno << 3) | 0)
+            out += write_varint(val)
+        elif isinstance(val, (bytes, bytearray)):
+            out += write_varint((fno << 3) | 2)
+            out += write_varint(len(val))
+            out += bytes(val)
+        else:
+            raise TypeError(f"field {fno}: unsupported value type {type(val).__name__}")
+    return bytes(out)
