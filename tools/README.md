@@ -31,6 +31,8 @@ Other Makefile targets:
 ```sh
 make test                   # pytest -q
 make gui                    # launch the desktop app
+make app                    # install /Applications/OpenNoiseRep.app (macOS)
+make app ARGS=--menubar     # ...plus "OpenNoiseRep Menu Bar.app"
 make sync ARGS="--since 2026-10-01 --no-files"
 make clean                  # remove __pycache__ / .pytest_cache, never data or venv
 ```

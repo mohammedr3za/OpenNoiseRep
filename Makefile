@@ -2,7 +2,7 @@
 #   make check PYTHON=/path/to/python
 PYTHON ?= ./venv/bin/python
 
-.PHONY: check test gui sync clean
+.PHONY: check test gui app sync clean
 
 check:            ## compile, tests, and CLI/decode/BLE/GUI smoke checks
 	$(PYTHON) tools/check.py
@@ -12,6 +12,9 @@ test:             ## run the pytest suite
 
 gui:              ## launch the desktop app
 	$(PYTHON) -m noiserep.cli gui
+
+app:              ## install /Applications/OpenNoiseRep.app (macOS); ARGS="--menubar"
+	$(PYTHON) tools/make_mac_app.py $(ARGS)
 
 sync:             ## fetch from the band; e.g. make sync ARGS="--since 2026-10-01"
 	$(PYTHON) -m noiserep.cli sync $(ARGS)
