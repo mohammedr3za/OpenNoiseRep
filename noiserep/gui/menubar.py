@@ -192,6 +192,7 @@ class MenubarApp(QtCore.QObject):
         self._status_item = None
         self._status_button = None
         self._status_target = None
+        self._native_menu_items: dict[str, object] = {}
         self._native_images: dict[bool, object] = {}
         if with_tray:
             self._create_tray()
@@ -219,7 +220,7 @@ class MenubarApp(QtCore.QObject):
     def _create_native_status_item(self) -> None:
         import objc
         from AppKit import (
-            NSFont, NSImage, NSImageLeft, NSObject, NSStatusBar,
+            NSFont, NSImageLeft, NSObject, NSStatusBar,
             NSVariableStatusItemLength,
         )
 
@@ -231,8 +232,20 @@ class MenubarApp(QtCore.QObject):
                 self._app = app
                 return self
 
-            def showMenu_(self, sender):
-                QtCore.QTimer.singleShot(0, self._app._popup_menu)
+            def connect_(self, sender):
+                QtCore.QTimer.singleShot(0, self._app._on_connect_action)
+
+            def sync_(self, sender):
+                QtCore.QTimer.singleShot(0, self._app.sync_now)
+
+            def toggleLock_(self, sender):
+                QtCore.QTimer.singleShot(0, self._app._toggle_away_lock)
+
+            def open_(self, sender):
+                QtCore.QTimer.singleShot(0, self._app.open_main_window)
+
+            def quit_(self, sender):
+                QtCore.QTimer.singleShot(0, self._app.quit)
 
         item = NSStatusBar.systemStatusBar().statusItemWithLength_(
             NSVariableStatusItemLength)
@@ -241,11 +254,95 @@ class MenubarApp(QtCore.QObject):
         button.setFont_(NSFont.menuBarFontOfSize_(0))
         button.setToolTip_("NoiseREP")
         self._status_target = _Target.alloc().initWithApp_(self)
-        button.setTarget_(self._status_target)
-        button.setAction_("showMenu:")
         self._status_item = item
         self._status_button = button
+        # A real NSMenu on the status item (not a Qt QMenu popup) is what makes
+        # the menu work while another app is in full screen, and it gets the
+        # native icons/checkmarks/key equivalents for free.
+        button.setMenu_(self._build_native_menu())
         item.setVisible_(True)
+
+    def _build_native_menu(self):
+        from AppKit import (
+            NSEventModifierFlagCommand, NSMenu, NSMenuItem,
+        )
+
+        menu = NSMenu.alloc().init()
+        menu.setAutoenablesItems_(False)
+        target = self._status_target
+
+        def add(key, title, action=None, shortcut="", icon=None,
+                enabled=True, checkable=False, checked=False):
+            item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                title, action, shortcut)
+            if action is not None:
+                item.setTarget_(target)
+            if shortcut:
+                item.setKeyEquivalentModifierMask_(NSEventModifierFlagCommand)
+            if icon:
+                item.setImage_(self._symbol_image(icon))
+            if checkable:
+                item.setState_(1 if checked else 0)
+            item.setEnabled_(enabled)
+            menu.addItem_(item)
+            self._native_menu_items[key] = item
+            return item
+
+        add("header", "♥ —", icon="heart.fill", enabled=False)
+        add("source", "Source: —", enabled=False)
+        add("status", self._status, enabled=False)
+        menu.addItem_(NSMenuItem.separatorItem())
+        add("connect", "Connect", b"connect:", icon="link")
+        add("sync", "Sync now", b"sync:", shortcut="r",
+            icon="arrow.triangle.2.circlepath", enabled=False)
+        add("lock", "Lock Mac when band goes away", b"toggleLock:",
+            icon="lock", checkable=True, checked=self.lock_on_away)
+        menu.addItem_(NSMenuItem.separatorItem())
+        add("open", "Open main window", b"open:", shortcut="o",
+            icon="macwindow")
+        add("quit", "Quit NoiseREP", b"quit:", shortcut="q", icon="power")
+        return menu
+
+    def _symbol_image(self, name: str):
+        from AppKit import NSImage
+        try:
+            image = NSImage.imageWithSystemSymbolName_accessibilityDescription_(
+                name, name)
+        except Exception:            # older macOS without SF Symbols
+            return None
+        if image is not None:
+            image.setTemplate_(True)
+        return image
+
+    def _toggle_away_lock(self) -> None:
+        self._set_lock_on_away(not self.lock_on_away)
+        self._render(force=True)
+
+    def _update_native_menu(self) -> None:
+        items = self._native_menu_items
+        if not items:
+            return
+        filled = self._connected and self._hr is not None
+        items["header"].setTitle_(
+            format_title(self._hr, self._connected, self._removed))
+        items["header"].setImage_(self._native_image(filled))
+        items["source"].setTitle_(self._source_text())
+        items["status"].setTitle_(self._status)
+
+        if self._connecting:
+            connect_text, connect_enabled = "Connecting…", False
+        elif self._connected:
+            connect_text, connect_enabled = "Disconnect", True
+        else:
+            connect_text, connect_enabled = "Connect", not self._syncing
+        items["connect"].setTitle_(connect_text)
+        items["connect"].setEnabled_(connect_enabled)
+
+        items["sync"].setTitle_("Syncing…" if self._syncing else "Sync now")
+        items["sync"].setEnabled_(self._connected and not self._syncing)
+        items["lock"].setState_(1 if self.lock_on_away else 0)
+        items["open"].setEnabled_(True)
+        items["quit"].setEnabled_(not self._quitting)
 
     def _popup_menu(self) -> None:
         self.menu.popup(QtGui.QCursor.pos())
@@ -371,6 +468,7 @@ class MenubarApp(QtCore.QObject):
 
         if self._status_item is not None:
             self._update_native_status()
+            self._update_native_menu()
         if self.tray is not None:
             self.tray.setIcon(
                 make_icon(self._connected, self._hr, self._removed))
