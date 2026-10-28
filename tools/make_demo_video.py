@@ -69,37 +69,45 @@ def _menu_frame() -> QtGui.QPixmap:
 
 
 def _frames(window: MainWindow, store) -> list[tuple[QtGui.QPixmap, str, float]]:
+    app = QtWidgets.QApplication.instance()
     frames: list[tuple[QtGui.QPixmap, str, float]] = []
+
+    def snap() -> QtGui.QPixmap:
+        # Flush layout/paint before grabbing; otherwise the first frame can be
+        # an empty page with only the greeting painted.
+        app.processEvents()
+        app.processEvents()
+        return window.grab()
 
     window._show_overview()
     window.resize(WIDTH, HEIGHT)
     window.range_combo.setCurrentIndex(0)          # Today
     window._load()
-    frames.append((window.grab(), "Sync once. See your day.", 2.6))
+    frames.append((snap(), "Sync once. See your day.", 3.4))
 
     scroll = window.stack.widget(0)
     scroll.verticalScrollBar().setValue(560)
-    frames.append((window.grab(),
+    frames.append((snap(),
                    "Vitals: HRV, resting HR, SpO2, temp, stress", 2.8))
     scroll.verticalScrollBar().setValue(0)
 
     window._open_vital_detail("hrv")
-    frames.append((window.grab(),
+    frames.append((snap(),
                    "Tap a vital for meaning and usual range", 2.8))
 
     window._show_overview()
     session = store.sleep_sessions()[-1]
     window._open_sleep_detail(session)
-    frames.append((window.grab(),
+    frames.append((snap(),
                    "Last night: HR, HRV and coverage", 2.8))
 
     window._show_overview()
     window.range_combo.setCurrentIndex(1)          # Day…
-    frames.append((window.grab(),
+    frames.append((snap(),
                    "Any day: calendar and previous/next", 2.8))
 
     window._show_guide()
-    frames.append((window.grab(), "The menu-bar icon, explained", 2.6))
+    frames.append((snap(), "The menu-bar icon, explained", 2.6))
 
     window._show_overview()
     frames.append((_menu_frame(), "Menu-bar heart rate", 2.6))
