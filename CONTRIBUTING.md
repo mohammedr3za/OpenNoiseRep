@@ -1,6 +1,6 @@
 # Contributing to noiserep
 
-Thanks for your interest! This project reverse-engineers the Noise REP band, so
+Thanks for your interest! This project reverse-engineers the Noise REP band as the Native Band app gives you limited development, so
 protocol findings are as valuable as code.
 
 ## Development setup
