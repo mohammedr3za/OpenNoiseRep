@@ -125,6 +125,7 @@ def build(argv: list[str] | None = None) -> int:
                 # Both packages select backends/plugins at import time.
                 "--collect-submodules", "pyqtgraph",
                 "--collect-submodules", "qasync",
+                "--collect-data", "noiserep",
                 "--hidden-import", "noiserep.gui.app",
             ]
             if sys.platform == "darwin":

@@ -30,6 +30,17 @@ async def find_band(scanner, name: str | None, timeout: float):
             raise BandNotFound(f"band '{name}' not found")
         return device
 
+    finder = getattr(scanner, "find_device_by_filter", None)
+    if finder is not None:
+        # Return on the first advertisement instead of scanning the whole
+        # timeout. ponytail: first band seen wins; use --name with two bands.
+        device = await finder(
+            lambda d, adv: (d.name or adv.local_name or "").startswith(BAND_PREFIX),
+            timeout=timeout)
+        if device is None:
+            raise BandNotFound(f"no {BAND_PREFIX}* band found")
+        return device
+
     devices = await scanner.discover(timeout=timeout)
     matches = sorted(
         (d for d in devices if (getattr(d, "name", None) or "").startswith(BAND_PREFIX)),
@@ -69,6 +80,7 @@ async def connect(name: str | None = None, scan_timeout: float = 20.0,
     await client.__aenter__()
     try:
         band = Band(client, WRITE_UUID, debug=debug)
+        band.name = getattr(device, "name", None)
         for uuid in (READ_UUID, WRITE_UUID, ACT_UUID):
             await client.start_notify(
                 uuid,

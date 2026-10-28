@@ -99,6 +99,7 @@ def build_qss(macos: bool | None = None) -> str:
     string for the host platform.
     """
     native = is_macos() if macos is None else macos
+    glass = "rgba(28,28,30,245)" if mode == "dark" else "rgba(255,255,255,245)"
 
     # Any bare QWidget rule also matches QComboBox/QToolButton and switches
     # them to Qt's stylesheet renderer, losing AppKit's chrome.  On macOS it
@@ -129,19 +130,20 @@ QLabel#shortcuts {{ color: {FG_MUTED}; font-size: 10px; }}
 
 /* app bar */
 QFrame#appbar {{ background: {PANEL}; border-bottom: 1px solid {BORDER}; }}
-QLabel#appName {{ font-size: 17px; font-weight: 700; color: {FG}; }}
+QLabel#appName {{ font-size: 18px; font-weight: 700; color: {FG};
+    letter-spacing: -0.3px; }}
 QLabel#appTag {{ font-size: 10px; font-weight: 600; color: {FG_MUTED};
     letter-spacing: 1.4px; }}
 QLabel#brandDot {{ font-size: 18px; color: {ACCENT}; }}
 QLabel#devicePill {{ color: {FG_MUTED}; font-size: 11px; }}
-QFrame#devicePill {{ background: {PANEL_HOVER}; border: 1px solid {BORDER};
-    border-radius: 11px; }}
+QFrame#devicePill {{ background: {PANEL_HOVER}; border: none;
+    border-radius: 13px; }}
 QLabel#bandDot {{ font-size: 11px; color: {FG_MUTED}; }}
 QLabel#bandDot[state="live"] {{ color: {RECOVERY_GOOD}; }}
 QLabel#bandDot[state="charging"] {{ color: {RECOVERY_MID}; }}
 QLabel#bandDot[state="searching"] {{ color: {FOCUS}; }}
 QLabel#bandDot[state="idle"] {{ color: {FG_MUTED}; }}
-QLabel#bandState {{ color: {FG}; font-size: 11px; font-weight: 600; }}
+QLabel#bandState {{ color: {FG}; font-size: 12px; font-weight: 600; }}
 QFrame#liveStrip {{ background: {PANEL}; border-bottom: 1px solid {BORDER}; }}
 QLabel#liveHeart {{ color: {HEART}; font-size: 26px; }}
 QLabel#liveValue {{ color: {FG}; font-size: 22px; font-weight: 650; }}
@@ -156,17 +158,21 @@ QFrame#todayCard {{ background: {PANEL}; border: 1px solid {BORDER};
 QPushButton#pillBtn {{ background: {PANEL}; color: {FG}; border: 1px solid {BORDER};
     border-radius: 15px; padding: 5px 14px; font-size: 13px; font-weight: 600; }}
 QPushButton#pillBtn:hover {{ background: {PANEL_HOVER}; }}
+QFrame#segmented {{ background: {PANEL_HOVER}; border-radius: 12px; }}
 QPushButton#navTab {{ background: transparent; color: {FG_MUTED}; border: none;
-    border-radius: 14px; padding: 6px 16px; font-size: 13px; font-weight: 600; }}
-QPushButton#navTab:checked {{ background: {PANEL_HOVER}; color: {FG}; }}
+    border-radius: 9px; padding: 6px 18px; font-size: 13px; font-weight: 600; }}
+QPushButton#navTab:checked {{ background: {PANEL}; color: {FG}; }}
 QPushButton#navTab:hover {{ color: {FG}; }}
+QPushButton#navTab:focus {{ border: none; }}
 QPushButton#liveBtn, QPushButton#themeBtn {{ background: transparent;
     color: {FG}; border: 1px solid {BORDER}; border-radius: 10px;
     padding: 7px 13px; font-size: 13px; }}
 QPushButton#liveBtn:hover, QPushButton#themeBtn:hover {{ background: {PANEL_HOVER}; }}
 QPushButton#liveBtn[active="true"] {{ background: {ACCENT_FILL}; color: {HEART};
     border: 1px solid {HEART}; font-weight: 600; }}
-QPushButton#themeBtn {{ padding: 7px 11px; }}
+QPushButton#themeBtn {{ padding: 0; border-radius: 19px; font-size: 16px;
+    background: {PANEL_HOVER}; border: none; }}
+QPushButton#themeBtn:hover {{ background: {BORDER}; }}
 QLabel#syncPct {{ color: {ACCENT}; font-size: 12px; font-weight: 600; }}
 
 /* icon guide */
@@ -261,15 +267,33 @@ QPushButton:pressed {{ background: {BORDER}; }}
 QPushButton:disabled {{ color: {FG_MUTED}; background: {BG}; }}
 QPushButton:focus {{ border: 2px solid {FOCUS}; }}
 
-QPushButton#primary {{ background: {ACCENT_DEEP}; color: {ON_ACCENT};
-    border: 2px solid {ACCENT_DEEP}; font-weight: 600; padding: 9px 18px;
-    border-radius: 11px; }}
-QPushButton#primary:hover {{ background: {ACCENT_DEEP_HOVER};
-    border-color: {ACCENT_DEEP_HOVER}; }}
-QPushButton#primary:pressed {{ background: {ACCENT_DEEP_HOVER}; }}
+QPushButton#primary {{ background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+    stop:0 {ACCENT_HOVER}, stop:1 {ACCENT}); color: {ON_ACCENT};
+    border: none; font-weight: 600; font-size: 13px; padding: 9px 20px;
+    border-radius: 19px; }}
+QPushButton#primary:hover {{ background: {ACCENT_HOVER}; }}
+QPushButton#primary:pressed {{ background: {ACCENT}; padding-top: 10px;
+    padding-bottom: 8px; }}
 QPushButton#primary:disabled {{ background: {PANEL_HOVER};
     border-color: {BORDER}; color: {FG_MUTED}; }}
 QPushButton#primary:focus {{ border: 2px solid {FOCUS}; }}
+
+/* settings */
+QLabel#pageTitle {{ font-size: 34px; font-weight: 700; color: {FG}; }}
+QFrame#settingsCard {{ background: {PANEL}; border: 1px solid {BORDER};
+    border-radius: 18px; }}
+QLabel#settingsHead {{ font-size: 16px; font-weight: 600; color: {FG}; }}
+QLabel#settingsNote {{ font-size: 13px; color: {FG_MUTED}; }}
+QLabel#settingsStep {{ font-size: 13px; color: {FG}; padding: 2px 0; }}
+QLabel#settingValue {{ font-size: 13px; color: {FG}; font-weight: 600; }}
+QFrame#settingsCard QPushButton, QFrame#settingsCard QToolButton {{
+    background: {PANEL_HOVER}; color: {FG}; border: none; border-radius: 17px;
+    padding: 8px 18px; font-size: 13px; font-weight: 600; }}
+QFrame#settingsCard QPushButton:hover, QFrame#settingsCard QToolButton:hover {{
+    background: {BORDER}; }}
+QFrame#settingsCard QPushButton[active="true"] {{ background: {HEART};
+    color: #FFFFFF; }}
+QFrame#settingsCard QToolButton::menu-indicator {{ image: none; width: 0; }}
 
 QPushButton#backBtn {{ background: transparent; border: 1px solid transparent;
     color: {FG}; padding: 6px 12px; text-align: left; border-radius: 9px;
@@ -287,7 +311,7 @@ QPushButton#linkBtn:focus {{ border: 1px solid {FOCUS}; }}
     if not native:
         qss += f"""
 /* menus and dropdowns: AppKit draws these on macOS */
-QMenu {{ background: {PANEL}; border: 1px solid {BORDER}; padding: 5px;
+QMenu {{ background: {glass}; border: 1px solid {BORDER}; padding: 7px;
     border-radius: 10px; }}
 QMenu::item {{ padding: 7px 24px 7px 14px; border-radius: 7px; color: {FG}; }}
 QMenu::item:selected {{ background: {PANEL_HOVER}; }}
@@ -297,9 +321,9 @@ QComboBox {{ background: {PANEL}; color: {FG}; border: 1px solid {BORDER};
     border-radius: 10px; padding: 6px 9px; min-height: 20px; }}
 QComboBox:focus {{ border: 2px solid {FOCUS}; }}
 QComboBox::drop-down {{ border: none; width: 22px; }}
-QComboBox QAbstractItemView {{ background: {PANEL}; color: {FG};
+QComboBox QAbstractItemView {{ background: {glass}; color: {FG};
     selection-background-color: {PANEL_HOVER}; border: 1px solid {BORDER};
-    outline: 0; padding: 3px; }}
+    outline: 0; padding: 6px; border-radius: 10px; }}
 
 /* the Export menu button gets a custom frame only off macOS */
 QToolButton#ghost {{ background: transparent; color: {FG};
@@ -328,8 +352,8 @@ QScrollBar:horizontal {{ background: transparent; height: 9px; margin: 0; }}
 QScrollBar::handle:horizontal {{ background: {BORDER}; border-radius: 4px;
     min-width: 24px; }}
 QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{ width: 0; }}
-QToolTip {{ background: {PANEL}; color: {FG}; font-size: 13px;
-    border: 1px solid {BORDER}; padding: 5px 7px; }}
+QToolTip {{ background: {glass}; color: {FG}; font-size: 12px;
+    border: 1px solid {BORDER}; border-radius: 8px; padding: 8px 11px; }}
 
 /* progress */
 QProgressBar {{ background: {PANEL_HOVER}; border: none; border-radius: 2px;

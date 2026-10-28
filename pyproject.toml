@@ -67,3 +67,6 @@ testpaths = ["tests"]
 # -ra keeps skips visible: capture-dependent tests skip without a local .pklg,
 # and GUI tests skip when PySide6/pyqtgraph/qasync are not installed.
 addopts = "-ra"
+
+[tool.setuptools.package-data]
+"noiserep.gui" = ["assets/*.png"]

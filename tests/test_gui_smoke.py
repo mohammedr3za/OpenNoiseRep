@@ -340,6 +340,7 @@ def test_range_modes_caption_and_custom_dates():
 
 def test_day_mode_has_calendar_and_prev_next():
     w = _window()
+    w._show_home("metrics")
     w.range_combo.setCurrentIndex(1)     # Day…
     assert w._range_mode == "day"
     assert not w.day_date.isHidden()
@@ -508,10 +509,10 @@ def test_theme_switch_rebuilds_today_in_dark_and_back():
     try:
         w.set_theme("dark")
         assert theme.mode == "dark" and w.stack.currentWidget() is w.today
-        assert "Light" in w.theme_btn.text()
+        assert "light" in w.theme_btn.toolTip()
     finally:
         w.set_theme("light")
-    assert "Dark" in w.theme_btn.text()
+    assert "dark" in w.theme_btn.toolTip()
     w.close()
 
 
@@ -562,17 +563,18 @@ def test_columns_for_width():
 
 def test_tiles_reflow_on_resize():
     w = _window(_seeded_with_other())
+    w._show_home("metrics")
     assert w._tile_widgets
     w.resize(1440, 900)
     w.show()
     _app().processEvents()
     w._relayout_tiles()
-    assert w._tile_cols == 3
+    assert w._tile_cols <= 1          # channel rows are full-width now
 
     w.resize(900, 700)
     _app().processEvents()
     w._relayout_tiles()
-    assert w._tile_cols == 2
+    assert w._tile_cols <= 1
     w.close()
 
 

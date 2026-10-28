@@ -20,6 +20,7 @@ from . import wire
 BASIC_DATA_REPORT = 164
 REPORT_BASIC_DATA = 165
 GET_RING_WEAR_STATUS = 420
+SCAN_WINDOW_S = 60.0
 MICRO_FUNCTION_FIELD = 12
 WEARING_FIELD = 12          # SEMicroFunction.inquiry_wearing_status
 
@@ -152,7 +153,7 @@ async def _poll(band, store, interval: float, on_sample, wake=None) -> None:
 
 
 async def keep_linked(store, name: str | None = None, interval: float = 10.0,
-                      history_every: float = 1800.0, retry_s: float = 5.0,
+                      history_every: float = 1800.0, retry_s: float = 1.0,
                       on_sample=lambda s: None, on_status=lambda s: None,
                       sync_now: asyncio.Event | None = None,
                       on_history=lambda: None, on_progress=None) -> None:
@@ -168,7 +169,10 @@ async def keep_linked(store, name: str | None = None, interval: float = 10.0,
 
     while True:
         try:
-            async with connect(name) as band:
+            # Worn, the band advertises only every ~30 s or more, so scan in
+            # long windows with almost no gap or the rare adverts are missed.
+            async with connect(name, scan_timeout=SCAN_WINDOW_S) as band:
+                name = name or getattr(band, "name", None)
                 on_status("connected")
                 last_history = float("-inf")
                 while band.c.is_connected:

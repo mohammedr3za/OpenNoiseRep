@@ -21,6 +21,7 @@ import datetime
 import os
 import subprocess
 import sys
+import tempfile
 import time
 
 import qasync
@@ -30,6 +31,7 @@ from ..errors import BandNotFound, TransportError
 from ..protocol import commands, realtime
 from ..store import Store, default_db_path
 from ..sync import run_sync
+from ..live import basic_data, parse_basic
 
 DEFAULT_POLL_SECONDS = 30.0
 # How long to wait for the first realtime event before falling back to polling.
@@ -720,7 +722,7 @@ class MenubarApp(QtCore.QObject):
             return False
         try:
             async with self._op_lock:
-                await band.send(realtime.start_frame())
+                await band.send(basic_data(True))
         except (TransportError, asyncio.TimeoutError):
             return False                     # NACK/timeout: poll instead
         self._realtime_active = True
@@ -737,10 +739,18 @@ class MenubarApp(QtCore.QObject):
                     now = loop.time()
                     if not got and now >= first_deadline:
                         break
-                    if got and now - last >= self.realtime_silence:
-                        break
+                    if got:
+                        async with self._op_lock:
+                            await band.send(basic_data(True))
                     continue
-                bpm = realtime.parse_bpm(payload)
+                sample = parse_basic(payload)
+                if sample is not None:
+                    got = True
+                    last = loop.time()
+                    self.store.write_live(sample)
+                    if self._window is not None:
+                        self._window._on_live(sample)
+                bpm = sample.heart_rate if sample is not None else None
                 if bpm is None:
                     continue                 # status echoes, other traffic
                 got = True
@@ -750,7 +760,7 @@ class MenubarApp(QtCore.QObject):
             try:
                 async with self._op_lock:
                     await asyncio.wait_for(
-                        band.send(realtime.stop_frame()), timeout=3.0)
+                        band.send(basic_data(False)), timeout=3.0)
                 self._realtime_active = False
             except asyncio.CancelledError:
                 raise                         # pause_worker will retry the stop
@@ -862,7 +872,7 @@ class MenubarApp(QtCore.QObject):
             try:
                 async with self._op_lock:
                     await asyncio.wait_for(
-                        band.send(realtime.stop_frame()), timeout=3.0)
+                        band.send(basic_data(False)), timeout=3.0)
             except Exception:
                 pass
             self._realtime_active = False
@@ -902,6 +912,10 @@ class MenubarApp(QtCore.QObject):
         self.app.quit()
 
 
+#: Held by the running helper; its owner PID lets the main window stop it.
+MENUBAR_LOCK = os.path.join(tempfile.gettempdir(), "noiserep-menubar.lock")
+
+
 def main(argv: list[str] | None = None, band_name: str | None = None,
          db_path: str | None = None,
          poll_seconds: float = DEFAULT_POLL_SECONDS,
@@ -911,8 +925,16 @@ def main(argv: list[str] | None = None, band_name: str | None = None,
     """Run the menu-bar app until Quit. ``band_name=None`` auto-discovers."""
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(
         list(argv) if argv is not None else sys.argv)
+    from .branding import apply_app_icon
+    apply_app_icon(app)
     app.setApplicationName("NoiseREP")
     app.setQuitOnLastWindowClosed(False)
+    # One helper at a time: a second copy would just fight over the band's
+    # single BLE connection.
+    lock = QtCore.QLockFile(MENUBAR_LOCK)
+    if not lock.tryLock(100):
+        print("menubar: already running", file=sys.stderr)
+        return 0
     loop = qasync.QEventLoop(app)
     asyncio.set_event_loop(loop)
     menubar = MenubarApp(app, band_name=band_name, db_path=db_path,

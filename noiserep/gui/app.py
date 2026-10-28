@@ -330,6 +330,47 @@ class AnimatedNumber(QtWidgets.QLabel):
         self._anim.start()
 
 
+def _end_tree(proc) -> None:
+    """Stop a child and everything it started.
+
+    On Windows a venv's python.exe is a launcher that spawns the real
+    interpreter, so terminate() alone leaves the child alive holding the
+    band's only BLE connection.
+    """
+    pid = getattr(proc, "pid", None)
+    if os.name == "nt" and pid:
+        import subprocess
+        subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
+                       capture_output=True, check=False)
+    proc.terminate()
+
+
+def _end_stray_menubar() -> None:
+    """Stop a Live helper this window did not start (or lost track of).
+
+    The helper holds ``MENUBAR_LOCK``; its owner PID says which process to
+    end, so a forgotten copy can never keep the band to itself.
+    """
+    from .menubar import MENUBAR_LOCK
+
+    lock = QtCore.QLockFile(MENUBAR_LOCK)
+    info = lock.getLockInfo()
+    ok, pid = (info[0], info[1]) if isinstance(info, tuple) else (False, 0)
+    if not ok or not pid or pid == os.getpid():
+        return
+    if os.name == "nt":
+        import subprocess
+        subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
+                       capture_output=True, check=False)
+    else:
+        import signal
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+    lock.removeStaleLockFile()
+
+
 def _profile_age() -> int | None:
     try:
         from ..config import ConfigError, load
@@ -414,6 +455,21 @@ class SmartDateAxis(pg.DateAxisItem):
         return out
 
 
+class GlassReadout(pg.TextItem):
+    """Rounded translucent chart readout, using the active theme palette."""
+
+    def paint(self, painter, *args):
+        super().paint(painter, *args)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing)
+        surface = QtGui.QColor(theme.PANEL)
+        surface.setAlpha(238)
+        edge = QtGui.QColor(theme.BORDER)
+        edge.setAlpha(220)
+        painter.setPen(QtGui.QPen(edge, 1))
+        painter.setBrush(surface)
+        painter.drawRoundedRect(self.boundingRect().adjusted(0.5, 0.5, -0.5, -0.5), 8, 8)
+
+
 class ChartView(pg.PlotWidget):
     """A gap-aware line chart with hover read-out and optional click-through.
 
@@ -461,11 +517,14 @@ class ChartView(pg.PlotWidget):
         self._marker = pg.ScatterPlotItem(
             [], [], size=9, pen=pg.mkPen(theme.PANEL, width=2),
             brush=pg.mkBrush(theme.ACCENT))
-        self._label = pg.TextItem(
-            "", anchor=(0, 0), color=theme.FG,
-            fill=pg.mkBrush(theme.PANEL),
-            border=pg.mkPen(theme.BORDER))
-        self._hover = False
+        self._label = GlassReadout("", anchor=(0, 0), color=theme.FG)
+        self._label.textItem.document().setDocumentMargin(8)
+        self._hover_anim = QtCore.QVariantAnimation(self)
+        self._hover_anim.setDuration(130)
+        self._hover_anim.setEasingCurve(QtCore.QEasingCurve.OutCubic)
+        self._hover_anim.valueChanged.connect(self._hover_opacity)
+        self._hover_anim.finished.connect(self._hover_finished)
+        self._hover = None
         self._show_hover(False)
         self._proxy = pg.SignalProxy(
             self.scene().sigMouseMoved, rateLimit=30, slot=self._on_mouse)
@@ -482,8 +541,7 @@ class ChartView(pg.PlotWidget):
         self._marker.setPen(pg.mkPen(theme.PANEL, width=2))
         self._marker.setBrush(pg.mkBrush(theme.ACCENT))
         self._label.setColor(theme.FG)
-        self._label.fill = pg.mkBrush(theme.PANEL)
-        self._label.border = pg.mkPen(theme.BORDER)
+        self._label.update()
 
     # -- data ------------------------------------------------------------
     def set_data(self, rows, unit: str | None = None, fill: bool = True) -> int:
@@ -537,13 +595,31 @@ class ChartView(pg.PlotWidget):
         return len(plotted)
 
     # -- hover -----------------------------------------------------------
-    def _show_hover(self, visible: bool) -> None:
-        self._hover = visible
+    def _hover_opacity(self, value) -> None:
         for item in (self._vline, self._marker, self._label):
-            try:
-                item.setVisible(visible)
-            except RuntimeError:
-                pass
+            item.setOpacity(float(value))
+
+    def _hover_finished(self) -> None:
+        if not self._hover:
+            for item in (self._vline, self._marker, self._label):
+                item.hide()
+
+    def _show_hover(self, visible: bool) -> None:
+        if self._hover == visible:
+            return
+        initial = self._hover is None
+        self._hover = visible
+        self._hover_anim.stop()
+        if initial:
+            self._hover_opacity(0.0)
+            self._hover_finished()
+            return
+        if visible:
+            for item in (self._vline, self._marker, self._label):
+                item.show()
+        self._hover_anim.setStartValue(self._label.opacity())
+        self._hover_anim.setEndValue(1.0 if visible else 0.0)
+        self._hover_anim.start()
 
     def _on_mouse(self, event) -> None:
         if not self._rows:
@@ -574,12 +650,27 @@ class ChartView(pg.PlotWidget):
         text = f"{when.strftime(fmt)}  ·  {_fmt(value)}"
         if self.unit:
             text += f" {self.unit}"
-        self._label.setText(text)
-        xr, yr = vb.viewRange()
-        right_half = self._x[j] > (xr[0] + xr[1]) / 2
-        self._label.setAnchor((-1, 0) if right_half else (0, 0))
-        self._label.setPos(self._x[j], yr[1] - (yr[1] - yr[0]) * 0.06)
+        # Position in scene pixels: data-space offsets can clip long labels
+        # at either edge, especially after zooming or on a narrow card.
+        rect = vb.sceneBoundingRect().adjusted(8, 8, -8, -8)
+        font = self._label.textItem.font()
+        metrics = QtGui.QFontMetricsF(font)
+        text = metrics.elidedText(text, QtCore.Qt.ElideRight,
+                                  max(1, int(rect.width() - 20)))
+        self._label.setText(text, color=theme.FG)
+        self._label.setAnchor((0, 0))
         self._show_hover(True)
+        width = self._label.boundingRect().width()
+        sample_x = vb.mapViewToScene(QtCore.QPointF(self._x[j], value)).x()
+        left = sample_x + 10
+        if left + width > rect.right():
+            left = sample_x - width - 10
+        left = max(rect.left(), min(left, rect.right() - width))
+        self._label.setPos(vb.mapSceneToView(QtCore.QPointF(left, rect.top())))
+
+    def leaveEvent(self, event):  # noqa: N802 - Qt override
+        self._show_hover(False)
+        super().leaveEvent(event)
 
     def mouseReleaseEvent(self, event):  # noqa: N802 - Qt override
         if (not self.interactive and self._rows
@@ -702,10 +793,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.stack.addWidget(self._build_vital_detail())  # index 4
         self.today = TodayPage(store, _profile_age(), on_open_metric=self._open_detail)
         self.stack.addWidget(self.today)                  # index 5
+        self.settings_page = self._build_settings()
+        self.stack.addWidget(self.settings_page)          # index 6
         outer.addWidget(self.stack, 1)
 
         self._install_shortcuts()
         self._load()
+        self._clock = QtCore.QTimer(self)
+        self._clock.timeout.connect(lambda: self.ov_title.setText(self._greeting()))
+        self._clock.start(60_000)
         self._show_home("today")
         self._apply_gutter()
 
@@ -725,19 +821,10 @@ class MainWindow(QtWidgets.QMainWindow):
         h.setContentsMargins(26, 10, 26, 10)
         h.setSpacing(10)
 
-        brand = QtWidgets.QHBoxLayout()
-        brand.setSpacing(8)
-        dot = QtWidgets.QLabel("●")
-        dot.setObjectName("brandDot")
         name = QtWidgets.QLabel("NoiseREP")
         name.setObjectName("appName")
-        self.app_tag = QtWidgets.QLabel("SYNC")
-        self.app_tag.setObjectName("appTag")
-        brand.addWidget(dot)
-        brand.addWidget(name)
-        brand.addWidget(self.app_tag)
-        h.addLayout(brand)
-        h.addSpacing(6)
+        h.addWidget(name)
+        h.addSpacing(10)
 
         pill = QtWidgets.QFrame()
         pill.setObjectName("devicePill")
@@ -753,17 +840,22 @@ class MainWindow(QtWidgets.QMainWindow):
         self.band_state.setObjectName("bandState")
         pl.addWidget(self.band_dot)
         pl.addWidget(self.band_state)
-        for label, obj in ((self.dev_model, "devicePill"),
-                           (self.dev_fw, "muted"),
-                           (self.dev_sync, "muted")):
+        for label, obj in ((self.dev_model, "settingValue"),
+                           (self.dev_fw, "settingValue"),
+                           (self.dev_sync, "settingValue")):
             label.setObjectName(obj)
-            pl.addWidget(label)
         self._set_band_state("off", "Band link off")
         h.addWidget(pill)
         h.addStretch(1)
         self.nav_tabs = {}
+        seg = QtWidgets.QFrame()
+        seg.setObjectName("segmented")
+        sl = QtWidgets.QHBoxLayout(seg)
+        sl.setContentsMargins(3, 3, 3, 3)
+        sl.setSpacing(2)
         group = QtWidgets.QButtonGroup(self)
-        for key, text in (("today", "Today"), ("metrics", "All metrics")):
+        for key, text in (("today", "Today"), ("metrics", "All metrics"),
+                          ("settings", "Settings")):
             tab = QtWidgets.QPushButton(text)
             tab.setObjectName("navTab")
             tab.setCheckable(True)
@@ -771,8 +863,9 @@ class MainWindow(QtWidgets.QMainWindow):
             tab.clicked.connect(lambda _=False, k=key: self._show_home(k))
             group.addButton(tab)
             self.nav_tabs[key] = tab
-            h.addWidget(tab)
-        h.addSpacing(12)
+            sl.addWidget(tab)
+        h.addWidget(seg)
+        h.addStretch(1)
 
         # QComboBox is native AppKit on macOS (theme.QSS omits its styling
         # there); the explicit height keeps it aligned with the app bar.
@@ -783,18 +876,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.range_combo.setToolTip("Choose the period shown")
         self.range_combo.setMinimumHeight(32)
         self.range_combo.currentIndexChanged.connect(self._on_range_mode_changed)
-        h.addWidget(self.range_combo)
 
         # Single-day navigation: ‹ [calendar date] ›.  Hidden until "Day…" is
         # selected so the app bar stays calm in the preset modes.
-        self.prev_day_btn = QtWidgets.QPushButton("‹")
-        self.prev_day_btn.setObjectName("ghost")
-        self.prev_day_btn.setFixedWidth(34)
-        self.prev_day_btn.setMinimumHeight(32)
-        self.prev_day_btn.setToolTip("Previous day")
-        self.prev_day_btn.setAccessibleName("Previous day")
-        self.prev_day_btn.clicked.connect(lambda: self._shift_day(-1))
-        h.addWidget(self.prev_day_btn)
 
         self.day_date = QtWidgets.QDateEdit()
         self.day_date.setCalendarPopup(True)
@@ -804,19 +888,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.day_date.setAccessibleName("Selected day")
         self.day_date.setToolTip("Pick any day with stored data")
         self.day_date.dateChanged.connect(self._on_day_changed)
-        h.addWidget(self.day_date)
 
-        self.next_day_btn = QtWidgets.QPushButton("›")
-        self.next_day_btn.setObjectName("ghost")
-        self.next_day_btn.setFixedWidth(34)
-        self.next_day_btn.setMinimumHeight(32)
-        self.next_day_btn.setToolTip("Next day")
-        self.next_day_btn.setAccessibleName("Next day")
-        self.next_day_btn.clicked.connect(lambda: self._shift_day(1))
-        h.addWidget(self.next_day_btn)
 
-        for _widget in (self.prev_day_btn, self.day_date, self.next_day_btn):
-            _widget.hide()
+        self.day_date.hide()
 
         # A QToolButton whose "ghost" frame exists only off macOS.  QPushButton
         # would inherit the app's custom rounded QPushButton rule, so on macOS
@@ -839,7 +913,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.export_menu_btn.setPopupMode(
             QtWidgets.QToolButton.ToolButtonPopupMode.InstantPopup)
         self.export_menu_btn.setMinimumHeight(36)
-        h.addWidget(self.export_menu_btn)
 
         self.live_btn = QtWidgets.QPushButton("♥ Live")
         self.live_btn.setObjectName("liveBtn")
@@ -847,7 +920,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.live_btn.setCursor(QtCore.Qt.PointingHandCursor)
         self.live_btn.clicked.connect(self._toggle_menubar)
         self._set_live_btn(False)
-        h.addWidget(self.live_btn)
 
         self.guide_btn = QtWidgets.QPushButton("? Icon guide")
         self.guide_btn.setObjectName("ghost")
@@ -855,12 +927,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.guide_btn.setToolTip("How to read the menu-bar heart icon")
         self.guide_btn.setAccessibleName("Menu-bar icon guide")
         self.guide_btn.clicked.connect(self._show_guide)
-        h.addWidget(self.guide_btn)
 
-        self.theme_btn = QtWidgets.QPushButton()
-        self.theme_btn.setObjectName("themeBtn")
-        self.theme_btn.setMinimumHeight(34)
-        self.theme_btn.setCursor(QtCore.Qt.PointingHandCursor)
+        from .icons import IconButton
+        self.theme_btn = IconButton("moon", 38)
         self.theme_btn.setAccessibleName("Switch light or dark theme")
         self.theme_btn.clicked.connect(self._toggle_theme)
         self._sync_theme_btn()
@@ -986,6 +1055,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _build_overview(self) -> QtWidgets.QWidget:
         scroll, _inner, lay = self._make_page()
 
+        row = QtWidgets.QHBoxLayout()
         head = QtWidgets.QVBoxLayout()
         head.setSpacing(2)
         self.ov_title = QtWidgets.QLabel("Good morning")
@@ -994,7 +1064,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ov_sub.setObjectName("muted")
         head.addWidget(self.ov_title)
         head.addWidget(self.ov_sub)
-        lay.addLayout(head)
+        row.addLayout(head)
+        row.addStretch(1)
+        from .today import DayNav
+        self.ov_day_nav = DayNav()
+        self.ov_day_nav.shifted.connect(self._overview_shift)
+        self.prev_day_btn, self.next_day_btn = self.ov_day_nav.prev, self.ov_day_nav.next
+        for w in (self.range_combo, self.day_date, self.ov_day_nav):
+            row.addWidget(w, 0, QtCore.Qt.AlignBottom)
+        lay.addLayout(row)
 
         self.ov_stack = QtWidgets.QStackedWidget()
 
@@ -1716,61 +1794,54 @@ class MainWindow(QtWidgets.QMainWindow):
         return card
 
     def _tiles_section(self, metrics, start, end) -> QtWidgets.QWidget:
+        """A readable channel list; no interpolated miniature curves for codes."""
         host = QtWidgets.QWidget()
         grid = QtWidgets.QGridLayout(host)
         grid.setContentsMargins(0, 0, 0, 0)
-        grid.setSpacing(16)
+        grid.setSpacing(8)
         self.tiles_grid = grid
-        cols = _columns_for_width(self._content_width())
         for i, metric in enumerate(metrics):
-            tile = self._tile(metric, start, end)
-            self._tile_widgets.append(tile)
-            grid.addWidget(tile, i // cols, i % cols)
-        for c in range(cols):
-            grid.setColumnStretch(c, 1)
-        self._tile_cols = cols
+            row = self._tile(metric, start, end)
+            self._tile_widgets.append(row)
+            grid.addWidget(row, i, 0)
+        grid.setColumnStretch(0, 1)
+        self._tile_cols = 1
         return host
 
     def _tile(self, metric: str, start, end) -> QtWidgets.QWidget:
-        rows = self.store.samples(metric, start, end)
-        y = [v for _, v in rows]
+        rows = sorted(self.store.samples(metric, start, end), key=lambda r: r[0])
         unit = display_unit(metric)
         card = ClickableCard("tile")
-        card.setMinimumHeight(152)
         card.setAccessibleName(f"{display_name(metric)} channel, open details")
+        card.setFocusPolicy(QtCore.Qt.StrongFocus)
         card.clicked.connect(lambda _=None, m=metric: self._open_detail(m))
-        v = QtWidgets.QVBoxLayout(card)
-        v.setContentsMargins(18, 15, 18, 13)
-        v.setSpacing(4)
-
-        top = QtWidgets.QHBoxLayout()
+        layout = QtWidgets.QHBoxLayout(card)
+        layout.setContentsMargins(18, 14, 18, 14)
+        layout.setSpacing(16)
+        details = QtWidgets.QVBoxLayout()
         name = QtWidgets.QLabel(display_name(metric))
         name.setObjectName("tileName")
-        top.addWidget(name)
-        top.addStretch(1)
-        chev = QtWidgets.QLabel("›")
-        chev.setObjectName("chevron")
-        top.addWidget(chev)
-        v.addLayout(top)
-
-        value_row = QtWidgets.QHBoxLayout()
-        value_row.setSpacing(6)
-        big = QtWidgets.QLabel(_fmt(y[-1]) if y else "—")
-        big.setObjectName("tileValue")
-        value_row.addWidget(big, 0, QtCore.Qt.AlignBottom)
-        if unit and y:
-            u = QtWidgets.QLabel(unit)
-            u.setObjectName("tileUnit")
-            value_row.addWidget(u, 0, QtCore.Qt.AlignBottom)
-        value_row.addStretch(1)
-        v.addLayout(value_row)
-
-        hint = QtWidgets.QLabel(
-            f"{len(y)} reading{'' if len(y) == 1 else 's'}"
-            if y else "No readings in this period")
+        name.setWordWrap(True)
+        details.addWidget(name)
+        if rows:
+            when, value = rows[-1]
+            summary = f"Latest recorded · {when:%d %b, %H:%M} · {len(rows):,} readings"
+        else:
+            summary = "No readings in this period"
+        hint = QtWidgets.QLabel(summary)
         hint.setObjectName("muted")
-        v.addWidget(hint)
-        v.addWidget(_sparkline(rows, height=44))
+        hint.setWordWrap(True)
+        details.addWidget(hint)
+        layout.addLayout(details, 1)
+        value_text = _fmt(rows[-1][1]) if rows else "—"
+        if unit and rows:
+            value_text += f" {unit}"
+        value_label = QtWidgets.QLabel(value_text)
+        value_label.setStyleSheet("font-size: 18px; font-weight: 600;")
+        layout.addWidget(value_label)
+        arrow = QtWidgets.QLabel("›")
+        arrow.setObjectName("chevron")
+        layout.addWidget(arrow)
         return card
 
     def _chips(self, y) -> QtWidgets.QWidget:
@@ -1941,10 +2012,11 @@ class MainWindow(QtWidgets.QMainWindow):
         if key == "today":
             self.stack.setCurrentWidget(self.today)
             self.today.refresh()
+        elif key == "settings":
+            self.stack.setCurrentWidget(self.settings_page)
         else:
             self.stack.setCurrentIndex(0)
-        for w in (self.range_combo, self.export_menu_btn):
-            w.setVisible(key != "today")
+        self._show_day_nav()
 
     def _plot_detail(self) -> None:
         metric = self._detail_metric
@@ -2183,6 +2255,115 @@ class MainWindow(QtWidgets.QMainWindow):
         v.addWidget(body)
         v.addStretch(1)
         return card
+
+    def _build_settings(self) -> QtWidgets.QWidget:
+        """Device details, pairing help, live menu-bar app, export, guide."""
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        host = QtWidgets.QWidget()
+        scroll.setWidget(host)
+        outer = QtWidgets.QVBoxLayout(host)
+        self._settings_layout = outer
+        outer.setSpacing(18)
+        title = QtWidgets.QLabel("Settings")
+        title.setObjectName("pageTitle")
+        outer.addWidget(title)
+
+        def section(name: str, note: str = "") -> QtWidgets.QVBoxLayout:
+            card = QtWidgets.QFrame()
+            card.setObjectName("settingsCard")
+            v = QtWidgets.QVBoxLayout(card)
+            v.setContentsMargins(24, 20, 24, 20)
+            v.setSpacing(10)
+            head = QtWidgets.QLabel(name)
+            head.setObjectName("settingsHead")
+            v.addWidget(head)
+            if note:
+                n = QtWidgets.QLabel(note)
+                n.setObjectName("settingsNote")
+                n.setWordWrap(True)
+                v.addWidget(n)
+            outer.addWidget(card)
+            return v
+
+        band = section("Band")
+        for caption, label in (("Model", self.dev_model), ("Firmware", self.dev_fw),
+                               ("Last sync", self.dev_sync)):
+            row = QtWidgets.QHBoxLayout()
+            cap = QtWidgets.QLabel(caption)
+            cap.setObjectName("settingsNote")
+            row.addWidget(cap)
+            row.addStretch(1)
+            row.addWidget(label)
+            band.addLayout(row)
+
+        pair = section("Connecting your band", (
+            "There is no pairing step. The app finds the band by name and "
+            "connects on its own whenever it is open."))
+        for i, step in enumerate((
+                "Turn your phone's Bluetooth off, or close NoiseFit — the band "
+                "talks to one device at a time.",
+                "Keep the band within a few metres of this PC, on your wrist or "
+                "on the charger. Either works.",
+                "If it is not found within a minute, set it on the charger for a "
+                "few seconds; that wakes its Bluetooth, then you can wear it "
+                "again.",
+                "Press Sync band: it stops anything else in this app that is "
+                "holding the band, then syncs.",
+                "Do not pair it in Windows Bluetooth settings; the app connects "
+                "directly."), 1):
+            lab = QtWidgets.QLabel(f"{i}.  {step}")
+            lab.setObjectName("settingsStep")
+            lab.setWordWrap(True)
+            pair.addWidget(lab)
+
+        live = section("Live heart rate in the menu bar", (
+            "Runs as a separate small app. While it is on, this window pauses "
+            "its own band connection, since the band accepts one connection."))
+        live.addWidget(self.live_btn, 0, QtCore.Qt.AlignLeft)
+
+        export = section("Export", "Save stored readings as CSV or JSON.")
+        export.addWidget(self.export_menu_btn, 0, QtCore.Qt.AlignLeft)
+
+        data = section("Your data", (
+            "Everything the band sends is saved on this PC in one SQLite file "
+            "and kept across restarts; nothing is uploaded. The band itself "
+            "only holds data until it is synced, so older days appear here "
+            "only from the first sync on."))
+        path = QtWidgets.QLabel(self.store.path)
+        path.setObjectName("settingValue")
+        path.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        path.setWordWrap(True)
+        data.addWidget(path)
+        open_btn = QtWidgets.QPushButton("Open folder")
+        open_btn.setCursor(QtCore.Qt.PointingHandCursor)
+        open_btn.clicked.connect(lambda: QtGui.QDesktopServices.openUrl(
+            QtCore.QUrl.fromLocalFile(os.path.dirname(self.store.path))))
+        data.addWidget(open_btn, 0, QtCore.Qt.AlignLeft)
+
+        guide = section("Menu-bar icon guide", "What each heart icon state means.")
+        guide.addWidget(self.guide_btn, 0, QtCore.Qt.AlignLeft)
+        outer.addStretch(1)
+        return scroll
+
+    def _crossfade_from_snapshot(self) -> None:
+        """Freeze the current look in an overlay, then fade it away."""
+        if not self.isVisible():
+            return
+        shot = QtWidgets.QLabel(self)
+        shot.setPixmap(self.grab())
+        shot.setGeometry(self.rect())
+        fx = QtWidgets.QGraphicsOpacityEffect(shot)
+        shot.setGraphicsEffect(fx)
+        shot.show()
+        shot.raise_()
+        fade = QtCore.QPropertyAnimation(fx, b"opacity", shot)
+        fade.setDuration(420)
+        fade.setStartValue(1.0)
+        fade.setEndValue(0.0)
+        fade.setEasingCurve(QtCore.QEasingCurve.InOutCubic)
+        fade.finished.connect(shot.deleteLater)
+        QtCore.QTimer.singleShot(0, fade.start)
 
     def _show_guide(self) -> None:
         self.stack.setCurrentWidget(self.guide_page)
@@ -2546,10 +2727,10 @@ class MainWindow(QtWidgets.QMainWindow):
     def _refresh_device(self) -> None:
         d = self.store.device()
         self.dev_model.setText((d and d["model"]) or "Noise REP")
-        self.dev_fw.setText(f"FW {d['fw']}" if d and d["fw"] else "")
+        self.dev_fw.setText(d["fw"] if d and d["fw"] else "—")
         last = self.store.last_sync()
         if last:
-            self.dev_sync.setText(f"synced {_to_local(last['time']):%d %b, %H:%M}")
+            self.dev_sync.setText(f"{_to_local(last['time']):%d %b, %H:%M}")
         else:
             self.dev_sync.setText("never synced")
 
@@ -2564,7 +2745,7 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             self.status.setText(
                 "No sync yet — connect the band and press Sync.")
-        self.info_banner.show()
+        self._flash_info()
         self.error_banner.hide()
 
     def _refresh_header(self) -> None:
@@ -2575,11 +2756,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _greeting(self) -> str:
         hour = datetime.datetime.now().hour
-        if hour < 12:
+        if 5 <= hour < 12:
             return "Good morning."
-        if hour < 18:
+        if 12 <= hour < 17:
             return "Good afternoon."
-        return "Good evening."
+        if 17 <= hour < 21:
+            return "Good evening."
+        return "Good night."
 
     def _range(self):
         mode = self._range_mode
@@ -2641,9 +2824,26 @@ class MainWindow(QtWidgets.QMainWindow):
             self._plot_detail()
 
     def _show_day_nav(self) -> None:
-        visible = self._range_mode == "day"
-        for widget in (self.prev_day_btn, self.day_date, self.next_day_btn):
-            widget.setVisible(visible)
+        day = self._range_mode == "day"
+        self.day_date.setVisible(day)
+        if hasattr(self, "ov_day_nav"):
+            self.ov_day_nav.set_day(
+                self.day_date.date().toPython() if day
+                else datetime.date.today() if self._range_mode == "today" else None)
+
+    def _overview_shift(self, delta: int) -> None:
+        """‹ Today › on All metrics: step through single days."""
+        today = QtCore.QDate.currentDate()
+        if delta == 0:
+            target = today
+        else:
+            base = self.day_date.date() if self._range_mode == "day" else today
+            target = min(base.addDays(delta), today)
+        mode = "today" if target == today else "day"
+        self.day_date.setDate(target)
+        index = next(i for i, (m, _) in enumerate(RANGE_MODES) if m == mode)
+        self.range_combo.setCurrentIndex(index)
+        self._show_day_nav()
 
     def _shift_day(self, delta: int) -> None:
         self.day_date.setDate(self.day_date.date().addDays(delta))
@@ -2675,17 +2875,19 @@ class MainWindow(QtWidgets.QMainWindow):
         bar = max(26, min(g, (width - 1000) // 2))
         self._bar_layout.setContentsMargins(bar, 10, bar, 10)
         self._banner_layout.setContentsMargins(g, 14, g, 0)
+        self._settings_layout.setContentsMargins(g, 30, g, 40)
 
     def _sync_theme_btn(self) -> None:
         dark = theme.mode == "dark"
-        self.theme_btn.setText("Light" if dark else "Dark")
+        self.theme_btn.set_icon("sun" if dark else "moon")
         self.theme_btn.setToolTip("Switch to the %s theme" % ("light" if dark else "dark"))
 
     def _toggle_theme(self) -> None:
         self.set_theme("light" if theme.mode == "dark" else "dark", save=True)
 
     def set_theme(self, mode: str, save: bool = False) -> None:
-        """Switch light/dark everywhere without restarting."""
+        """Switch light/dark everywhere, cross-fading from the old look."""
+        self._crossfade_from_snapshot()
         theme.apply(mode)
         app = QtWidgets.QApplication.instance()
         app.setStyleSheet(theme.QSS)
@@ -2710,11 +2912,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def resizeEvent(self, event):  # noqa: N802 - Qt override
         super().resizeEvent(event)
-        width = self.width()
         self._apply_gutter()
-        self.dev_sync.setVisible(width >= 1000)
-        self.dev_fw.setVisible(width >= 900)
-        self.app_tag.setVisible(width >= 1040)
         self._resize_timer.start()
 
     def showEvent(self, event):  # noqa: N802 - Qt override
@@ -2734,24 +2932,9 @@ class MainWindow(QtWidgets.QMainWindow):
         return max(0, max(self.stack.width(), self.width() - 56) - 56)
 
     def _relayout_tiles(self) -> None:
-        # Keep the vitals/goal rows responsive even when there are no generic
-        # channel tiles to reflow.
+        # Channel rows remain full-width; vitals and goals still reflow.
         self._relayout_vitals()
         self._relayout_movement()
-        if self.tiles_grid is None or not self._tile_widgets:
-            return
-        cols = _columns_for_width(self._content_width())
-        if cols == self._tile_cols:
-            return
-        while self.tiles_grid.count():
-            self.tiles_grid.takeAt(0)
-        for c in range(3):
-            self.tiles_grid.setColumnStretch(c, 0)
-        for i, widget in enumerate(self._tile_widgets):
-            self.tiles_grid.addWidget(widget, i // cols, i % cols)
-        for c in range(cols):
-            self.tiles_grid.setColumnStretch(c, 1)
-        self._tile_cols = cols
 
     # ------------------------------------------------------------------
     # banner helpers
@@ -2809,7 +2992,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.live_btn.setEnabled(True)
         try:
             self._menubar_proc = subprocess.Popen(
-                [sys.executable, "-m", "noiserep.cli", "menubar"],
+                [sys.executable, "-m", "noiserep.cli", "menubar", "--db", self.store.path],
                 start_new_session=True)
         except OSError as exc:
             self._set_live_btn(False)
@@ -2823,17 +3006,33 @@ class MainWindow(QtWidgets.QMainWindow):
                          "link is paused until you click Live again.")
         self._menubar_poll.start()
 
+    def _free_band(self) -> None:
+        """Make sure nothing else in this app holds the band."""
+        if self._menubar_active():
+            self._stop_menubar()
+        _end_stray_menubar()
+
     def _stop_menubar(self) -> None:
         proc = self._menubar_proc
         self._menubar_stopping = True
         self.live_btn.setEnabled(False)
         self._set_live_btn(True, "Stopping…")
-        proc.terminate()
-        QtCore.QTimer.singleShot(3000, lambda: proc.poll() is None and proc.kill())
+        _end_tree(proc)
 
     def _poll_menubar(self) -> None:
         proc = self._menubar_proc
-        if proc is None or proc.poll() is None:
+        if proc is None:
+            return
+        if proc.poll() is None:
+            from ..live import LiveSample
+            report = self.store.live()
+            if report is not None:
+                age = (datetime.datetime.now() - report["at"]).total_seconds()
+                if 0 <= age <= 45:
+                    self._on_live(LiveSample(**report))
+                else:
+                    self.today.live_hr.set(None)
+                    self.today.live_card.setToolTip("Waiting for a fresh reading from the band…")
             return
         self._menubar_poll.stop()
         self._menubar_proc = None
@@ -2861,9 +3060,19 @@ class MainWindow(QtWidgets.QMainWindow):
         except OSError:
             return False
 
+    def _flash_info(self, ms: int = 4500) -> None:
+        """Show the info banner briefly; status is never left on screen."""
+        timer = getattr(self, "_info_timer", None)
+        if timer is None:
+            timer = self._info_timer = QtCore.QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(self.info_banner.hide)
+        self.info_banner.show()
+        timer.start(ms)
+
     def _set_status(self, text: str) -> None:
         self.status.setText(text)
-        self.info_banner.show()
+        self._flash_info()
 
     def _show_error(self, message: str) -> None:
         self.error_text.setText(message)
@@ -2874,7 +3083,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _clear_error(self) -> None:
         self.error_banner.hide()
-        self.info_banner.show()
+        self._flash_info()
 
     # ------------------------------------------------------------------
     # keyboard shortcuts
@@ -2947,13 +3156,15 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_link_status(self, text: str) -> None:
         print(f"{datetime.datetime.now():%H:%M:%S} [band link] {text}", flush=True)
         if text == "connected":
+            self._linked = True
             self._set_band_state("live", "Connected")
         elif text == "syncing history":
             self._set_band_state("live", "Syncing history…")
             self._set_status("Syncing history from the band…")
         elif text.startswith("disconnected"):
             self.sync_bar.finish(ok=False)
-            self._set_band_state("searching", "Band not in range · retrying")
+            self._set_band_state("searching", "Waiting for band…")
+            self._linked = False
 
     def _on_live(self, sample) -> None:
         self._last_live = sample
@@ -2971,7 +3182,7 @@ class MainWindow(QtWidgets.QMainWindow):
         refuse the next connection until its supervision timeout passes.
         """
         if self._menubar_active():
-            self._menubar_proc.terminate()
+            _end_tree(self._menubar_proc)
         task = self._link_task
         if task is None or task.done():
             return super().closeEvent(event)
@@ -3021,9 +3232,22 @@ class MainWindow(QtWidgets.QMainWindow):
     async def _on_sync(self) -> None:
         if self._syncing:
             return
-        if self._link_task is not None and not self._link_task.done():
-            self._sync_now.set()          # the link owns the band's one connection
-            self._set_status("Syncing on the live link…")
+        self._free_band()
+        if self._sync_now is not None:
+            # The link owns the band's one connection: (re)start it and
+            # have it sync right away.
+            if self._link_task is None or self._link_task.done():
+                self._link_task = None
+                self.start_link()
+            self._sync_now.set()
+            if getattr(self, "_linked", False):
+                self._set_status("Syncing…")
+            else:
+                self._set_status(
+                    "Waiting for the band — worn, it only announces itself "
+                    "every ~30 s, so connecting can take a minute. A few "
+                    "seconds on the charger wakes it at once. It syncs as "
+                    "soon as it connects.")
             return
 
         self._clear_error()
@@ -3077,6 +3301,8 @@ def main(argv: list[str] | None = None) -> int:
     import asyncio
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(
         sys.argv if argv is None else argv)
+    from .branding import apply_app_icon
+    apply_app_icon(app)
     app.setApplicationName("NoiseREP Sync")
     app.setApplicationDisplayName("NoiseREP Sync")
     saved = QtCore.QSettings("NoiseREP", "Sync").value("theme", "light")

@@ -194,205 +194,41 @@ class RingCell(QtWidgets.QWidget):
 
 
 class AreaChart(Animated):
-    """A line + gradient area over one day with a hover readout.
-
-    Axes and series are rendered once per (size, data, theme) into pixmaps;
-    paint is two blits plus the small hover overlay.
-    """
+    """Today adapter for the same gap-aware chart used on All Metrics."""
 
     def __init__(self, color: str, unit: str = "", parent=None):
         super().__init__(parent)
-        self.color, self.unit = color, unit
-        self.points: list[tuple[dt.datetime, float]] = []
+        # Lazy import: app imports TodayPage before defining ChartView.
+        from .app import ChartView
+
+        self.unit = unit
+        self.points = []
         self.x0 = self.x1 = None
-        self.y_range: tuple[float, float] | None = None
-        self.gap_s = 900
-        self._ts: list[float] = []
-        self._hover: int | None = None
-        self._cache: tuple | None = None   # (key, axes pixmap, series pixmap, scale)
-        self.setMouseTracking(True)
-        self.setMinimumHeight(190)
+        self.y_range = None
+        self.chart = ChartView(interactive=True, height=170)
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.chart)
+        self.setFixedHeight(170)
 
     def set(self, points, x0, x1, y_range=None) -> None:
-        self.points, self.x0, self.x1, self.y_range = list(points), x0, x1, y_range
-        self._ts = [t.timestamp() for t, _ in self.points]
-        self._hover = None
-        self._cache = None
-        self.update()
+        self.points = sorted(points, key=lambda row: row[0])
+        self.x0, self.x1, self.y_range = x0, x1, y_range
+        self.chart.retheme()
+        self.chart.set_data(self.points, self.unit or None)
+        if not self.points:
+            self.chart.getPlotItem().setTitle("No readings yet", color=theme.FG_MUTED)
+        else:
+            self.chart.getPlotItem().setTitle(None)
+        if y_range is not None:
+            self.chart.setYRange(*y_range, padding=0.08)
 
     def append(self, t: dt.datetime, v: float) -> None:
-        self.points.append((t, v))
-        self._ts.append(t.timestamp())
-        self._cache = None
-        self.update()
+        self.set([*self.points, (t, v)], self.x0, self.x1, self.y_range)
 
-    def _area(self) -> QtCore.QRectF:
-        left, right, top, bottom = 40, 8, 10, 24
-        return QtCore.QRectF(left, top, self.width() - left - right,
-                             self.height() - top - bottom)
-
-    def _build(self):
-        """Render axes + series into pixmaps for the current size and data."""
-        dpr = self.devicePixelRatioF()
-        area = self._area()
-        w, h = self.width(), self.height()
-        axes = QtGui.QPixmap(int(w * dpr), int(h * dpr))
-        series = QtGui.QPixmap(int(w * dpr), int(h * dpr))
-        for pm in (axes, series):
-            pm.setDevicePixelRatio(dpr)
-            pm.fill(QtCore.Qt.transparent)
-        pa = QtGui.QPainter(axes)
-        pa.setRenderHint(QtGui.QPainter.Antialiasing)
-        self._axes(pa, area)
-        if len(self.points) < 2 or self.x0 is None:
-            pa.setPen(qcolor(theme.FG_MUTED))
-            pa.setFont(font(13))
-            pa.drawText(area, QtCore.Qt.AlignCenter, "No readings yet")
-            pa.end()
-            return axes, series, None
-        lo, hi = self.y_range or (min(v for _, v in self.points),
-                                  max(v for _, v in self.points))
-        if self.y_range is None:
-            pad = max((hi - lo) * 0.12, 1)
-            lo, hi = lo - pad, hi + pad
-        span = (self.x1 - self.x0).total_seconds() or 1
-        scale = (lo, hi, span, self.x0.timestamp())
-        pa.setFont(font(11))
-        pa.setPen(qcolor(theme.FG_MUTED))
-        for v in (lo, (lo + hi) / 2, hi):
-            y = area.bottom() - area.height() * (v - lo) / (hi - lo)
-            pa.drawText(QtCore.QRectF(0, y - 8, 34, 16),
-                        QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter, f"{v:.0f}")
-        pa.end()
-        ps = QtGui.QPainter(series)
-        ps.setRenderHint(QtGui.QPainter.Antialiasing)
-        grad = QtGui.QLinearGradient(0, area.top(), 0, area.bottom())
-        grad.setColorAt(0, qcolor(self.color, 0.30))
-        grad.setColorAt(1, qcolor(self.color, 0.0))
-        pen = QtGui.QPen(qcolor(self.color), 2.0)
-        pen.setJoinStyle(QtCore.Qt.RoundJoin)
-        for pts in self._runs(area, scale):
-            line = QtGui.QPainterPath()
-            line.moveTo(pts[0])
-            for pt in pts[1:]:
-                line.lineTo(pt)
-            fill = QtGui.QPainterPath(line)
-            fill.lineTo(pts[-1].x(), area.bottom())
-            fill.lineTo(pts[0].x(), area.bottom())
-            ps.fillPath(fill, grad)
-            ps.setPen(pen)
-            ps.drawPath(line)
-        ps.end()
-        return axes, series, scale
-
-    def _runs(self, area, scale):
-        """Pixel-space polylines, one per contiguous run, one point per 1.5 px."""
-        lo, hi, span, t0 = scale
-        kx = area.width() / span
-        ky = area.height() / (hi - lo)
-        runs: list[list[QtCore.QPointF]] = []
-        cur: list[QtCore.QPointF] = []
-        bucket, acc, n, last_t = None, 0.0, 0, None
-
-        def flush():
-            if n:
-                cur.append(QtCore.QPointF(area.left() + (bucket + 0.5) * 1.5,
-                                          area.bottom() - (acc / n - lo) * ky))
-
-        for ts, (_, v) in zip(self._ts, self.points):
-            if last_t is not None and ts - last_t > self.gap_s:
-                flush()
-                acc, n, bucket = 0.0, 0, None
-                runs.append(cur)
-                cur = []
-            last_t = ts
-            b = int((ts - t0) * kx / 1.5)
-            if b != bucket:
-                flush()
-                acc, n, bucket = 0.0, 0, b
-            acc += v
-            n += 1
-        flush()
-        runs.append(cur)
-        return [r for r in runs if len(r) > 1]
-
-    def paintEvent(self, _):  # noqa: N802 - Qt API
-        key = (self.size().toTuple(), self.devicePixelRatioF(), theme.mode,
-               len(self.points), self.color)
-        if self._cache is None or self._cache[0] != key:
-            self._cache = (key, *self._build())
-        _, axes, series, scale = self._cache
-        p = QtGui.QPainter(self)
-        p.drawPixmap(0, 0, axes)
-        if scale is None:
-            return
-        area = self._area()
-        p.setClipRect(QtCore.QRectF(0, 0, area.left() + area.width() * self.progress,
-                                    self.height()))
-        p.drawPixmap(0, 0, series)
-        p.setClipping(False)
-        if self._hover is not None and self.progress >= 1.0:
-            p.setRenderHint(QtGui.QPainter.Antialiasing)
-            self._draw_hover(p, area, scale)
-
-    def _axes(self, p, area) -> None:
-        p.setPen(QtGui.QPen(qcolor(theme.FG, 0.07), 1))
-        for i in range(5):
-            y = area.top() + area.height() * i / 4
-            p.drawLine(QtCore.QPointF(area.left(), y), QtCore.QPointF(area.right(), y))
-        if self.x0 is None:
-            return
-        p.setFont(font(11))
-        p.setPen(qcolor(theme.FG_MUTED))
-        span = (self.x1 - self.x0).total_seconds() or 1
-        step = 3 if span > 12 * 3600 else 1
-        t = self.x0.replace(minute=0, second=0)
-        while t <= self.x1:
-            if t >= self.x0 and t.hour % step == 0:
-                x = area.left() + area.width() * (t - self.x0).total_seconds() / span
-                p.drawText(QtCore.QRectF(x - 24, area.bottom() + 5, 48, 16),
-                           QtCore.Qt.AlignCenter, f"{t:%H:%M}")
-            t += dt.timedelta(hours=1)
-
-    def _draw_hover(self, p, area, scale) -> None:
-        if self._hover >= len(self.points):
-            return
-        lo, hi, span, t0 = scale
-        t, v = self.points[self._hover]
-        x = area.left() + area.width() * (self._ts[self._hover] - t0) / span
-        y = area.bottom() - area.height() * (v - lo) / (hi - lo)
-        p.setPen(QtGui.QPen(qcolor(theme.FG, 0.30), 1, QtCore.Qt.DashLine))
-        p.drawLine(QtCore.QPointF(x, area.top()), QtCore.QPointF(x, area.bottom()))
-        p.setPen(QtGui.QPen(qcolor(theme.PANEL), 2))
-        p.setBrush(qcolor(self.color))
-        p.drawEllipse(QtCore.QPointF(x, y), 4.5, 4.5)
-        label = f"{v:.0f} {self.unit} · {t:%H:%M}".replace("  ", " ")
-        p.setFont(font(12, QtGui.QFont.Weight.DemiBold))
-        w = p.fontMetrics().horizontalAdvance(label) + 18
-        box = QtCore.QRectF(min(max(x - w / 2, area.left()), area.right() - w),
-                            area.top(), w, 24)
-        p.setPen(QtGui.QPen(qcolor(theme.BORDER), 1))
-        p.setBrush(qcolor(theme.PANEL))
-        p.drawRoundedRect(box, 8, 8)
-        p.setPen(qcolor(theme.FG))
-        p.drawText(box, QtCore.Qt.AlignCenter, label)
-
-    def mouseMoveEvent(self, e):  # noqa: N802 - Qt API
-        if self._cache is None or self._cache[3] is None or not self._ts:
-            return
-        area = self._area()
-        _, _, span, t0 = self._cache[3]
-        ts = t0 + (e.position().x() - area.left()) / area.width() * span
-        i = bisect.bisect_left(self._ts, ts)
-        if i > 0 and (i == len(self._ts) or ts - self._ts[i - 1] < self._ts[i] - ts):
-            i -= 1
-        if i != self._hover:
-            self._hover = i
-            self.update()
-
-    def leaveEvent(self, _):  # noqa: N802 - Qt API
-        self._hover = None
-        self.update()
+    def set_progress(self, value: float) -> None:
+        # Keep the axes and recorded samples stable while the page animates.
+        self.progress = value
 
 
 class Hypnogram(Animated):
@@ -402,7 +238,7 @@ class Hypnogram(Animated):
         super().__init__(parent)
         self.stages: list[tuple[dt.datetime, int]] = []
         self.start = self.end = None
-        self.setMinimumHeight(190)
+        self.setFixedHeight(170)
 
     def set(self, stages, start, end) -> None:
         self.stages, self.start, self.end = sorted(stages), start, end
@@ -426,7 +262,7 @@ class Hypnogram(Animated):
         if not self.stages or self.start is None:
             p.setPen(qcolor(theme.FG_MUTED))
             p.setFont(font(13))
-            p.drawText(area, QtCore.Qt.AlignCenter,
+            p.drawText(area, QtCore.Qt.AlignCenter | QtCore.Qt.TextWordWrap,
                        "No sleep stages yet — they arrive with the band's sleep record")
             return
         span = (self.end - self.start).total_seconds() or 1
@@ -459,7 +295,7 @@ class Bars(Animated):
         super().__init__(parent)
         self.color = color
         self.values = [0.0] * 24
-        self.setMinimumHeight(130)
+        self.setFixedHeight(140)
 
     def set(self, values) -> None:
         self.values = list(values)
@@ -468,13 +304,23 @@ class Bars(Animated):
     def paintEvent(self, _):  # noqa: N802 - Qt API
         p = QtGui.QPainter(self)
         p.setRenderHint(QtGui.QPainter.Antialiasing)
-        area = QtCore.QRectF(2, 4, self.width() - 4, self.height() - 26)
+        area = QtCore.QRectF(42, 10, max(1, self.width() - 52), self.height() - 36)
         top = max(self.values) or 1
+        p.setFont(font(11))
+        for fraction in (0.0, 0.5, 1.0):
+            y = area.bottom() - area.height() * fraction
+            p.setPen(QtGui.QPen(qcolor(theme.FG, 0.12), 1))
+            p.drawLine(QtCore.QPointF(area.left(), y), QtCore.QPointF(area.right(), y))
+            p.setPen(qcolor(theme.FG_MUTED))
+            p.drawText(QtCore.QRectF(0, y - 8, 34, 16),
+                       QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter, f"{top * fraction:,.0f}")
         slot = area.width() / 24
         p.setPen(QtCore.Qt.NoPen)
         for i, v in enumerate(self.values):
             h = area.height() * v / top * self.progress
-            p.setBrush(qcolor(self.color, 1.0 if v else 0.15))
+            if not v:
+                continue
+            p.setBrush(qcolor(theme.ACCENT, 0.85))
             p.drawRoundedRect(QtCore.QRectF(area.left() + i * slot + slot * 0.18,
                                             area.bottom() - max(h, 3),
                                             slot * 0.64, max(h, 3)), 3, 3)
@@ -485,13 +331,59 @@ class Bars(Animated):
                        QtCore.Qt.AlignLeft, f"{h:02d}:00")
 
 
+class BodyBattery(Animated):
+    """Battery silhouette filled from the latest recorded body-battery value."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.value = None
+        self.recorded_at = None
+        self.setFixedHeight(170)
+        self.setAccessibleName("Body battery: no readings")
+
+    def set(self, points):
+        valid = [(t, float(v)) for t, v in points if 0 <= v <= 100]
+        self.recorded_at, self.value = max(valid, key=lambda r: r[0]) if valid else (None, None)
+        self.setAccessibleName("Body battery: no readings" if self.value is None
+                               else f"Body battery: {self.value:.0f} percent")
+        self.update()
+
+    def paintEvent(self, _):  # noqa: N802
+        p = QtGui.QPainter(self)
+        p.setRenderHint(QtGui.QPainter.Antialiasing)
+        width = min(280, self.width() - 36)
+        rect = QtCore.QRectF((self.width() - width - 9) / 2, 22, width, 88)
+        p.setPen(QtCore.Qt.NoPen)
+        p.setBrush(qcolor(theme.FG_MUTED, 0.5))
+        p.drawRoundedRect(QtCore.QRectF(rect.right() + 4, rect.top() + 29, 7, 30), 3, 3)
+        p.setPen(QtGui.QPen(qcolor(theme.FG_MUTED, 0.65), 2))
+        p.setBrush(qcolor(theme.FG, 0.04))
+        p.drawRoundedRect(rect, 14, 14)
+        inner = rect.adjusted(6, 6, -6, -6)
+        if self.value is not None and self.value > 0:
+            clip = QtGui.QPainterPath()
+            clip.addRoundedRect(inner, 9, 9)
+            p.setClipPath(clip)
+            fill = QtCore.QRectF(inner)
+            fill.setWidth(inner.width() * self.value / 100 * self.progress)
+            p.fillRect(fill, qcolor(theme.ACCENT, 0.28))
+            p.setClipping(False)
+        p.setPen(qcolor(theme.FG))
+        p.setFont(font(36, QtGui.QFont.Weight.Bold))
+        p.drawText(rect, QtCore.Qt.AlignCenter, "—" if self.value is None else f"{self.value:.0f}%")
+        p.setFont(font(12))
+        p.setPen(qcolor(theme.FG_MUTED))
+        caption = "No readings for this day" if self.recorded_at is None else f"Last recorded at {self.recorded_at:%H:%M}"
+        p.drawText(QtCore.QRectF(0, 124, self.width(), 24), QtCore.Qt.AlignCenter, caption)
+
+
 class ZoneBar(Animated):
     """Minutes per heart-rate zone as one rounded stacked bar plus legend."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.minutes = [0.0] * 5
-        self.setMinimumHeight(96)
+        self.setFixedHeight(170)
 
     def set(self, minutes) -> None:
         self.minutes = list(minutes) if minutes else [0.0] * 5
@@ -500,28 +392,29 @@ class ZoneBar(Animated):
     def paintEvent(self, _):  # noqa: N802 - Qt API
         p = QtGui.QPainter(self)
         p.setRenderHint(QtGui.QPainter.Antialiasing)
-        total = sum(self.minutes)
-        track = QtCore.QRectF(0, 6, self.width(), 14)
-        path = QtGui.QPainterPath()
-        path.addRoundedRect(track, 7, 7)
-        p.setClipPath(path)
-        p.fillRect(track, qcolor(theme.FG, 0.07))
-        x, full = 0.0, self.width() * self.progress
-        for m, c in zip(self.minutes, ZONE_COLORS):
-            w = full * (m / total) if total else 0
-            p.fillRect(QtCore.QRectF(x, 6, w, 14), qcolor(c))
-            x += w
-        p.setClipping(False)
-        col_w = self.width() / 5
-        for i, (m, c) in enumerate(zip(self.minutes, ZONE_COLORS)):
+        maximum = max(self.minutes) or 1
+        row_h = self.height() / 5
+        for i, (minutes, color) in enumerate(zip(self.minutes, ZONE_COLORS)):
+            top = i * row_h
             p.setFont(font(12))
-            p.setPen(qcolor(c))
-            p.drawText(QtCore.QRectF(i * col_w, 32, col_w, 18), QtCore.Qt.AlignLeft,
-                       f"Zone {i + 1}")
-            p.setFont(font(16, QtGui.QFont.Weight.DemiBold))
+            p.setPen(qcolor(theme.FG_MUTED))
+            p.drawText(QtCore.QRectF(0, top, 54, row_h),
+                       QtCore.Qt.AlignVCenter, f"Zone {i + 1}")
+            track = QtCore.QRectF(62, top + (row_h - 8) / 2,
+                                  max(1, self.width() - 125), 8)
+            p.setPen(QtCore.Qt.NoPen)
+            p.setBrush(qcolor(theme.FG, 0.07))
+            p.drawRoundedRect(track, 4, 4)
+            if minutes:
+                bar = QtCore.QRectF(track)
+                bar.setWidth(track.width() * minutes / maximum * self.progress)
+                p.setBrush(qcolor(color))
+                p.drawRoundedRect(bar, 4, 4)
             p.setPen(qcolor(theme.FG))
-            p.drawText(QtCore.QRectF(i * col_w, 50, col_w, 24), QtCore.Qt.AlignLeft,
-                       f"{m:.0f}m")
+            p.setFont(font(13, QtGui.QFont.Weight.DemiBold))
+            p.drawText(QtCore.QRectF(self.width() - 58, top, 58, row_h),
+                       QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter,
+                       f"{minutes:.0f} min")
 
 
 # -- cards ---------------------------------------------------------------------
@@ -532,16 +425,19 @@ class Card(QtWidgets.QFrame):
     def __init__(self, title: str, color: str | None = None, parent=None):
         super().__init__(parent)
         self.setObjectName("todayCard")
+        self.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Maximum)
         self.body = QtWidgets.QVBoxLayout(self)
-        self.body.setContentsMargins(22, 18, 22, 20)
-        self.body.setSpacing(10)
+        self.body.setContentsMargins(18, 14, 18, 14)
+        self.body.setSpacing(6)
         head = QtWidgets.QHBoxLayout()
         self.title = style(QtWidgets.QLabel(title), 14, QtGui.QFont.Weight.DemiBold,
-                           color or theme.FG_MUTED)
+                           theme.FG)
         head.addWidget(self.title)
         head.addStretch(1)
-        self.aside = style(QtWidgets.QLabel(""), 13, color=theme.FG_MUTED)
-        head.addWidget(self.aside)
+        self.aside = style(QtWidgets.QLabel(""), 12, color=theme.FG_MUTED)
+        self.aside.setWordWrap(True)
+        self.aside.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+        head.addWidget(self.aside, 1)
         self.body.addLayout(head)
         self.headline = style(QtWidgets.QLabel(""), 30, QtGui.QFont.Weight.Bold)
         self.headline.hide()
@@ -561,7 +457,9 @@ class StatRow(QtWidgets.QWidget):
         h.setContentsMargins(0, 3, 0, 3)
         h.setSpacing(8)
         h.addWidget(style(QtWidgets.QLabel("●"), 9, color=color))
-        h.addWidget(style(QtWidgets.QLabel(name), 14))
+        label = style(QtWidgets.QLabel(name), 13)
+        label.setWordWrap(True)
+        h.addWidget(label, 1)
         h.addStretch(1)
         self.value = QtWidgets.QLabel("—")
         self._ok = None
@@ -651,6 +549,39 @@ class _Job(QtCore.QRunnable):
             pass
 
 
+class DayNav(QtWidgets.QFrame):
+    """Segmented ‹ Today › control; emits -1 / 0 / +1."""
+
+    shifted = QtCore.Signal(int)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        from .icons import IconButton
+        self.setObjectName("segmented")
+        nl = QtWidgets.QHBoxLayout(self)
+        nl.setContentsMargins(3, 3, 3, 3)
+        nl.setSpacing(2)
+        self.prev, self.next = IconButton("left", 30), IconButton("right", 30)
+        for b in (self.prev, self.next):
+            b.filled = False
+        self.prev.setToolTip("Previous day")
+        self.next.setToolTip("Next day")
+        self.today = QtWidgets.QPushButton("Today")
+        self.today.setObjectName("navTab")
+        self.today.setCheckable(True)
+        self.today.setCursor(QtCore.Qt.PointingHandCursor)
+        for b, delta in ((self.prev, -1), (self.today, 0), (self.next, 1)):
+            b.clicked.connect(lambda _=False, d=delta: self.shifted.emit(d))
+            nl.addWidget(b)
+        self.set_day(dt.date.today())
+
+    def set_day(self, day) -> None:
+        """Reflect ``day`` (``None`` = a multi-day range)."""
+        today = dt.date.today()
+        self.next.setEnabled(day is not None and day < today)
+        self.today.setChecked(day == today)
+
+
 # -- the page ------------------------------------------------------------------
 
 CACHE_TTL_S = 600     # today's cached data is refetched (silently) after this
@@ -678,7 +609,8 @@ class TodayPage(QtWidgets.QScrollArea):
         self._gutter = -1
         self._outer.addLayout(self._header())
         self.grid = QtWidgets.QGridLayout()
-        self.grid.setSpacing(14)
+        self.grid.setSpacing(12)
+        self.grid.setAlignment(QtCore.Qt.AlignTop)
         self._outer.addLayout(self.grid)
         self._outer.addStretch(1)
         self._build_cards()
@@ -710,17 +642,16 @@ class TodayPage(QtWidgets.QScrollArea):
         titles.addWidget(self.title)
         h.addLayout(titles)
         h.addStretch(1)
-        for text, delta in (("‹", -1), ("Today", 0), ("›", 1)):
-            b = QtWidgets.QPushButton(text)
-            b.setObjectName("pillBtn")
-            b.setCursor(QtCore.Qt.PointingHandCursor)
-            b.clicked.connect(lambda _=False, d=delta: self.shift(d))
-            h.addWidget(b, 0, QtCore.Qt.AlignBottom)
+        nav = DayNav()
+        nav.shifted.connect(self.shift)
+        self.day_nav = nav
+        h.addWidget(nav, 0, QtCore.Qt.AlignBottom)
         return h
 
     def shift(self, delta: int) -> None:
         self.day = dt.date.today() if delta == 0 else self.day + dt.timedelta(days=delta)
         self.day = min(self.day, dt.date.today())
+        self.day_nav.set_day(self.day)
         self.refresh()
 
     # cards -------------------------------------------------------------------
@@ -746,21 +677,9 @@ class TodayPage(QtWidgets.QScrollArea):
         row.addWidget(self.live_spo2, 2)
         row.addWidget(self.live_stress, 2)
         self.live_card.body.addLayout(row)
-        status = QtWidgets.QHBoxLayout()
-        status.setSpacing(6)
-        self.live_dot = style(QtWidgets.QLabel("●"), 10, color=theme.FG_MUTED)
-        self.live_place = style(QtWidgets.QLabel("Waiting for the band…"), 13,
-                                color=theme.FG_MUTED)
-        self.live_battery = style(QtWidgets.QLabel(""), 13,
-                                  QtGui.QFont.Weight.DemiBold)
-        status.addWidget(self.live_dot)
-        status.addWidget(self.live_place)
-        status.addStretch(1)
-        status.addWidget(self.live_battery)
-        self.live_card.body.addLayout(status)
 
-        self.hr_card = Card("Heart Rate", theme.HEART)
-        self.hr_chart = AreaChart(theme.HEART, "bpm")
+        self.hr_card = Card("Heart Rate", theme.ACCENT)
+        self.hr_chart = AreaChart(theme.ACCENT, "bpm")
         self.hr_card.body.addWidget(self.hr_chart, 1)
 
         self.vitals_card = Card("Vitals", theme.OXYGEN)
@@ -772,7 +691,7 @@ class TodayPage(QtWidgets.QScrollArea):
             ("temperature", "Skin temperature", theme.STRESS))}
         for r in self.vital_rows.values():
             self.vitals_card.body.addWidget(r)
-        self.vitals_card.body.addStretch(1)
+        self.vitals_card.body.setAlignment(QtCore.Qt.AlignTop)
 
         self.sleep_card = Card("Sleep", theme.SLEEP)
         self.hypnogram = Hypnogram()
@@ -786,7 +705,7 @@ class TodayPage(QtWidgets.QScrollArea):
             ("debt", "Sleep debt", theme.FG_MUTED))}
         for r in self.sleep_rows.values():
             self.sleep_stats.body.addWidget(r)
-        self.sleep_stats.body.addStretch(1)
+        self.sleep_stats.body.setAlignment(QtCore.Qt.AlignTop)
 
         self.steps_card = Card("Steps", theme.STEPS)
         self.steps_bars = Bars(theme.STEPS)
@@ -802,7 +721,16 @@ class TodayPage(QtWidgets.QScrollArea):
 
         self.battery_card = Card("Body Battery", theme.RECOVERY_GOOD)
         self.battery_chart = AreaChart(theme.RECOVERY_GOOD)
-        self.battery_card.body.addWidget(self.battery_chart, 1)
+        self.battery_gauge = BodyBattery()
+        self.battery_views = QtWidgets.QStackedWidget()
+        self.battery_views.setFixedHeight(170)
+        self.battery_views.addWidget(self.battery_gauge)
+        self.battery_views.addWidget(self.battery_chart)
+        self.battery_switch = QtWidgets.QCheckBox("Graph view")
+        self.battery_switch.setAccessibleName("Show body battery graph")
+        self.battery_switch.toggled.connect(lambda graph: self.battery_views.setCurrentIndex(int(graph)))
+        self.battery_card.body.itemAt(0).layout().addWidget(self.battery_switch)
+        self.battery_card.body.addWidget(self.battery_views)
 
         self.cards = [self.rings_card, self.live_card, self.hr_card, self.vitals_card,
                       self.sleep_card, self.sleep_stats, self.steps_card,
@@ -810,7 +738,7 @@ class TodayPage(QtWidgets.QScrollArea):
         self.animated = [self.cell_recovery.ring, self.cell_strain.ring,
                          self.cell_sleep.ring, self.hr_chart, self.hypnogram,
                          self.steps_bars, self.zone_bar, self.stress_chart,
-                         self.battery_chart]
+                         self.battery_chart, self.battery_gauge]
 
     #: (card, row, col, row span, col span) for 12 / 6 / 1 column grids.
     def _layout_for(self, cols: int):
@@ -818,8 +746,8 @@ class TodayPage(QtWidgets.QScrollArea):
         if cols == 12:
             return [(c[0], 0, 0, 1, 6), (c[1], 0, 6, 1, 6), (c[2], 1, 0, 1, 8),
                     (c[3], 1, 8, 1, 4), (c[4], 2, 0, 1, 8), (c[5], 2, 8, 1, 4),
-                    (c[6], 3, 0, 1, 3), (c[7], 3, 3, 1, 3), (c[8], 3, 6, 1, 3),
-                    (c[9], 3, 9, 1, 3)]
+                    (c[6], 3, 0, 1, 6), (c[7], 3, 6, 1, 6), (c[8], 4, 0, 1, 6),
+                    (c[9], 4, 6, 1, 6)]
         if cols == 6:
             return [(c[0], 0, 0, 1, 6), (c[1], 1, 0, 1, 6), (c[2], 2, 0, 1, 6),
                     (c[4], 3, 0, 1, 6), (c[3], 4, 0, 1, 3), (c[5], 4, 3, 1, 3),
@@ -933,6 +861,7 @@ class TodayPage(QtWidgets.QScrollArea):
         self.hr_card.aside.setText(f"Resting {s.rhr_bpm:.0f} bpm" if s.rhr_bpm else "")
         self.stress_chart.set(d["stress"], d["start"], d["end"], (0, 100))
         self.battery_chart.set(d["body_battery"], d["start"], d["end"], (0, 100))
+        self.battery_gauge.set(d["body_battery"])
         self.steps_bars.set(d["steps"])
         t = d["totals"]
         self.steps_card.aside.setText(
@@ -968,15 +897,7 @@ class TodayPage(QtWidgets.QScrollArea):
         self.live_hr.set(bpm or None)
         self.live_spo2.set(sample.spo2)
         self.live_stress.set(sample.stress)
-        text, color = {
-            "charging": ("Charging", theme.RECOVERY_MID),
-            "wrist": ("On wrist", theme.RECOVERY_GOOD),
-            "off_wrist": ("Off wrist", theme.FG_MUTED),
-            "unknown": ("Connected", theme.RECOVERY_GOOD)}[sample.place]
-        style(self.live_dot, 10, color=color)
-        self.live_place.setText(f"{text} · updated {sample.at:%H:%M:%S}")
-        self.live_battery.setText("" if sample.battery is None else (
-            f"{'⚡ ' if charging else ''}Battery {sample.battery}%"))
+        self.live_card.setToolTip(f"Updated {sample.at:%H:%M:%S}")
         if bpm and self.day == dt.date.today() and self.hr_chart.points:
             if sample.at > self.hr_chart.points[-1][0]:
                 self.hr_chart.append(sample.at, float(bpm))
