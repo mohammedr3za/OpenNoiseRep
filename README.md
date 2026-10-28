@@ -25,6 +25,12 @@ Python package and command are still named `noiserep`.
 |---|---|
 | ![Day mode with calendar and previous/next day](docs/images/day.png) | ![Menu-bar heart states: 72, tilde, dash](docs/images/menubar.png) |
 
+## Demo
+
+[Watch the 19-second MP4](docs/media/OpenNoiseRep-demo.mp4)
+
+![OpenNoiseRep demo](docs/media/OpenNoiseRep-demo.gif)
+
 ## Features
 
 - Historical sync: device info, data index, heart-rate/activity series and
@@ -61,6 +67,15 @@ noiserep decode capture.pklg       # offline
 
 The band accepts one BLE central at a time. Wake it (or put it on the charger)
 and turn the phone's Bluetooth off while syncing.
+
+## Further development
+
+- Custom notification vibration: validate the `buzz` patterns and add triggers.
+- Live HR: confirm the realtime command or start the optical sensor on demand.
+- Sleep stages and score: fetch and decode a staged sleep file.
+- Workout files: parse sport files when the band sends them.
+- Temperature calibration for raw values such as 213.
+- Packaging, signing, and Windows.
 
 ## Docs
 

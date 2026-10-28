@@ -779,8 +779,10 @@ class MenubarApp(QtCore.QObject):
         band = self._band
         if band is None:
             return None
-        # Use the whole device timeline: the band's RTC may be unset (~2002).
-        since = datetime.datetime(2000, 1, 1)
+        # The band rejects a 2000 date with an empty status frame.  Ask for
+        # today; a paired band's clock is current, and this is the live series.
+        since = datetime.datetime.now().replace(
+            hour=0, minute=0, second=0, microsecond=0)
         async with self._op_lock:
             await band.send(commands.series(113, since, realtime.HEART_RATE_METRIC))
         loop = asyncio.get_running_loop()

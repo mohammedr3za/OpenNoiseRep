@@ -99,11 +99,18 @@ async def run_sync(band, since: datetime.datetime, want_files: bool = True,
     await _ask(band, commands.data_index(), "index", result, reply_timeout)
     done += 1
     report("index")
+    # A 2000 "fetch everything" date is rejected by a paired band (empty
+    # status reply), so use the earliest date the band actually indexed.
+    series_since = since
+    if since.year <= 2001 and result.index is not None:
+        dates = [r.date for r in result.index.records]
+        if dates:
+            series_since = min(dates)
     for metric_id in commands.METRIC_IDS:
         if time.monotonic() - start > overall_timeout:
             break
         for cmd_type in (113, 115):
-            await _ask(band, commands.series(cmd_type, since, metric_id),
+            await _ask(band, commands.series(cmd_type, series_since, metric_id),
                        f"series-{cmd_type}-{metric_id}", result, reply_timeout)
             done += 1
             report("series")

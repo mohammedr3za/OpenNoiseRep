@@ -48,6 +48,19 @@ def test_run_sync_sorts_replies(capture_payloads):
     assert band.sent  # it actually issued commands
 
 
+def test_run_sync_uses_an_indexed_date_when_since_is_epoch(capture_payloads):
+    from noiserep import wire
+
+    idx = _recv_by_type(capture_payloads, 112)
+    band = FakeBand([idx])
+    asyncio.run(run_sync(band, datetime.datetime(2000, 1, 1),
+                         want_files=False, reply_timeout=0.2))
+    series = [p for p in band.sent if wire.field(p, 1) in (113, 115)]
+    assert series
+    date = wire.sub(series[0], 9, 1, 1)
+    assert wire.field(date, 1) == 2026      # the index's year, not 2000
+
+
 def test_write_result_writes_files(tmp_path, capture_payloads):
     dev = _recv_by_type(capture_payloads, 32)
     hr = _recv_by_type(capture_payloads, 113, longest=True)
