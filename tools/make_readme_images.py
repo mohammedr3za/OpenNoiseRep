@@ -61,15 +61,42 @@ def _synthetic_store() -> Store:
     steps = [0] * 24                         # 1 h
     for hour in (7, 8, 9, 12, 13, 18, 19, 20):
         steps[hour] = 260 + hour * 23
+    distance = [int(value * 0.714) for value in steps]
+    calories = [int(value * 0.16) for value in steps]
+    active = [1 if value else 0 for value in steps]
 
     imports = [0] * 24                       # 1 h (metric 11: unknown flag)
     imports[8] = 1
+
+    spo2 = [0] * 288                         # 5 min; sparse real readings
+    for i in (40, 90, 140, 190, 240):
+        spo2[i] = 96 + i % 4
+
+    temp = [0] * 24                          # 1 h, candidate skin temperature
+    for hour in range(6, 23):
+        temp[hour] = 30 + hour % 3
 
     r.series = [
         MetricSeries(BASE, 2, 30, heart, b""),
         MetricSeries(BASE, 21, 900, hrv, b""),
         MetricSeries(BASE, 22, 300, stress, b""),
-        MetricSeries(BASE, 0, 3600, steps, b""),
+        MetricSeries(BASE, 4, 300, spo2, b""),
+        MetricSeries(BASE, 23, 3600, temp, b""),
+        MetricSeries(
+            BASE, 0, 3600, steps, b"",
+            channels={
+                "steps": steps,
+                "distance_m": distance,
+                "calories": calories,
+                "active_minutes": active,
+            },
+            totals={
+                "steps": sum(steps),
+                "distance_m": sum(distance),
+                "calories": sum(calories),
+                "active_minutes": sum(active),
+            },
+        ),
         MetricSeries(BASE, 11, 3600, imports, b""),
     ]
 

@@ -142,6 +142,16 @@ QFrame#tile:focus {{ border: 2px solid {FOCUS}; }}
 QFrame#statCard {{ background: {PANEL}; border: 1px solid {BORDER};
     border-radius: 14px; }}
 QFrame#statCard:hover {{ border: 1px solid {ACCENT_HOVER}; }}
+QFrame#vitalCard, QFrame#goalCard {{ background: {PANEL};
+    border: 1px solid {BORDER}; border-radius: 14px; }}
+QLabel#vitalLabel, QLabel#goalLabel {{ color: {FG_MUTED}; font-size: 10px;
+    letter-spacing: 1.1px; }}
+QLabel#vitalValue, QLabel#goalValue {{ color: {FG}; font-size: 24px;
+    font-weight: 700; }}
+QLabel#vitalUnit, QLabel#goalUnit {{ color: {FG_MUTED}; font-size: 11px; }}
+QLabel#vitalBadge {{ color: {ACCENT_DEEP}; font-size: 9px; font-weight: 600;
+    letter-spacing: 0.5px; }}
+QLabel#goalMeta {{ color: {FG_MUTED}; font-size: 10px; }}
 QFrame#divider {{ background: {BORDER}; min-height: 1px; max-height: 1px;
     border: none; }}
 

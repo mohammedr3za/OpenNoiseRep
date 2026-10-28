@@ -19,8 +19,8 @@ from PySide6 import QtCore, QtGui, QtWidgets  # noqa: E402
 
 from noiserep.gui import theme  # noqa: E402
 from noiserep.gui.app import (  # noqa: E402
-    RANGE_MODES, MainWindow, _columns_for_width, _downsample, _segments,
-    display_name, display_unit,
+    RANGE_MODES, MainWindow, _columns_for_width, _downsample, _movement_columns,
+    _segments, _vitals_columns, display_name, display_unit,
 )
 from noiserep.protocol.decode import DeviceInfo, MetricSeries  # noqa: E402
 from noiserep.store import Store  # noqa: E402
@@ -51,6 +51,50 @@ def _seeded(day: datetime.datetime | None = None, others: bool = True) -> Store:
 def _window(store=None) -> MainWindow:
     _app()
     return MainWindow(store if store is not None else _seeded())
+
+
+def _today_at_six() -> datetime.datetime:
+    return datetime.datetime.combine(
+        datetime.date.today(), datetime.time(6, 0))
+
+
+def _seeded_with_other() -> Store:
+    """The normal seed plus one unmapped channel, so a tile remains."""
+    store = _seeded()
+    r = SyncResult()
+    r.series = [MetricSeries(_today_at_six(), 99, 60, [0, 5, 6], b"")]
+    store.ingest(r)
+    return store
+
+
+def _seeded_vitals() -> Store:
+    """Heart rate plus all five vitals and the four daily-activity channels."""
+    day = _today_at_six()
+    r = SyncResult()
+    r.device = DeviceInfo("1.4.0", "SN-TEST", "aa:bb:cc:dd:ee:ff", "R1")
+    r.series = [
+        MetricSeries(day, 2, 30, [0, 72, 74, 76], b""),       # HR
+        MetricSeries(day, 21, 900, [0, 58, 60], b""),         # HRV
+        MetricSeries(day, 22, 300, [0, 35, 40], b""),         # stress
+        MetricSeries(day, 4, 300, [0, 98], b""),              # SpO2
+        MetricSeries(day, 23, 3600, [0, 27], b""),            # temp candidate
+        MetricSeries(day, 0, 3600, [], b"", channels={
+            "steps": [0, 1200, 1800],
+            "distance_m": [0, 850, 1300],
+            "calories": [0, 90, 130],
+            "active_minutes": [0, 12, 20],
+        }),
+    ]
+    store = Store(":memory:")
+    store.ingest(r)
+    return store
+
+
+def _label_texts(widget) -> str:
+    """All label text under ``widget`` (including the widget itself)."""
+    labels = [widget] if isinstance(widget, QtWidgets.QLabel) else []
+    labels += widget.findChildren(QtWidgets.QLabel)
+    return " ".join(label.text() for label in labels)
 
 
 # -- labels -----------------------------------------------------------------
@@ -125,10 +169,87 @@ def test_overview_lists_metrics_and_opens_detail():
 
 
 def test_overview_value_block_and_tiles_exist():
-    w = _window()
+    w = _window(_seeded_with_other())
     assert w.tiles_grid is not None
-    assert len(w._tile_widgets) == len(w._shown_metrics) - 1
+    # Featured metrics live in their own sections; only metric_99 remains.
+    assert len(w._tile_widgets) == 1
+    assert w.vital_cards
     assert w.ov_stack.currentIndex() == 0
+    w.close()
+
+
+def test_vitals_render_values_and_units():
+    w = _window(_seeded_vitals())
+    texts = {key: _label_texts(card)
+             for key, card in w.vital_cards.items()}
+    assert set(texts) == {"hrv", "resting_hr", "spo2", "temperature", "stress"}
+    assert "60" in texts["hrv"] and "ms" in texts["hrv"]
+    assert "72" in texts["resting_hr"] and "bpm" in texts["resting_hr"]
+    assert "estimate" in texts["resting_hr"].lower()
+    assert "98" in texts["spo2"] and "%" in texts["spo2"]
+    # Temperature is a candidate with no verified unit: show the value and no
+    # invented unit, only the candidate badge.
+    assert "27" in texts["temperature"]
+    assert "candidate" in texts["temperature"].lower()
+    assert "°" not in texts["temperature"]
+    assert "40" in texts["stress"]
+    w.close()
+
+
+def test_missing_vitals_show_dash_and_explaining_tooltip():
+    w = _window()                  # seed has HR + HRV only
+    for key in ("stress", "spo2", "temperature"):
+        card = w.vital_cards[key]
+        assert "—" in _label_texts(card)
+        tip = card.toolTip().lower()
+        assert "no " in tip and "sample" in tip and "range" in tip
+    w.close()
+
+
+def test_heart_and_stress_cards_show_latest_and_time():
+    w = _window(_seeded_vitals())
+    heart = _label_texts(w.heart_cards["heart_rate"])
+    assert "76" in heart and "bpm" in heart and "Last reading" in heart
+    stress = _label_texts(w.heart_cards["stress"])
+    assert "40" in stress and "Last reading" in stress
+    w.close()
+
+
+def test_movement_totals_progress_and_default_goal_note():
+    w = _window(_seeded_vitals())
+    assert w.goal_progress["steps"].maximum() == 5000
+    assert w.goal_progress["steps"].value() == 3000
+    assert w.goal_progress["active_minutes"].maximum() == 30
+    assert w.goal_progress["active_minutes"].value() == 30   # capped at goal
+    assert w.goal_progress["distance_m"].maximum() == 4000
+    assert w.goal_progress["distance_m"].value() == 2150
+    assert w.goal_progress["calories"].maximum() == 200
+    assert w.goal_progress["calories"].value() == 200        # 220 capped
+    steps = _label_texts(w.goal_cards["steps"])
+    assert "3,000" in steps and "5,000" in steps
+    assert "km" in _label_texts(w.goal_cards["distance_m"])
+    assert "kcal" in _label_texts(w.goal_cards["calories"])
+    assert "min" in _label_texts(w.goal_cards["active_minutes"])
+    assert "hydration" in w.goals_note.text()
+    w.close()
+
+
+def test_responsive_card_breakpoints():
+    assert [_vitals_columns(w) for w in (1000, 700, 400)] == [5, 3, 2]
+    assert [_movement_columns(w) for w in (1000, 600, 300)] == [4, 2, 1]
+
+
+def test_vitals_grid_reflows_on_resize():
+    w = _window(_seeded_vitals())
+    w.resize(1440, 900)
+    w.show()
+    _app().processEvents()
+    w._relayout_tiles()
+    assert w._vitals_cols == 5
+    w.resize(900, 700)
+    _app().processEvents()
+    w._relayout_tiles()
+    assert w._vitals_cols == 3
     w.close()
 
 
@@ -327,7 +448,7 @@ def test_columns_for_width():
 
 
 def test_tiles_reflow_on_resize():
-    w = _window()
+    w = _window(_seeded_with_other())
     assert w._tile_widgets
     w.resize(1440, 900)
     w.show()
@@ -357,6 +478,26 @@ def test_sleep_card_appears_when_store_supports_it():
     w = _window(store)
     assert w.sleep_card is not None
     assert w.sleep_summary.text().startswith("6h")
+    w.close()
+
+
+def test_sleep_highlights_says_no_vendor_score():
+    store = _seeded()
+    store.sleep_sessions = lambda start=None, end=None: [{
+        "bedtime": datetime.datetime.combine(
+            datetime.date.today(), datetime.time(2, 0)),
+        "wake": datetime.datetime.combine(
+            datetime.date.today(), datetime.time(8, 0)),
+        "total_min": 360,
+        "source": "rri",
+    }]
+    store.rest_summary = lambda start=None, end=None: None
+    w = _window(store)
+    assert w.sleep_card is not None
+    text = _label_texts(w.sleep_card)
+    assert "from RRI" in text
+    assert "No vendor score" in text
+    assert "6h" in text
     w.close()
 
 

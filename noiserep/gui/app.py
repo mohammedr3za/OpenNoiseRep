@@ -198,6 +198,51 @@ def _columns_for_width(width: int) -> int:
     return max(1, min(3, width // 300))
 
 
+def _vitals_columns(width: int) -> int:
+    """Five compact vitals at wide widths, reflowing to three then two."""
+    if width >= 860:
+        return 5
+    if width >= 540:
+        return 3
+    return 2
+
+
+def _movement_columns(width: int) -> int:
+    """Four goal cards at wide widths, reflowing to two then one."""
+    if width >= 720:
+        return 4
+    if width >= 380:
+        return 2
+    return 1
+
+
+#: Metrics already given a dedicated overview section; they are not repeated
+#: in the generic "Other channels" tile grid.
+_FEATURED_METRICS = frozenset({
+    "heart_rate",
+    "steps", "distance_m", "calories", "active_minutes",
+    "heart_rate_variability", "stress", "blood_oxygen", "metric_23",
+})
+
+#: Short caption for each of the five vital cards, in display order.
+_VITAL_CARDS = (
+    ("hrv", "HRV"),
+    ("resting_hr", "Resting HR"),
+    ("spo2", "SpO2"),
+    ("temperature", "Temp"),
+    ("stress", "Stress"),
+)
+
+#: Movement channel, caption, display unit, default goal, and goal text.
+#: Distance goals are in metres; the card converts its total to kilometres.
+_MOVEMENT_GOALS = (
+    ("steps", "Steps", "steps", 5000, "5,000 steps"),
+    ("active_minutes", "Active Minutes", "min", 30, "30 min"),
+    ("distance_m", "Distance", "km", 4000, "4.0 km"),
+    ("calories", "Calories", "kcal", 200, "200 kcal"),
+)
+
+
 def _shortcut_label(seq: str) -> str:
     if sys.platform == "darwin":
         return seq.replace("Ctrl+", "⌘").replace("Esc", "esc")
@@ -826,6 +871,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self._tile_cols = 0
         self.sleep_card = None
         self.sleep_summary = None
+        self._vitals_grid = None
+        self._vital_widgets = []
+        self._vitals_cols = 0
+        self._movement_grid = None
+        self._movement_widgets = []
+        self._movement_cols = 0
+        self.vital_cards = {}
+        self.goal_cards = {}
+        self.goal_progress = {}
+        self.heart_cards = {}
+        self.goals_note = None
 
         start, end = self._range()
         metrics = self.store.metrics(start, end)
@@ -840,18 +896,21 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ov_body.addWidget(self._value_block(hero, rows, link=True))
         self.ov_body.addWidget(self._overview_chart(hero, rows))
         self.ov_body.addWidget(self._overview_stat_cards(rows))
+        self.ov_body.addWidget(self._vitals_section())
         sleep = self._maybe_sleep_card(start, end)
         if sleep is not None:
+            self.ov_body.addWidget(self._section_label("HIGHLIGHTS"))
             self.ov_body.addWidget(sleep)
+        self.ov_body.addWidget(self._heart_stress_section())
+        self.ov_body.addWidget(self._movement_section())
         workouts = self._workouts_section()
         if workouts is not None:
             self.ov_body.addWidget(workouts)
 
-        others = [m for m in metrics if m != hero]
+        others = [m for m in metrics
+                  if m != hero and m not in _FEATURED_METRICS]
         if others:
-            label = QtWidgets.QLabel("OTHER CHANNELS")
-            label.setObjectName("sectionLabel")
-            self.ov_body.addWidget(label)
+            self.ov_body.addWidget(self._section_label("OTHER CHANNELS"))
             self.ov_body.addWidget(self._tiles_section(others, start, end))
 
         self.ov_body.addStretch(1)
@@ -871,6 +930,317 @@ class MainWindow(QtWidgets.QMainWindow):
                 "No data yet — sync your band to pull its history. Put the "
                 "band nearby with your phone's Bluetooth off.")
             self.empty_all_btn.hide()
+
+    # -- vitals / highlights / movement -----------------------------------
+    @staticmethod
+    def _section_label(text: str) -> QtWidgets.QLabel:
+        label = QtWidgets.QLabel(text)
+        label.setObjectName("sectionLabel")
+        return label
+
+    def _vitals_section(self) -> QtWidgets.QWidget:
+        start, end = self._range()
+        try:
+            vits = analytics.vitals(self.store, start, end)
+        except Exception:  # noqa: BLE001 - never break the overview
+            vits = {}
+
+        wrap = QtWidgets.QWidget()
+        outer = QtWidgets.QVBoxLayout(wrap)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(8)
+        outer.addWidget(self._section_label("VITALS"))
+
+        host = QtWidgets.QWidget()
+        grid = QtWidgets.QGridLayout(host)
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setSpacing(12)
+        self._vitals_grid = grid
+        self._vital_widgets = []
+        self.vital_cards = {}
+        for key, caption in _VITAL_CARDS:
+            vital = vits.get(key)
+            if vital is None:
+                continue
+            card = self._vital_card(caption, vital)
+            self.vital_cards[key] = card
+            self._vital_widgets.append(card)
+
+        cols = _vitals_columns(self._content_width())
+        self._place_cards(grid, self._vital_widgets, cols, len(_VITAL_CARDS))
+        self._vitals_cols = cols
+        outer.addWidget(host)
+        return wrap
+
+    def _vital_card(self, caption: str, vital) -> QtWidgets.QFrame:
+        card = QtWidgets.QFrame()
+        card.setObjectName("vitalCard")
+        card.setMinimumHeight(96)
+        card.setMinimumWidth(120)
+        card.setSizePolicy(QtWidgets.QSizePolicy.Expanding,
+                           QtWidgets.QSizePolicy.Preferred)
+        v = QtWidgets.QVBoxLayout(card)
+        v.setContentsMargins(15, 12, 15, 12)
+        v.setSpacing(2)
+
+        label = QtWidgets.QLabel(caption.upper())
+        label.setObjectName("vitalLabel")
+        v.addWidget(label)
+
+        value_text = _fmt(vital.value) if vital.available else "—"
+        row = QtWidgets.QHBoxLayout()
+        row.setSpacing(4)
+        value = QtWidgets.QLabel(value_text)
+        value.setObjectName("vitalValue")
+        row.addWidget(value, 0, QtCore.Qt.AlignBottom)
+        if vital.available and vital.unit:
+            unit = QtWidgets.QLabel(vital.unit)
+            unit.setObjectName("vitalUnit")
+            row.addWidget(unit, 0, QtCore.Qt.AlignBottom)
+        row.addStretch(1)
+        v.addLayout(row)
+
+        if vital.confidence in ("estimate", "candidate"):
+            badge = QtWidgets.QLabel(vital.confidence)
+            badge.setObjectName("vitalBadge")
+            v.addWidget(badge)
+        else:
+            v.addStretch(1)
+
+        card.setToolTip(self._vital_tooltip(vital))
+        shown = f"{value_text} {vital.unit or ''}".strip()
+        card.setAccessibleName(
+            f"{caption}: {shown}" if vital.available
+            else f"{caption}: not available")
+        return card
+
+    @staticmethod
+    def _vital_tooltip(vital) -> str:
+        if not vital.available:
+            parts = [
+                f"No {vital.label.lower()} sample was stored in this range.",
+                vital.source,
+            ]
+            if vital.note:
+                parts.append(vital.note)
+            return " · ".join(part for part in parts if part)
+
+        parts = [f"{vital.label}: {_fmt(vital.value)}"
+                 + (f" {vital.unit}" if vital.unit else "")]
+        if vital.at is not None:
+            parts.append(f"latest {vital.at:%d %b, %H:%M}")
+        if vital.source:
+            parts.append(vital.source)
+        if vital.note:
+            parts.append(vital.note)
+        return " · ".join(parts)
+
+    def _heart_stress_section(self) -> QtWidgets.QWidget:
+        start, end = self._range()
+        wrap = QtWidgets.QWidget()
+        outer = QtWidgets.QVBoxLayout(wrap)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(8)
+        outer.addWidget(self._section_label("HEART & STRESS"))
+
+        host = QtWidgets.QWidget()
+        row = QtWidgets.QHBoxLayout(host)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(12)
+        self.heart_cards = {}
+        hr_card = self._reading_card(
+            "Heart Rate", self.store.samples("heart_rate", start, end), "bpm")
+        stress_card = self._reading_card(
+            "Stress", self.store.samples("stress", start, end), None)
+        self.heart_cards["heart_rate"] = hr_card
+        self.heart_cards["stress"] = stress_card
+        row.addWidget(hr_card, 1)
+        row.addWidget(stress_card, 1)
+        outer.addWidget(host)
+        return wrap
+
+    def _reading_card(self, caption: str, rows, unit: str | None
+                      ) -> QtWidgets.QFrame:
+        card = QtWidgets.QFrame()
+        card.setObjectName("statCard")
+        card.setMinimumHeight(106)
+        card.setSizePolicy(QtWidgets.QSizePolicy.Expanding,
+                           QtWidgets.QSizePolicy.Preferred)
+        v = QtWidgets.QVBoxLayout(card)
+        v.setContentsMargins(20, 14, 20, 14)
+        v.setSpacing(3)
+
+        label = QtWidgets.QLabel(caption.upper())
+        label.setObjectName("statLabel")
+        v.addWidget(label)
+
+        value_text = _fmt(rows[-1][1]) if rows else "—"
+        value_row = QtWidgets.QHBoxLayout()
+        value_row.setSpacing(4)
+        value = QtWidgets.QLabel(value_text)
+        value.setObjectName("statNum")
+        value_row.addWidget(value, 0, QtCore.Qt.AlignBottom)
+        if rows and unit:
+            unit_label = QtWidgets.QLabel(unit)
+            unit_label.setObjectName("tileUnit")
+            value_row.addWidget(unit_label, 0, QtCore.Qt.AlignBottom)
+        value_row.addStretch(1)
+        v.addLayout(value_row)
+
+        if rows:
+            when = rows[-1][0]
+            if when.date() == datetime.date.today():
+                when_text = f"Last reading {when:%H:%M}"
+            else:
+                when_text = f"Last reading {when:%d %b, %H:%M}"
+        else:
+            when_text = "No readings in this range"
+        sub = QtWidgets.QLabel(when_text)
+        sub.setObjectName("muted")
+        sub.setWordWrap(True)
+        v.addWidget(sub)
+        v.addStretch(1)
+
+        shown = f"{value_text} {unit or ''}".strip() if rows else "not available"
+        card.setAccessibleName(f"{caption}: {shown}; {when_text}")
+        if not rows:
+            card.setToolTip(
+                f"No {caption.lower()} samples were stored in this range.")
+        return card
+
+    def _movement_section(self) -> QtWidgets.QWidget:
+        start, end = self._range()
+        wrap = QtWidgets.QWidget()
+        outer = QtWidgets.QVBoxLayout(wrap)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(8)
+        outer.addWidget(self._section_label("MOVEMENT & GOALS"))
+
+        host = QtWidgets.QWidget()
+        grid = QtWidgets.QGridLayout(host)
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setSpacing(12)
+        self._movement_grid = grid
+        self._movement_widgets = []
+        self.goal_cards = {}
+        self.goal_progress = {}
+        for channel, caption, unit, goal, goal_text in _MOVEMENT_GOALS:
+            card, progress = self._goal_card(
+                channel, caption, unit, goal, goal_text,
+                self.store.samples(channel, start, end))
+            self.goal_cards[channel] = card
+            self.goal_progress[channel] = progress
+            self._movement_widgets.append(card)
+
+        cols = _movement_columns(self._content_width())
+        self._place_cards(grid, self._movement_widgets, cols,
+                          len(_MOVEMENT_GOALS))
+        self._movement_cols = cols
+        outer.addWidget(host)
+
+        self.goals_note = QtWidgets.QLabel(
+            "Goals are defaults; the band does not measure hydration.")
+        self.goals_note.setObjectName("muted")
+        self.goals_note.setWordWrap(True)
+        outer.addWidget(self.goals_note)
+        return wrap
+
+    def _goal_card(self, channel: str, caption: str, unit: str, goal: int,
+                   goal_text: str, rows) -> tuple[QtWidgets.QFrame,
+                                                  QtWidgets.QProgressBar]:
+        card = QtWidgets.QFrame()
+        card.setObjectName("goalCard")
+        card.setMinimumHeight(116)
+        card.setMinimumWidth(140)
+        card.setSizePolicy(QtWidgets.QSizePolicy.Expanding,
+                           QtWidgets.QSizePolicy.Preferred)
+        v = QtWidgets.QVBoxLayout(card)
+        v.setContentsMargins(15, 12, 15, 12)
+        v.setSpacing(4)
+
+        label = QtWidgets.QLabel(caption.upper())
+        label.setObjectName("goalLabel")
+        v.addWidget(label)
+
+        total = sum(value for _, value in rows) if rows else 0.0
+        if not rows:
+            shown_value, shown_unit = "—", ""
+        elif channel == "distance_m":
+            shown_value, shown_unit = f"{total / 1000.0:.1f}", "km"
+        else:
+            shown_value, shown_unit = f"{int(round(total)):,}", unit
+
+        value_row = QtWidgets.QHBoxLayout()
+        value_row.setSpacing(4)
+        value = QtWidgets.QLabel(shown_value)
+        value.setObjectName("goalValue")
+        value_row.addWidget(value, 0, QtCore.Qt.AlignBottom)
+        if shown_unit:
+            unit_label = QtWidgets.QLabel(shown_unit)
+            unit_label.setObjectName("goalUnit")
+            value_row.addWidget(unit_label, 0, QtCore.Qt.AlignBottom)
+        value_row.addStretch(1)
+        v.addLayout(value_row)
+
+        progress = QtWidgets.QProgressBar()
+        progress.setTextVisible(False)
+        progress.setRange(0, goal)
+        progress.setValue(int(round(min(total, float(goal)))) if rows else 0)
+        progress.setAccessibleName(f"{caption} progress")
+        v.addWidget(progress)
+
+        if rows:
+            pct = (total / goal * 100.0) if goal else 0.0
+            meta_text = f"{pct:.0f}% of {goal_text} · default goal"
+        else:
+            meta_text = f"Goal {goal_text} (default) · no data in this range"
+        meta = QtWidgets.QLabel(meta_text)
+        meta.setObjectName("goalMeta")
+        meta.setWordWrap(True)
+        v.addWidget(meta)
+        v.addStretch(1)
+
+        card.setAccessibleName(f"{caption}: {shown_value} {shown_unit}".strip()
+                               + f"; {meta_text}")
+        if not rows:
+            card.setToolTip(
+                f"No {caption.lower()} samples were stored in this range.")
+        return card, progress
+
+    @staticmethod
+    def _place_cards(grid: QtWidgets.QGridLayout, widgets, cols: int,
+                     max_cols: int) -> None:
+        """Reflow ``widgets`` into ``cols`` columns of an existing grid."""
+        while grid.count():
+            grid.takeAt(0)
+        for c in range(max_cols):
+            grid.setColumnStretch(c, 0)
+        for i, widget in enumerate(widgets):
+            grid.addWidget(widget, i // cols, i % cols)
+        for c in range(cols):
+            grid.setColumnStretch(c, 1)
+
+    def _relayout_vitals(self) -> None:
+        grid = getattr(self, "_vitals_grid", None)
+        widgets = getattr(self, "_vital_widgets", [])
+        if grid is None or not widgets:
+            return
+        cols = _vitals_columns(self._content_width())
+        if cols == self._vitals_cols and grid.count() == len(widgets):
+            return
+        self._place_cards(grid, widgets, cols, len(_VITAL_CARDS))
+        self._vitals_cols = cols
+
+    def _relayout_movement(self) -> None:
+        grid = getattr(self, "_movement_grid", None)
+        widgets = getattr(self, "_movement_widgets", [])
+        if grid is None or not widgets:
+            return
+        cols = _movement_columns(self._content_width())
+        if cols == self._movement_cols and grid.count() == len(widgets):
+            return
+        self._place_cards(grid, widgets, cols, len(_MOVEMENT_GOALS))
+        self._movement_cols = cols
 
     def _value_block(self, metric: str, rows, link: bool = False,
                      centered: bool = False) -> QtWidgets.QWidget:
@@ -971,11 +1341,11 @@ class MainWindow(QtWidgets.QMainWindow):
         return self._stat_cards_row(specs)
 
     def _maybe_sleep_card(self, start, end):
-        """Last night's rest, from RRI or a real sleep file.
+        """Last night's rest, used as the compact Highlights card.
 
-        A session is shown only when the store has one.  The sub-label and
-        insight text distinguish an RRI-derived rest span from a staged sleep
-        file, so the numbers are never presented as more than they are.
+        A session is shown only when the store has one.  The card reports the
+        duration, bedtime/wake and RRI summary; the band has no vendor sleep
+        score, so it says so rather than inventing one.
         """
         self.sleep_card = None
         self.sleep_summary = None
@@ -1034,6 +1404,11 @@ class MainWindow(QtWidgets.QMainWindow):
         sub.setObjectName("muted")
         row.addWidget(sub, 0, QtCore.Qt.AlignBottom)
         row.addStretch(1)
+        no_score = QtWidgets.QLabel("No vendor score")
+        no_score.setObjectName("muted")
+        no_score.setToolTip(
+            "The band does not report a vendor sleep score; none is invented.")
+        row.addWidget(no_score, 0, QtCore.Qt.AlignBottom)
         v.addLayout(row)
 
         if summary is not None:
@@ -1056,17 +1431,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 chips.addLayout(cell)
             chips.addStretch(1)
             v.addLayout(chips)
-            notes = analytics.insights(summary)
-            for line in notes[1:3]:
-                note = QtWidgets.QLabel(line)
-                note.setObjectName("muted")
-                note.setWordWrap(True)
-                v.addWidget(note)
-            if len(notes) > 3:
-                caveat = QtWidgets.QLabel(notes[3])
-                caveat.setObjectName("muted")
-                caveat.setWordWrap(True)
-                v.addWidget(caveat)
         else:
             hint = QtWidgets.QLabel("No RRI beats recorded in this window.")
             hint.setObjectName("muted")
@@ -1076,7 +1440,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sleep_card = frame
         frame.setAccessibleName(
             f"Last night: {_fmt_span(total_min * 60)} from {bedtime:%H:%M} "
-            f"to {wake:%H:%M}")
+            f"to {wake:%H:%M}; no vendor score")
         return frame
 
     def _workouts_section(self):
@@ -1976,6 +2340,10 @@ class MainWindow(QtWidgets.QMainWindow):
         return max(0, max(self.stack.width(), self.width() - 56) - 56)
 
     def _relayout_tiles(self) -> None:
+        # Keep the vitals/goal rows responsive even when there are no generic
+        # channel tiles to reflow.
+        self._relayout_vitals()
+        self._relayout_movement()
         if self.tiles_grid is None or not self._tile_widgets:
             return
         cols = _columns_for_width(self._content_width())
