@@ -14,6 +14,9 @@ from .protocol import commands
 from .protocol.decode import (
     decode_payload, DeviceInfo, DataIndex, MetricSeries, DeviceFile,
 )
+from .protocol.files import (
+    RriFile, SleepSession, assemble_activity_files, decode_activity_file,
+)
 from .protocol.metrics import metric_name
 
 
@@ -24,6 +27,20 @@ class SyncResult:
     series: list = field(default_factory=list)
     files: list = field(default_factory=list)
     raw: list = field(default_factory=list)      # list[tuple[label, bytes]]
+    rri: list = field(default_factory=list)      # list[RriFile]
+    sleep: list = field(default_factory=list)    # list[SleepSession]
+
+
+def _decode_pushed_files(result: SyncResult) -> None:
+    """Assemble and decode type-4097 chunks into RRI / sleep records."""
+    for activity in assemble_activity_files(result.files):
+        # The name stamps the end of an RRI window; decode_activity_file
+        # converts it to a slot-0 start.
+        decoded = decode_activity_file(activity.name, activity.data)
+        if isinstance(decoded, RriFile):
+            result.rri.append(decoded)
+        elif isinstance(decoded, SleepSession):
+            result.sleep.append(decoded)
 
 
 def _sort(rec, result: SyncResult) -> None:
@@ -52,20 +69,52 @@ async def _ask(band, payload: bytes, label: str, result: SyncResult, timeout: fl
 
 async def run_sync(band, since: datetime.datetime, want_files: bool = True,
                    reply_timeout: float = 6.0, file_timeout: float = 12.0,
-                   overall_timeout: float = 90.0) -> SyncResult:
+                   overall_timeout: float = 90.0, progress=None) -> SyncResult:
+    """Fetch history from a live band and collect decoded records.
+
+    ``progress``, if given, is called ``progress(done, total, stage)`` as the
+    sync advances, for a UI progress indicator. ``stage`` is a machine tag —
+    ``"device"``, ``"index"``, ``"series"``, ``"control"``, ``"files"``
+    (reported with ``total == 0`` because the file count is unknown ahead of
+    time, i.e. indeterminate), then ``"done"``. The tags carry no user-facing
+    wording, keeping this layer text-free; the caller maps them to labels.
+    Exceptions raised by the callback are swallowed.
+    """
     start = time.monotonic()
     result = SyncResult()
+    total = 2 + len(commands.METRIC_IDS) * 2 + 2
+    done = 0
+
+    def report(stage: str, indeterminate: bool = False) -> None:
+        if progress is None:
+            return
+        try:
+            progress(done, 0 if indeterminate else total, stage)
+        except Exception:
+            pass
+
     await _ask(band, commands.device_info(), "devinfo", result, reply_timeout)
+    done += 1
+    report("device")
     await _ask(band, commands.data_index(), "index", result, reply_timeout)
+    done += 1
+    report("index")
     for metric_id in commands.METRIC_IDS:
         if time.monotonic() - start > overall_timeout:
             break
         for cmd_type in (113, 115):
             await _ask(band, commands.series(cmd_type, since, metric_id),
                        f"series-{cmd_type}-{metric_id}", result, reply_timeout)
+            done += 1
+            report("series")
     await _ask(band, commands.control_123(), "ctl123", result, reply_timeout)
+    done += 1
+    report("control")
     await _ask(band, commands.control_117(), "ctl117", result, reply_timeout)
+    done += 1
+    report("control")
     if want_files:
+        report("files", indeterminate=True)
         while True:
             if time.monotonic() - start > overall_timeout:
                 break
@@ -78,6 +127,8 @@ async def run_sync(band, since: datetime.datetime, want_files: bool = True,
                 _sort(decode_payload(payload), result)
             except Exception:
                 pass
+    _decode_pushed_files(result)
+    report("done")
     return result
 
 
@@ -103,6 +154,18 @@ def write_result(result: SyncResult, out_dir: str) -> str:
         ],
         "files": [
             {"name": f.name, "bytes": len(f.data), "flag": f.flag} for f in result.files
+        ],
+        "rri": [
+            {"start": None if r.start is None else r.start.isoformat(),
+             "samples": len(r.samples), "rejected": r.rejected,
+             "slots": r.total_slots} for r in result.rri
+        ],
+        "sleep": [
+            {"bedtime": s.bedtime.isoformat(), "wake": s.wake.isoformat(),
+             "total_min": s.total_min, "deep_min": s.deep_min,
+             "light_min": s.light_min, "rem_min": s.rem_min,
+             "awake_min": s.awake_min, "quality": s.quality,
+             "source": s.source} for s in result.sleep
         ],
     }
     with open(os.path.join(out_dir, "decoded.json"), "w") as fh:

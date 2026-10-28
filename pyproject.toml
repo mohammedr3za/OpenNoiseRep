@@ -1,21 +1,69 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "noiserep"
-version = "0.0.1"
-description = "Read raw heart-rate / activity data off the Noise REP band, no vendor app."
+dynamic = ["version"]
+description = "Read raw heart-rate and activity data off the Noise REP band, without the vendor app."
+readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "noiserep contributors" }]
+keywords = [
+    "noise-rep",
+    "fitness band",
+    "bluetooth",
+    "ble",
+    "heart rate",
+    "reverse engineering",
+]
 dependencies = []
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Environment :: MacOS X",
+    "Environment :: X11 Applications :: Qt",
+    "Intended Audience :: Developers",
+    "Intended Audience :: End Users/Desktop",
+    "Intended Audience :: Science/Research",
+    "Operating System :: MacOS :: MacOS X",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Medical Science Apps.",
+    "Topic :: System :: Hardware",
+]
 
 [project.optional-dependencies]
 dev = ["pytest>=7"]
 ble = ["bleak>=0.20"]
+gui = ["PySide6>=6.6", "pyqtgraph>=0.13", "qasync>=0.27"]
 
 [project.scripts]
 noiserep = "noiserep.cli:main"
 
+# Set these once the public repository exists. PyPI renders them on the project
+# page, so do not publish placeholder URLs.
+# [project.urls]
+# Homepage = "https://github.com/<owner>/noiserep"
+# Repository = "https://github.com/<owner>/noiserep"
+# Issues = "https://github.com/<owner>/noiserep/issues"
+
 [tool.setuptools.packages.find]
 include = ["noiserep*"]
+
+[tool.setuptools.dynamic]
+version = { attr = "noiserep.__version__" }
+
+[tool.pytest.ini_options]
+minversion = "7"
+testpaths = ["tests"]
+# -ra keeps skips visible: capture-dependent tests skip without a local .pklg,
+# and GUI tests skip when PySide6/pyqtgraph/qasync are not installed.
+addopts = "-ra"

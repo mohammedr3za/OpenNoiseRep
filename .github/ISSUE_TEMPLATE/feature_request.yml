@@ -1,0 +1,59 @@
+name: Feature request
+description: Suggest a feature or an improvement
+title: "[feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        noiserep is **read-only by default**: it fetches history and never writes
+        settings, alarms, or the band clock. The one write path is the
+        experimental, `--yes`-gated `buzz` haptics command. New features that
+        write to the band need an explicit opt-in design, a clear safety case,
+        and hardware validation.
+        Please describe the user problem before the implementation.
+
+        Never include your band MAC, serial number, or real health values.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem would this solve?
+      description: Describe the user need or workflow, not just the feature.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Existing commands, exports, or scripts that might already help.
+
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Scope
+      options:
+        - Local-only (store, export, GUI, docs)
+        - Read-only band command
+        - Writes to the band (needs design review)
+        - Unsure
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I checked docs/ROADMAP.md and this is not already planned.
+          required: true
+        - label: This request contains no device identifiers or health data.
+          required: true

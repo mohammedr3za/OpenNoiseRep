@@ -20,9 +20,10 @@ def test_sync_invalid_since_returns_2(capsys):
     assert "invalid" in capsys.readouterr().err
 
 
-def test_parse_since_defaults_to_today_midnight():
+def test_parse_since_defaults_to_whole_device_history():
+    # The band's clock may be unset (~2002), so the default must not be today.
     dt = cli._parse_since(None)
-    assert dt.hour == 0 and dt.minute == 0 and dt.second == 0
+    assert dt.year == 2000 and (dt.month, dt.day) == (1, 1)
 
 
 def test_parse_since_accepts_iso_date():
