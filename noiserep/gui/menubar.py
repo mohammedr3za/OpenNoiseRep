@@ -55,7 +55,7 @@ def format_title(bpm: int | None, connected: bool,
 
 
 def make_icon(connected: bool, bpm: int | None = None,
-              removed: bool = False, size: int = 18) -> QtGui.QIcon:
+              removed: bool = False, size: int = 22) -> QtGui.QIcon:
     """A monochrome heart + number template, drawn with QPainter.
 
     macOS shows only the tray *icon*, not ``setTitle`` text, so the number is
@@ -65,7 +65,7 @@ def make_icon(connected: bool, bpm: int | None = None,
     menu bar's light/dark appearance.
     """
     ratio = 2
-    width = size + 40
+    width = size + 44
     pix = QtGui.QPixmap(width * ratio, size * ratio)
     pix.setDevicePixelRatio(ratio)
     pix.fill(QtCore.Qt.transparent)
@@ -92,7 +92,7 @@ def make_icon(connected: bool, bpm: int | None = None,
     label = (str(int(bpm)) if filled else
              ("~" if removed else "—"))
     font = QtGui.QFont("Helvetica Neue")
-    font.setPixelSize(13)
+    font.setPixelSize(15)
     font.setBold(True)
     painter.setFont(font)
     painter.setPen(QtGui.QColor(0, 0, 0))
