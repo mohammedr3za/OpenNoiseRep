@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import datetime as dt
 import functools
-from dataclasses import dataclass
+from dataclasses import dataclass, field as dc_field
 
 from ..wire import field, field_all, parse, sub
 
@@ -76,6 +76,105 @@ def decode_index(payload: bytes) -> DataIndex:
     return DataIndex(records)
 
 
+#: Metric 0 is a composite daily-activity record whose arrays are one value per
+#: hour.  Channel name -> body field number.  Arrays are big-endian u16.
+DAILY_CHANNELS: tuple[tuple[str, int], ...] = (
+    ("steps", 3),
+    ("distance_m", 5),
+    ("calories", 7),
+    ("active_minutes", 15),
+)
+
+#: Vendor-computed day totals that accompany the hourly arrays (field number).
+#: Distance has no scalar total, so it is summed from its array.
+DAILY_TOTAL_FIELDS: dict[str, int] = {
+    "steps": 9,
+    "calories": 10,
+    "active_minutes": 13,
+}
+
+#: The activity arrays cover a whole day at one value per hour.
+DAILY_HOURS = 24
+
+
+@dataclass
+class DailyActivity:
+    """Decoded metric-0 hourly channels and their day totals."""
+
+    channels: dict[str, list[int]]
+    totals: dict[str, int]
+
+
+def _hourly_u16(value, hours: int = DAILY_HOURS) -> list[int] | None:
+    """Decode up to ``hours`` big-endian u16 values from a byte string.
+
+    Returns ``None`` when the field is absent or too short to hold one value.
+    An odd trailing byte is ignored rather than shifting every later value, and
+    an over-long array is truncated, so a malformed length cannot manufacture
+    hours.  A missing channel stays absent; a present all-zero channel stays a
+    row of zeros (the store's zero-skipping decides what to persist).
+    """
+    if not isinstance(value, (bytes, bytearray)) or len(value) < 2:
+        return None
+    count = min(len(value) // 2, hours)
+    return [int.from_bytes(value[i * 2:i * 2 + 2], "big")
+            for i in range(count)]
+
+
+def decode_daily_channels(body: bytes) -> DailyActivity:
+    """Decode one metric-0 series body into hourly channels and day totals.
+
+    The body (a type-113/115 ``f9`` sub-message) carries the hourly arrays in
+    ``f3`` steps, ``f5`` distance in metres, ``f7`` active calories and ``f15``
+    active minutes.  Scalars ``f9``/``f10``/``f13`` are the vendor totals for
+    steps / calories / active minutes; when a scalar is absent (or truncated to
+    a non-integer) the array is summed instead.  ``f14`` is a cumulative
+    calorie array, not an independent total, and is deliberately not exposed.
+
+    Only channels whose field is a valid u16 array are returned; a channel with
+    no evidence is omitted rather than filled with zeros.
+    """
+    channels: dict[str, list[int]] = {}
+    for name, fno in DAILY_CHANNELS:
+        values = _hourly_u16(field(body, fno))
+        if values is not None:
+            channels[name] = values
+
+    totals: dict[str, int] = {}
+    for name, _ in DAILY_CHANNELS:
+        if name not in channels:
+            continue
+        if name == "distance_m":
+            totals[name] = sum(channels[name])
+            continue
+        scalar = field(body, DAILY_TOTAL_FIELDS[name])
+        totals[name] = scalar if isinstance(scalar, int) else sum(channels[name])
+    return DailyActivity(channels=channels, totals=totals)
+
+
+@_guarded
+def decode_daily_activity(payload: bytes) -> DailyActivity | None:
+    """Decode the metric-0 series in a full type-113/115 payload.
+
+    Returns ``None`` when the payload has no metric-0 body.  This is a
+    convenience over :func:`decode_series` for callers that only want the
+    daily-activity channels.
+    """
+    container = field(payload, 9)
+    if not isinstance(container, (bytes, bytearray)):
+        return None
+    for _, wt, body in parse(container):
+        if wt != 2:
+            continue
+        entry = field(body, 1)
+        if not isinstance(entry, (bytes, bytearray)):
+            continue
+        if field(entry, 2) != 0:
+            continue
+        return decode_daily_channels(body)
+    return None
+
+
 @dataclass
 class MetricSeries:
     date: dt.datetime
@@ -83,6 +182,10 @@ class MetricSeries:
     interval_s: int | None
     samples: list[int]
     raw: bytes = b""
+    #: Metric 0 only: decoded hourly arrays keyed by channel name.
+    channels: dict[str, list[int]] = dc_field(default_factory=dict)
+    #: Metric 0 only: day totals keyed by channel name.
+    totals: dict[str, int] = dc_field(default_factory=dict)
 
 
 @_guarded
@@ -92,7 +195,12 @@ def decode_series(payload: bytes) -> MetricSeries:
 
     samples / interval_s come only from f3 (a byte array whose cadence is f2).
     Without f3, samples is empty and interval_s is None; if f2 is bytes they
-    are kept untouched in `raw` (structure not yet understood)."""
+    are kept untouched in `raw` (structure not yet understood).
+
+    For metric 0 (daily activity) the raw f3 bytes stay in ``samples`` for
+    backwards compatibility, while the decoded 24-hour u16 arrays are added in
+    ``channels`` and ``totals`` (see :func:`decode_daily_channels`).
+    """
     container = field(payload, 9)
     if not isinstance(container, (bytes, bytearray)):
         raise DecodeError("no series container (field 9) in payload")
@@ -114,7 +222,13 @@ def decode_series(payload: bytes) -> MetricSeries:
         else:
             samples, interval = [], None
             raw = bytes(f2) if isinstance(f2, (bytes, bytearray)) else b""
-        return MetricSeries(decode_date(date_buf), metric_id, interval, samples, raw)
+        channels: dict[str, list[int]] = {}
+        totals: dict[str, int] = {}
+        if metric_id == 0:
+            activity = decode_daily_channels(body)
+            channels, totals = activity.channels, activity.totals
+        return MetricSeries(decode_date(date_buf), metric_id, interval, samples,
+                            raw, channels, totals)
     raise DecodeError("no series body (f9 sub-message with entry) in payload")
 
 

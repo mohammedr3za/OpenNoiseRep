@@ -40,6 +40,69 @@ class MetricInfo:
     source: str
 
 
+@dataclass(frozen=True)
+class ChannelInfo:
+    """A named channel inside a composite metric (currently metric 0).
+
+    Unlike :class:`MetricInfo` these are not metric ids: they are the four
+    hourly arrays carried by the daily-activity body.  ``name`` is the key the
+    store writes samples under, so ``Store.samples("steps")`` works directly.
+    """
+
+    name: str
+    unit: str | None
+    display_name: str
+    confidence: str  # "verified" | "likely" | "unknown"
+    source: str
+
+
+#: Channels decoded from metric 0.  The vendor capture establishes the sums
+#: (steps = f9, calories = f10, active minutes = f13) and the ~0.71 m/step
+#: ratio; the display units are conventional, not read from the app.
+CHANNELS: dict[str, ChannelInfo] = {
+    "steps": ChannelInfo(
+        name="steps",
+        unit="steps",
+        display_name="Steps",
+        confidence="likely",
+        source=(
+            "vendor capture: hourly u16-BE array (f3) sums to f9; ~0.71 m/step "
+            "against the distance array"
+        ),
+    ),
+    "distance_m": ChannelInfo(
+        name="distance_m",
+        unit="m",
+        display_name="Distance",
+        confidence="likely",
+        source=(
+            "vendor capture: hourly u16-BE array (f5) in metres; sums to 1887 m "
+            "for 2644 steps (~0.71 m/step)"
+        ),
+    ),
+    "calories": ChannelInfo(
+        name="calories",
+        unit="kcal",
+        display_name="Active Calories",
+        confidence="likely",
+        source=(
+            "vendor capture: hourly u16-BE array (f7) sums to f10; f14 is the "
+            "cumulative form of the same values"
+        ),
+    ),
+    "active_minutes": ChannelInfo(
+        name="active_minutes",
+        unit="min",
+        display_name="Active Minutes",
+        confidence="likely",
+        source=(
+            "vendor capture: hourly u16-BE array (f15) sums to f13, the "
+            "vendor's active-minutes total"
+        ),
+    ),
+}
+
+
 METRICS: dict[int, MetricInfo] = {
     0: MetricInfo(
         id=0,
@@ -113,12 +176,14 @@ METRICS: dict[int, MetricInfo] = {
 
 
 def _resolve(metric):
-    """Accept an int id, a canonical name, or ``metric_N`` and return MetricInfo.
+    """Accept an int id, a canonical name, ``metric_N``, or channel name.
 
-    String names are accepted so callers that key series by ``metric_name()``
-    can feed that key straight back in.
+    Returns a :class:`MetricInfo`, a :class:`ChannelInfo`, or ``None``.  String
+    names are accepted so callers that key series by ``metric_name()`` can feed
+    that key straight back in; the metric-0 channel names resolve the same way
+    so the GUI can label stored channel series.
     """
-    if isinstance(metric, MetricInfo):
+    if isinstance(metric, (MetricInfo, ChannelInfo)):
         return metric
     if isinstance(metric, int):
         return METRICS.get(metric)
@@ -131,6 +196,7 @@ def _resolve(metric):
                 return METRICS.get(int(metric[len("metric_"):]))
             except ValueError:
                 return None
+        return CHANNELS.get(metric)
     return None
 
 

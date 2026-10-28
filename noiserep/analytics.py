@@ -17,12 +17,21 @@ import statistics
 from dataclasses import dataclass
 from typing import Iterable, Sequence
 
+from .protocol.metrics import metric_confidence
+
 #: A silence longer than this splits one rest window into two.  Sleep RRI is
 #: recorded in bursts, so allow a 30-minute hole before splitting a night.
 DEFAULT_GAP_S = 1800
 
 #: Ignore short fragments; a rest summary needs at least this span.
 DEFAULT_MIN_MINUTES = 30
+
+#: The resting-HR estimate uses the lowest tenth of usable readings by count.
+RESTING_HR_LOWEST_FRACTION = 0.10
+
+#: Plausible heart-rate bounds (bpm); a value outside them is not a reading.
+RESTING_HR_MIN_BPM = 20
+RESTING_HR_MAX_BPM = 250
 
 
 @dataclass(frozen=True)
@@ -208,13 +217,162 @@ def insights(summary: RestSummary) -> list[str]:
     return lines
 
 
+# ---------------------------------------------------------------------------
+# Vitals
+# ---------------------------------------------------------------------------
+
+#: Keys always present in :func:`vitals`'s result, in display order.
+VITAL_KEYS = ("resting_hr", "hrv", "stress", "spo2", "temperature")
+
+
+@dataclass(frozen=True)
+class Vital:
+    """One derived vital, with the evidence needed to render it honestly.
+
+    ``value`` is ``None`` when the metric is absent.  ``source`` says where the
+    value came from (a metric name, or the estimate recipe), and ``confidence``
+    is one of ``"verified"`` / ``"likely"`` / ``"candidate"`` / ``"estimate"``
+    so a candidate is never shown as certain health data.
+    """
+
+    key: str
+    label: str
+    value: float | None
+    unit: str | None
+    source: str
+    confidence: str
+    at: dt.datetime | None = None
+    note: str | None = None
+
+    @property
+    def available(self) -> bool:
+        return self.value is not None
+
+
+def _value(item):
+    """Read a sample value from a ``(ts, value)`` pair, dict or object."""
+    if isinstance(item, (tuple, list)) and len(item) >= 2:
+        return item[1]
+    if isinstance(item, dict):
+        return item.get("value")
+    return getattr(item, "value", None)
+
+
+def resting_hr_estimate(samples: Iterable) -> float | None:
+    """Median of the lowest decile of non-zero, plausible heart-rate readings.
+
+    This is a *robust estimate* computed from the band's heart-rate series: it
+    is deliberately not the vendor's resting-HR field (the band's daily-summary
+    file has one, but this device does not push that file).  Taking the median
+    of the lowest 10% by count resists a single spurious low reading, while
+    still describing the rate the band actually recorded at rest.
+
+    Returns ``None`` when there is no usable reading.
+    """
+    values: list[float] = []
+    for item in samples or []:
+        value = _value(item)
+        if (isinstance(value, (int, float)) and not isinstance(value, bool)
+                and RESTING_HR_MIN_BPM <= value <= RESTING_HR_MAX_BPM):
+            values.append(float(value))
+    if not values:
+        return None
+    values.sort()
+    count = max(1, math.ceil(len(values) * RESTING_HR_LOWEST_FRACTION))
+    return statistics.median(values[:count])
+
+
+def _latest(store, metric: str, start=None, end=None):
+    rows = store.samples(metric, start, end)
+    return rows[-1] if rows else None
+
+
+def vitals(store, start=None, end=None) -> dict[str, Vital]:
+    """Derived latest vitals from a :class:`~noiserep.store.Store`.
+
+    ``store`` only needs a ``samples(metric, start, end)`` method (the real
+    :class:`~noiserep.store.Store` and test doubles both qualify).
+
+    The result always has every key in :data:`VITAL_KEYS`; a missing metric
+    yields ``Vital.value is None`` rather than an invented number.  ``hrv``,
+    ``stress`` and ``spo2`` are the latest stored samples of metrics 21, 22 and
+    4; ``temperature`` is metric 23, labelled a *candidate* because its unit is
+    not established (the vendor capture suggests ~27-31 but a live unworn
+    reading was 213).
+    """
+    hr_rows = store.samples("heart_rate", start, end)
+    resting = resting_hr_estimate(hr_rows)
+    if hr_rows:
+        resting_source = (
+            "computed from heart_rate: median of the lowest 10% of "
+            f"{len(hr_rows):,} readings"
+        )
+    else:
+        resting_source = (
+            "computed from heart_rate: median of the lowest 10% of readings; "
+            "none stored"
+        )
+
+    out: dict[str, Vital] = {
+        "resting_hr": Vital(
+            key="resting_hr",
+            label="Resting HR estimate",
+            value=round(resting, 1) if resting is not None else None,
+            unit="bpm",
+            source=resting_source,
+            confidence="estimate",
+            note="Not the vendor's resting-HR figure; a low-decile estimate.",
+        ),
+    }
+
+    specs = (
+        ("hrv", "Heart Rate Variability", "heart_rate_variability", "ms"),
+        ("stress", "Stress", "stress", None),
+        ("spo2", "Blood Oxygen (SpO2)", "blood_oxygen", "%"),
+    )
+    for key, label, metric, unit in specs:
+        row = _latest(store, metric, start, end)
+        out[key] = Vital(
+            key=key,
+            label=label,
+            value=float(row[1]) if row is not None else None,
+            unit=unit,
+            source=f"latest {metric} sample",
+            confidence=metric_confidence(metric) or "candidate",
+            at=row[0] if row is not None else None,
+        )
+
+    # Metric 23 is an hourly 0-255 array whose meaning is not established.  A
+    # vendor day reads 27-31 (consistent with degrees Celsius) while an unworn
+    # live day reads 0 and 213, so expose it as a candidate without a unit.
+    temp = _latest(store, "metric_23", start, end)
+    out["temperature"] = Vital(
+        key="temperature",
+        label="Temperature (candidate)",
+        value=float(temp[1]) if temp is not None else None,
+        unit=None,
+        source="latest metric_23 sample (temperature candidate)",
+        confidence="candidate",
+        at=temp[0] if temp is not None else None,
+        note="Unit and meaning unverified; do not treat as body temperature.",
+    )
+    return out
+
+
 __all__ = [
     "DEFAULT_GAP_S",
     "DEFAULT_MIN_MINUTES",
+    "RESTING_HR_LOWEST_FRACTION",
+    "RESTING_HR_MAX_BPM",
+    "RESTING_HR_MIN_BPM",
     "RestSummary",
+    "VITAL_KEYS",
+    "Vital",
     "hr_series",
     "insights",
     "overnight_rest",
     "rest_windows",
+    "resting_hr_estimate",
     "summarize",
+    "vitals",
 ]

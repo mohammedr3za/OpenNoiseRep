@@ -40,6 +40,9 @@ from ..protocol.metrics import metric_name
 
 _UTC = _dt.timezone.utc
 
+#: Metric 0's decoded channels are one value per hour.
+_CHANNEL_INTERVAL_S = 3600
+
 
 def _to_ts(d: _dt.datetime) -> int:
     return int(d.replace(tzinfo=_UTC).timestamp())
@@ -264,6 +267,12 @@ class Store:
         ``SleepSession`` or list of them, and a ``RriFile`` / ``RriSample``
         list respectively); when absent the call behaves exactly as before.
 
+        A metric series with decoded ``channels`` (currently metric 0's hourly
+        steps / distance / calories / active minutes) stores one sample per
+        non-zero hour under each channel name, instead of its packed raw byte
+        array.  This is what makes ``Store.samples("steps")`` work; re-ingest
+        stays idempotent through the usual ``(metric, ts)`` upsert.
+
         Returns counts of rows written this call:
         ``{"samples", "files", "sleep", "sleep_stages", "rri"}``.
         """
@@ -283,6 +292,29 @@ class Store:
             )
 
         for s in getattr(result, "series", []):
+            # Metric 0's `samples` are its packed byte array, not a time
+            # series.  When the decoder supplied hourly channels, persist those
+            # instead so the raw bytes never masquerade as samples.
+            channels = getattr(s, "channels", None) or {}
+            if channels:
+                rows = []
+                for name, values in channels.items():
+                    if not isinstance(values, (list, tuple)):
+                        continue
+                    for i, v in enumerate(values):
+                        if not v:
+                            continue          # zero means "no reading"
+                        ts = _to_ts(s.date + _dt.timedelta(
+                            seconds=i * _CHANNEL_INTERVAL_S))
+                        rows.append((name, ts, float(v)))
+                if rows:
+                    cur.executemany(
+                        "INSERT INTO samples(metric, ts, value) VALUES(?,?,?) "
+                        "ON CONFLICT(metric, ts) DO UPDATE SET value=excluded.value",
+                        rows,
+                    )
+                    counts["samples"] += len(rows)
+                continue
             if not s.samples or not s.interval_s:
                 continue
             metric = metric_name(s.metric_id)
