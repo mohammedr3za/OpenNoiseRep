@@ -318,7 +318,31 @@ def vitals(store, start=None, end=None) -> dict[str, Vital]:
             confidence=metric_confidence(metric) or "candidate",
             at=row[0] if row is not None else None,
         )
+    if not out["hrv"].available:
+        out["hrv"] = _rri_hrv(store, start, end) or out["hrv"]
     return out
+
+
+def _rri_hrv(store, start, end) -> Vital | None:
+    """Cleaned RMSSD over the longest beat-to-beat (RRI) window in range."""
+    from .scores import nightly_hrv
+
+    fn = getattr(store, "rest_summary", None)
+    summary = fn(start, end) if fn is not None else None
+    if summary is None:
+        return None
+    value = nightly_hrv(store.rri(summary.start, summary.end),
+                        summary.start, summary.end)
+    if value is None:
+        return None
+    return Vital(
+        key="hrv", label="HRV estimate", value=value,
+        unit="ms", confidence="estimate", at=summary.end,
+        source=(f"median 5-min RMSSD of cleaned RR intervals, "
+                f"{summary.start:%H:%M}–{summary.end:%H:%M}"),
+        note=("From the band's 64 ms RR slots, which add peak-timing "
+              "jitter; reads high. The band's own sleep HRV replaces it "
+              "once a sleep record syncs."))
 
 
 def _resting_vital(store, start, end) -> Vital:

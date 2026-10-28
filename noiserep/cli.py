@@ -119,6 +119,29 @@ def _resolve_name(name):
         return None
 
 
+def _live(name, db, interval, history_every):
+    import asyncio
+    import datetime
+    from .live import keep_linked
+    from .store import Store, default_db_path
+
+    def show(s):
+        print(f"{s.at:%H:%M:%S}  HR {s.heart_rate or '-'}  SpO2 {s.spo2 or '-'}  "
+              f"stress {s.stress or '-'}  steps {s.steps}  kcal {s.calories}  "
+              f"battery {s.battery}%{' charging' if s.charging else ''}", flush=True)
+
+    def status(text):
+        print(f"{datetime.datetime.now():%H:%M:%S}  [{text}]", flush=True)
+
+    with Store(db or default_db_path()) as store:
+        try:
+            asyncio.run(keep_linked(store, _resolve_name(name), interval,
+                                    history_every, on_sample=show, on_status=status))
+        except KeyboardInterrupt:
+            pass
+    return 0
+
+
 def _sync(name, since_str, out, no_files, verbose, db):
     import asyncio
     import datetime
@@ -324,6 +347,12 @@ def main(argv: list[str] | None = None) -> int:
     e.add_argument("--format", dest="fmt", choices=["csv", "json"], default="csv")
     e.add_argument("--out", dest="out", required=True, help="output file path")
     sub.add_parser("gui", help="launch the desktop app")
+    lv = sub.add_parser("live", help="stay connected: live values + periodic history")
+    lv.add_argument("--name", dest="name", default=None)
+    lv.add_argument("--db", dest="db", default=None)
+    lv.add_argument("--interval", type=float, default=10.0, help="live poll seconds")
+    lv.add_argument("--history-every", type=float, default=1800.0,
+                    help="seconds between full history syncs")
     sl = sub.add_parser("sleep", help="summarise last night's rest from stored RRI")
     sl.add_argument("--db", dest="db", default=None,
                     help="SQLite DB path; default per-OS user-data dir")
@@ -377,6 +406,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "gui":
         from .gui.app import main as gui_main
         return gui_main([])
+    if args.cmd == "live":
+        return _live(args.name, args.db, args.interval, args.history_every)
     if args.cmd == "sleep":
         return _sleep(args.db, args.json_path)
     if args.cmd == "workouts":

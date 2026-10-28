@@ -29,6 +29,7 @@ local timezone; `_from_ts` recovers the original naive datetime.
 from __future__ import annotations
 
 import datetime as _dt
+import json
 import os
 import pathlib
 import sqlite3
@@ -151,6 +152,8 @@ CREATE TABLE IF NOT EXISTS sleep_stages(
 CREATE TABLE IF NOT EXISTS rri_samples(
     ts INTEGER PRIMARY KEY,
     rr_ms INTEGER);
+CREATE TABLE IF NOT EXISTS live(
+    id INTEGER PRIMARY KEY CHECK(id=1), ts INTEGER, json TEXT);
 CREATE TABLE IF NOT EXISTS workouts(
     start INTEGER, kind TEXT, duration_s INTEGER, level TEXT,
     steps INTEGER, kcal INTEGER, source TEXT,
@@ -485,6 +488,27 @@ class Store:
             )
             written += 1
         return written
+
+    def write_live(self, sample) -> None:
+        """Keep the latest live report; heart rate also joins ``live_hr``."""
+        data = {k: v for k, v in vars(sample).items() if k != "at"}
+        ts = _to_ts(sample.at)
+        self._conn.execute(
+            "INSERT INTO live(id, ts, json) VALUES(1,?,?) ON CONFLICT(id) DO "
+            "UPDATE SET ts=excluded.ts, json=excluded.json", (ts, json.dumps(data)))
+        if sample.heart_rate:
+            self._conn.execute(
+                "INSERT INTO samples(metric, ts, value) VALUES('live_hr',?,?) "
+                "ON CONFLICT(metric, ts) DO UPDATE SET value=excluded.value",
+                (ts, float(sample.heart_rate)))
+        self._conn.commit()
+
+    def live(self) -> dict | None:
+        """The latest live report with its time, or ``None``."""
+        row = self._conn.execute("SELECT ts, json FROM live WHERE id=1").fetchone()
+        if row is None:
+            return None
+        return {"at": _from_ts(row["ts"]), **json.loads(row["json"])}
 
     def ingest_sleep(self, session, source: str | None = None) -> tuple | None:
         """Upsert a decoded sleep session; return ``(session_id, n_stages)``."""
