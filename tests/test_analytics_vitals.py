@@ -87,7 +87,7 @@ def test_vitals_values_units_and_timestamps():
     assert temperature.value == 30.0
     assert temperature.unit is None              # unit not established
     assert temperature.confidence == "candidate"
-    assert "metric_23" in temperature.source
+    assert "temperature" in temperature.source
     assert temperature.at == DAY + datetime.timedelta(minutes=2)
     s.close()
 

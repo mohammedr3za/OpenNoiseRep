@@ -10,7 +10,7 @@
   <img alt="License MIT" src="https://img.shields.io/badge/license-MIT-CC785C">
   <img alt="Platform macOS and Linux" src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-CC785C">
   <img alt="Status alpha" src="https://img.shields.io/badge/status-alpha-D4A27F">
-  <img alt="Tests" src="https://img.shields.io/badge/tests-216%20passing-879A77">
+  <img alt="Tests" src="https://img.shields.io/badge/tests-218%20passing-879A77">
 </p>
 
 noiserep connects to the **Noise REP** fitness band over BLE, reads the history it
@@ -32,6 +32,10 @@ rate, a CLI, and CSV/JSON exports. No account. No cloud. No vendor app.
 |---|---|
 | ![All channels view with daily activity, HRV, stress and unknown channels](docs/images/channels.png) | ![Menu bar showing filled heart 72, outlined heart tilde when removed, and outlined heart dash when disconnected](docs/images/menubar.png) |
 
+<p align="center">
+  <img src="docs/images/day.png" alt="Day mode with a calendar picker and previous/next day buttons" width="900">
+</p>
+
 The screenshots are generated from **synthetic data** by
 `tools/make_readme_images.py`; they contain no personal health data.
 
@@ -41,10 +45,13 @@ The screenshots are generated from **synthetic data** by
   info, the data index, the `113`/`115` series and the pushed `4097` activity
   files. Chunking, start/end acks and auto-discovery work live.
 - **A clean desktop app.** A health-style overview with **Vitals** (HRV, resting
-  HR estimate, SpO2, temperature candidate, stress), **Highlights** (last
-  night), **Heart & stress**, **Movement & goals** (steps, active minutes,
-  distance, calories), per-channel charts, date ranges, sleep detail, CSV/JSON
-  export and a **♥ Live** button for the menu bar.
+  HR, SpO2, temperature, stress), **Highlights** (last night), **Heart & stress**,
+  **Movement & goals** (steps, active minutes, distance, calories), per-channel
+  charts, sleep detail, CSV/JSON export and a **♥ Live** button for the menu bar.
+  Click a vital for what it means, its chart and its usual range.
+- **Any day, any range.** Today / **Day… with a calendar and ‹ › previous/next
+  day** / Last 7 / Last 30 / All / Custom From–To. The store keeps every day and
+  charts aggregate across the selected window.
 - **Live heart rate in the menu bar.** `♥ 72` when worn, `♥ ~` when the band is
   off-wrist, `♥ —` when disconnected. It tries the realtime stream, falls back
   to the confirmed `113` series, and retries a failed connection every 60 s
@@ -54,7 +61,7 @@ The screenshots are generated from **synthetic data** by
   within a grace period, noiserep can lock the Mac locally.
 - **Rest/sleep analytics.** Overnight RRI becomes a rest window with average and
   5–95% heart rate, RMSSD/SDNN/pNN50, beat coverage, a minute-level timeline and
-  plain-language observations. It is labelled **from RRI**, never as scored sleep.
+  plain-language observations. It is a recorded rest window, not scored sleep.
 - **Workouts, when the band sends them.** Sport/workout files are detected and
   listed; today this band has sent none, and the UI says so.
 - **Own your data.** SQLite storage with idempotent upserts, CSV/JSON export,
@@ -116,8 +123,9 @@ See [`docs/PROTOCOL.md`](docs/PROTOCOL.md) for the wire format and
 ## Honest about the data
 
 - **Heart rate is verified.** Daily activity, SpO2, HRV, stress and RRI are
-  marked **likely** and shown with a `(likely)` suffix. Unknown ids stay
-  `Channel N` forever; the neutral fallback is a feature.
+  evidence-based; unknown ids stay `Channel N`. Provenance, confidence and the
+  temperature/ADC note live in [`docs/RELEASE-NOTES.md`](docs/RELEASE-NOTES.md)
+  rather than cluttering the app.
 - **Sleep stages need a staged sleep file.** Your band has sent only RRI, so
   light/deep/REM are not present. The app says *Not available* rather than
   inventing stages. A stage timeline renders automatically if the band sends a
@@ -125,8 +133,8 @@ See [`docs/PROTOCOL.md`](docs/PROTOCOL.md) for the wire format and
 - **No workouts have arrived.** The sync has only pushed RRI files. Record a
   workout on the band and sync again; sport files will appear if the band sends
   them.
-- **The RRI millisecond unit is inferred**, validated against a vendor capture
-  but not against the band's own readout.
+- **The RRI millisecond unit is inferred**, validated against a capture but not
+  against the band's own readout; see the release notes.
 - **The clock may be unset (~2002)** on a freshly-unpaired band. Sync defaults to
   the whole device timeline, and timestamps are device-relative.
 

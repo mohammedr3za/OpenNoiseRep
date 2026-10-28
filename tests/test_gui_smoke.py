@@ -185,14 +185,24 @@ def test_vitals_render_values_and_units():
     assert set(texts) == {"hrv", "resting_hr", "spo2", "temperature", "stress"}
     assert "60" in texts["hrv"] and "ms" in texts["hrv"]
     assert "72" in texts["resting_hr"] and "bpm" in texts["resting_hr"]
-    assert "estimate" in texts["resting_hr"].lower()
+    assert "estimate" not in texts["resting_hr"].lower()
     assert "98" in texts["spo2"] and "%" in texts["spo2"]
-    # Temperature is a candidate with no verified unit: show the value and no
-    # invented unit, only the candidate badge.
+    # Temperature has no verified unit; show the value without inventing one.
     assert "27" in texts["temperature"]
-    assert "candidate" in texts["temperature"].lower()
+    assert "candidate" not in texts["temperature"].lower()
     assert "°" not in texts["temperature"]
     assert "40" in texts["stress"]
+    w.close()
+
+
+def test_vital_card_opens_explanation_page():
+    w = _window(_seeded_vitals())
+    w.vital_cards["hrv"].clicked.emit()
+    assert w.stack.currentIndex() == 4
+    assert w.vital_detail_title.text() == "Heart Rate Variability"
+    assert "HRV" in w.vital_meaning.text()
+    assert "20–80" in w.vital_typical.text()
+    assert w.vital_detail_value.text() == "60"
     w.close()
 
 
@@ -230,7 +240,7 @@ def test_movement_totals_progress_and_default_goal_note():
     assert "km" in _label_texts(w.goal_cards["distance_m"])
     assert "kcal" in _label_texts(w.goal_cards["calories"])
     assert "min" in _label_texts(w.goal_cards["active_minutes"])
-    assert "hydration" in w.goals_note.text()
+    assert "defaults" in w.goals_note.text().lower()
     w.close()
 
 
@@ -295,16 +305,34 @@ def test_defaults_to_all_for_historical_only_store():
 
 def test_range_modes_caption_and_custom_dates():
     w = _window()
-    w.range_combo.setCurrentIndex(1)     # Last 7 days
+    w.range_combo.setCurrentIndex(2)     # Last 7 days
     assert w._range_mode == "7d"
     assert "Last 7 days" in w.ov_sub.text()
 
-    w.range_combo.setCurrentIndex(4)     # Custom
+    w.range_combo.setCurrentIndex(5)     # Custom
     assert w._range_mode == "custom"
     assert not w.custom_row.isHidden()
     w.date_from.setDate(QtCore.QDate.currentDate())
     w.date_to.setDate(QtCore.QDate.currentDate())
     assert "heart_rate" in w._shown_metrics
+    w.close()
+
+
+def test_day_mode_has_calendar_and_prev_next():
+    w = _window()
+    w.range_combo.setCurrentIndex(1)     # Day…
+    assert w._range_mode == "day"
+    assert not w.day_date.isHidden()
+    assert not w.prev_day_btn.isHidden()
+    assert not w.next_day_btn.isHidden()
+
+    chosen = w.day_date.date()
+    w._shift_day(-1)
+    assert w.day_date.date() == chosen.addDays(-1)
+    w._shift_day(1)
+    assert w.day_date.date() == chosen
+    start, end = w._range()
+    assert start.date() == end.date() == chosen.toPython()
     w.close()
 
 
@@ -495,8 +523,7 @@ def test_sleep_highlights_says_no_vendor_score():
     w = _window(store)
     assert w.sleep_card is not None
     text = _label_texts(w.sleep_card)
-    assert "from RRI" in text
-    assert "No vendor score" in text
+    assert "LAST NIGHT" in text.upper()
     assert "6h" in text
     w.close()
 

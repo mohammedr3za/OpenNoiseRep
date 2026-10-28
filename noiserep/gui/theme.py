@@ -92,6 +92,7 @@ def build_qss(macos: bool | None = None) -> str:
 
 QLabel {{ background: transparent; color: {FG}; font-size: 13px; }}
 QLabel#muted {{ color: {FG_MUTED}; font-size: 12px; }}
+QLabel#bodyText {{ color: {FG}; font-size: 13px; }}
 QLabel#hint {{ color: {FG_MUTED}; font-size: 12px; }}
 QLabel#status {{ color: {FG_MUTED}; font-size: 12px; }}
 QLabel#sectionLabel {{ color: {FG_MUTED}; font-size: 10px; letter-spacing: 1.4px; }}

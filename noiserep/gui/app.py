@@ -42,6 +42,7 @@ UNITS = {"heart_rate": "bpm"}
 # (mode, combo label)
 RANGE_MODES = [
     ("today", "Today"),
+    ("day", "Day…"),
     ("7d", "Last 7 days"),
     ("30d", "Last 30 days"),
     ("all", "All data"),
@@ -57,10 +58,8 @@ _STAGE_TEXT = {
     "done": "Saving…",
 }
 
-# Optional, defensively-imported metric labels from the protocol layer. That
-# module is owned by another workstream, so anything it exposes is used only
-# when it is present and callable; otherwise we fall back to neutral names.
-try:  # pragma: no cover - import shape depends on concurrent work
+# Optional, defensively-imported metric labels from the protocol layer.
+try:  # pragma: no cover
     from ..protocol.metrics import metric_display as _metric_display
 except Exception:  # noqa: BLE001 - absent/incomplete module is fine
     _metric_display = None
@@ -68,10 +67,6 @@ try:  # pragma: no cover
     from ..protocol.metrics import metric_unit as _metric_unit
 except Exception:  # noqa: BLE001
     _metric_unit = None
-try:  # pragma: no cover
-    from ..protocol.metrics import metric_confidence as _metric_confidence
-except Exception:  # noqa: BLE001
-    _metric_confidence = None
 
 
 # --------------------------------------------------------------------------
@@ -83,15 +78,7 @@ def display_name(metric: str) -> str:
         try:
             name = _metric_display(metric)
             if name:
-                name = str(name)
-                if (_metric_confidence is not None
-                        and not name.startswith("Channel ")):
-                    try:
-                        if _metric_confidence(metric) == "likely":
-                            name += " (likely)"
-                    except Exception:  # noqa: BLE001
-                        pass
-                return name
+                return str(name)
         except Exception:  # noqa: BLE001 - never let labelling break the UI
             pass
     if metric.startswith("metric_"):
@@ -232,6 +219,56 @@ _VITAL_CARDS = (
     ("temperature", "Temp"),
     ("stress", "Stress"),
 )
+
+#: What each vital means, its usual range, and the stored channel to chart.
+VITAL_GUIDE = {
+    "hrv": {
+        "title": "Heart Rate Variability",
+        "metric": "heart_rate_variability",
+        "meaning": (
+            "HRV is the variation in time between heartbeats. It reflects "
+            "autonomic balance and recovery; a higher value often suggests "
+            "more recovery, but normal varies widely with age and fitness."),
+        "typical": (
+            "Resting RMSSD is often roughly 20–80 ms in adults. Compare with "
+            "your own trend rather than a single reading."),
+    },
+    "resting_hr": {
+        "title": "Resting Heart Rate",
+        "metric": "heart_rate",
+        "meaning": (
+            "Heart rate while at rest. A lower resting rate often reflects "
+            "better cardiovascular fitness; it also rises with stress, "
+            "illness, caffeine or poor sleep."),
+        "typical": "60–100 bpm is a common adult resting range.",
+    },
+    "spo2": {
+        "title": "Blood Oxygen (SpO2)",
+        "metric": "blood_oxygen",
+        "meaning": (
+            "An estimate of oxygen saturation from the optical sensor. "
+            "Readings are sensitive to strap fit and movement."),
+        "typical": (
+            "95–100% is typical at sea level. Persistent values below 90% "
+            "warrant medical advice."),
+    },
+    "temperature": {
+        "title": "Temperature",
+        "metric": "metric_23",
+        "meaning": (
+            "The band's temperature channel. Its scale is not established, "
+            "so only plausible values are shown."),
+        "typical": "No established range for this band.",
+    },
+    "stress": {
+        "title": "Stress",
+        "metric": "stress",
+        "meaning": (
+            "A 0–100 stress score derived from heart-rate variability. It is "
+            "a trend indicator, not a diagnosis; one reading is not decisive."),
+        "typical": "0–33 low, 34–66 moderate, 67–100 high.",
+    },
+}
 
 #: Movement channel, caption, display unit, default goal, and goal text.
 #: Distance goals are in metres; the card converts its total to kilometres.
@@ -548,6 +585,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.stack.addWidget(self._build_sleep_detail())  # index 2
         self.guide_page = self._build_guide()
         self.stack.addWidget(self.guide_page)             # index 3
+        self.stack.addWidget(self._build_vital_detail())  # index 4
         outer.addWidget(self.stack, 1)
 
         self._install_shortcuts()
@@ -608,6 +646,39 @@ class MainWindow(QtWidgets.QMainWindow):
         self.range_combo.setMinimumHeight(32)
         self.range_combo.currentIndexChanged.connect(self._on_range_mode_changed)
         h.addWidget(self.range_combo)
+
+        # Single-day navigation: ‹ [calendar date] ›.  Hidden until "Day…" is
+        # selected so the app bar stays calm in the preset modes.
+        self.prev_day_btn = QtWidgets.QPushButton("‹")
+        self.prev_day_btn.setObjectName("ghost")
+        self.prev_day_btn.setFixedWidth(34)
+        self.prev_day_btn.setMinimumHeight(32)
+        self.prev_day_btn.setToolTip("Previous day")
+        self.prev_day_btn.setAccessibleName("Previous day")
+        self.prev_day_btn.clicked.connect(lambda: self._shift_day(-1))
+        h.addWidget(self.prev_day_btn)
+
+        self.day_date = QtWidgets.QDateEdit()
+        self.day_date.setCalendarPopup(True)
+        self.day_date.setDisplayFormat("ddd dd MMM yyyy")
+        self.day_date.setMinimumHeight(32)
+        self.day_date.setDate(QtCore.QDate.currentDate())
+        self.day_date.setAccessibleName("Selected day")
+        self.day_date.setToolTip("Pick any day with stored data")
+        self.day_date.dateChanged.connect(self._on_day_changed)
+        h.addWidget(self.day_date)
+
+        self.next_day_btn = QtWidgets.QPushButton("›")
+        self.next_day_btn.setObjectName("ghost")
+        self.next_day_btn.setFixedWidth(34)
+        self.next_day_btn.setMinimumHeight(32)
+        self.next_day_btn.setToolTip("Next day")
+        self.next_day_btn.setAccessibleName("Next day")
+        self.next_day_btn.clicked.connect(lambda: self._shift_day(1))
+        h.addWidget(self.next_day_btn)
+
+        for _widget in (self.prev_day_btn, self.day_date, self.next_day_btn):
+            _widget.hide()
 
         # A QToolButton whose "ghost" frame exists only off macOS.  QPushButton
         # would inherit the app's custom rounded QPushButton rule, so on macOS
@@ -962,7 +1033,7 @@ class MainWindow(QtWidgets.QMainWindow):
             vital = vits.get(key)
             if vital is None:
                 continue
-            card = self._vital_card(caption, vital)
+            card = self._vital_card(key, caption, vital)
             self.vital_cards[key] = card
             self._vital_widgets.append(card)
 
@@ -972,9 +1043,13 @@ class MainWindow(QtWidgets.QMainWindow):
         outer.addWidget(host)
         return wrap
 
-    def _vital_card(self, caption: str, vital) -> QtWidgets.QFrame:
-        card = QtWidgets.QFrame()
-        card.setObjectName("vitalCard")
+    def _vital_card(self, key: str, caption: str,
+                    vital) -> QtWidgets.QFrame:
+        card = ClickableCard("vitalCard")
+        card.setCursor(QtCore.Qt.PointingHandCursor)
+        card.clicked.connect(
+            lambda _=None, k=key: self._open_vital_detail(k))
+        card.setToolTip(f"Open {caption} details")
         card.setMinimumHeight(96)
         card.setMinimumWidth(120)
         card.setSizePolicy(QtWidgets.QSizePolicy.Expanding,
@@ -1000,12 +1075,7 @@ class MainWindow(QtWidgets.QMainWindow):
         row.addStretch(1)
         v.addLayout(row)
 
-        if vital.confidence in ("estimate", "candidate"):
-            badge = QtWidgets.QLabel(vital.confidence)
-            badge.setObjectName("vitalBadge")
-            v.addWidget(badge)
-        else:
-            v.addStretch(1)
+        v.addStretch(1)
 
         card.setToolTip(self._vital_tooltip(vital))
         shown = f"{value_text} {vital.unit or ''}".strip()
@@ -1017,22 +1087,11 @@ class MainWindow(QtWidgets.QMainWindow):
     @staticmethod
     def _vital_tooltip(vital) -> str:
         if not vital.available:
-            parts = [
-                f"No {vital.label.lower()} sample was stored in this range.",
-                vital.source,
-            ]
-            if vital.note:
-                parts.append(vital.note)
-            return " · ".join(part for part in parts if part)
-
+            return f"No {vital.label.lower()} sample in this range."
         parts = [f"{vital.label}: {_fmt(vital.value)}"
                  + (f" {vital.unit}" if vital.unit else "")]
         if vital.at is not None:
             parts.append(f"latest {vital.at:%d %b, %H:%M}")
-        if vital.source:
-            parts.append(vital.source)
-        if vital.note:
-            parts.append(vital.note)
         return " · ".join(parts)
 
     def _heart_stress_section(self) -> QtWidgets.QWidget:
@@ -1138,8 +1197,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._movement_cols = cols
         outer.addWidget(host)
 
-        self.goals_note = QtWidgets.QLabel(
-            "Goals are defaults; the band does not measure hydration.")
+        self.goals_note = QtWidgets.QLabel("Goals are defaults.")
         self.goals_note.setObjectName("muted")
         self.goals_note.setWordWrap(True)
         outer.addWidget(self.goals_note)
@@ -1386,12 +1444,6 @@ class MainWindow(QtWidgets.QMainWindow):
         cap.setObjectName("sectionLabel")
         head.addWidget(cap)
         head.addStretch(1)
-        source = session.get("source") or ""
-        badge = QtWidgets.QLabel(
-            "from RRI" if source == "rri" else
-            ("sleep file" if source else ""))
-        badge.setObjectName("muted")
-        head.addWidget(badge)
         v.addLayout(head)
 
         row = QtWidgets.QHBoxLayout()
@@ -1404,11 +1456,6 @@ class MainWindow(QtWidgets.QMainWindow):
         sub.setObjectName("muted")
         row.addWidget(sub, 0, QtCore.Qt.AlignBottom)
         row.addStretch(1)
-        no_score = QtWidgets.QLabel("No vendor score")
-        no_score.setObjectName("muted")
-        no_score.setToolTip(
-            "The band does not report a vendor sleep score; none is invented.")
-        row.addWidget(no_score, 0, QtCore.Qt.AlignBottom)
         v.addLayout(row)
 
         if summary is not None:
@@ -1440,7 +1487,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sleep_card = frame
         frame.setAccessibleName(
             f"Last night: {_fmt_span(total_min * 60)} from {bedtime:%H:%M} "
-            f"to {wake:%H:%M}; no vendor score")
+            f"to {wake:%H:%M}")
         return frame
 
     def _workouts_section(self):
@@ -1870,9 +1917,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sleep_insight_layout.setSpacing(4)
         lay.addWidget(self.sleep_insight_host)
 
-        note = QtWidgets.QLabel(
-            "Derived from RRI beat-to-beat data. This is a recorded rest "
-            "window, not a scored sleep study; interpretations are descriptive.")
+        note = QtWidgets.QLabel("Recorded overnight rest window.")
         note.setObjectName("muted")
         note.setWordWrap(True)
         lay.addWidget(note)
@@ -1997,10 +2042,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if not (bedtime and wake and total_min):
             return
         self._sleep_session = session
-        source = session.get("source") or "rri"
         self.sleep_detail_sub.setText(
-            f"{bedtime:%A, %d %B} · {bedtime:%H:%M} – {wake:%H:%M} · "
-            f"{'from RRI' if source == 'rri' else source}")
+            f"{bedtime:%A, %d %B} · {bedtime:%H:%M} – {wake:%H:%M}")
         self.sleep_detail_value.setText(_fmt_span(total_min * 60))
 
         summary = None
@@ -2134,6 +2177,127 @@ class MainWindow(QtWidgets.QMainWindow):
         legend.addStretch(1)
         self.sleep_stages_layout.addLayout(legend)
 
+    # -- vital detail ----------------------------------------------------
+    def _build_vital_detail(self) -> QtWidgets.QWidget:
+        scroll, _inner, lay = self._make_page()
+
+        header = QtWidgets.QWidget()
+        h = QtWidgets.QHBoxLayout(header)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(8)
+        back = QtWidgets.QPushButton("‹  Back")
+        back.setObjectName("backBtn")
+        back.setCursor(QtCore.Qt.PointingHandCursor)
+        back.setFixedWidth(110)
+        back.setMinimumHeight(36)
+        back.setAccessibleName("Back to overview")
+        back.clicked.connect(self._show_overview)
+        h.addWidget(back, 0, QtCore.Qt.AlignLeft)
+        h.addStretch(1)
+        center = QtWidgets.QVBoxLayout()
+        center.setSpacing(1)
+        self.vital_detail_title = QtWidgets.QLabel("—")
+        self.vital_detail_title.setObjectName("metricTitle")
+        self.vital_detail_title.setAlignment(QtCore.Qt.AlignCenter)
+        self.vital_detail_sub = QtWidgets.QLabel("")
+        self.vital_detail_sub.setObjectName("rangeLabel")
+        self.vital_detail_sub.setAlignment(QtCore.Qt.AlignCenter)
+        center.addWidget(self.vital_detail_title)
+        center.addWidget(self.vital_detail_sub)
+        h.addLayout(center)
+        h.addStretch(1)
+        spacer = QtWidgets.QWidget()
+        spacer.setFixedWidth(110)
+        h.addWidget(spacer)
+        lay.addWidget(header)
+
+        value_row = QtWidgets.QHBoxLayout()
+        value_row.setSpacing(8)
+        value_row.addStretch(1)
+        self.vital_detail_value = QtWidgets.QLabel("—")
+        self.vital_detail_value.setObjectName("heroValue")
+        self.vital_detail_unit = QtWidgets.QLabel("")
+        self.vital_detail_unit.setObjectName("heroUnit")
+        value_row.addWidget(self.vital_detail_value, 0, QtCore.Qt.AlignBottom)
+        value_row.addWidget(self.vital_detail_unit, 0, QtCore.Qt.AlignBottom)
+        value_row.addStretch(1)
+        lay.addLayout(value_row)
+
+        stat_bar = QtWidgets.QFrame()
+        stat_bar.setObjectName("card")
+        self.vital_stat_row = QtWidgets.QHBoxLayout(stat_bar)
+        self.vital_stat_row.setContentsMargins(22, 14, 22, 14)
+        self.vital_stat_row.setSpacing(30)
+        self.vital_stat_row.addStretch(1)
+        lay.addWidget(stat_bar)
+
+        self.vital_chart = ChartView(interactive=True)
+        lay.addWidget(self._chart_card(self.vital_chart, "Trend", height=270))
+
+        meaning_card = QtWidgets.QFrame()
+        meaning_card.setObjectName("card")
+        mv = QtWidgets.QVBoxLayout(meaning_card)
+        mv.setContentsMargins(22, 16, 22, 16)
+        mv.setSpacing(6)
+        mv.addWidget(self._section_label("WHAT IT MEANS"))
+        self.vital_meaning = QtWidgets.QLabel("")
+        self.vital_meaning.setObjectName("bodyText")
+        self.vital_meaning.setWordWrap(True)
+        mv.addWidget(self.vital_meaning)
+        lay.addWidget(meaning_card)
+
+        typical_card = QtWidgets.QFrame()
+        typical_card.setObjectName("card")
+        tv = QtWidgets.QVBoxLayout(typical_card)
+        tv.setContentsMargins(22, 16, 22, 16)
+        tv.setSpacing(6)
+        tv.addWidget(self._section_label("USUAL RANGE"))
+        self.vital_typical = QtWidgets.QLabel("")
+        self.vital_typical.setObjectName("bodyText")
+        self.vital_typical.setWordWrap(True)
+        tv.addWidget(self.vital_typical)
+        lay.addWidget(typical_card)
+        lay.addStretch(1)
+        return scroll
+
+    def _open_vital_detail(self, key: str) -> None:
+        guide = VITAL_GUIDE.get(key)
+        if guide is None:
+            return
+        start, end = self._range()
+        try:
+            vital = analytics.vitals(self.store, start, end).get(key)
+        except Exception:  # noqa: BLE001
+            vital = None
+        rows = self.store.samples(guide["metric"], start, end)
+
+        self.vital_detail_title.setText(guide["title"])
+        self.vital_detail_sub.setText(self._range_caption())
+        self.vital_detail_value.setText(
+            _fmt(vital.value) if vital is not None and vital.available else "—")
+        self.vital_detail_unit.setText(
+            (vital.unit or "") if vital is not None and vital.available else "")
+        self.vital_meaning.setText(guide["meaning"])
+        self.vital_typical.setText(guide["typical"])
+
+        self._clear_layout(self.vital_stat_row)
+        y = [value for _, value in rows]
+        stats = [("Current", self.vital_detail_value.text(), True)]
+        if y:
+            stats += [
+                ("Average", _fmt_avg(_mean(y)), False),
+                ("Min", _fmt(min(y)), False),
+                ("Max", _fmt(max(y)), False),
+                ("Readings", str(len(y)), False),
+            ]
+        for label, value, accent in stats:
+            self.vital_stat_row.addWidget(
+                self._sleep_stat_cell(label, value, accent))
+        self.vital_stat_row.addStretch(1)
+
+        self.vital_chart.set_data(rows, vital.unit if vital else None)
+        self.stack.setCurrentIndex(4)
+
     # -- stat row helpers ------------------------------------------------
     def _clear_stats(self) -> None:
         while self.stat_row.count() > 1:  # keep the trailing stretch
@@ -2199,11 +2363,28 @@ class MainWindow(QtWidgets.QMainWindow):
         self.range_combo.setCurrentIndex(index)
         self.range_combo.blockSignals(False)
         self.custom_row.setVisible(mode == "custom")
+        self._show_day_nav()
+
+    def _default_day(self) -> None:
+        """When entering Day mode, fall back to the latest stored day."""
+        lo, hi = self.store.sample_bounds()
+        if hi is None:
+            return
+        today = datetime.date.today()
+        if lo.date() <= today <= hi.date():
+            return
+        self.day_date.blockSignals(True)
+        self.day_date.setDate(QtCore.QDate(hi.year, hi.month, hi.day))
+        self.day_date.blockSignals(False)
 
     def _sync_dates_to_bounds(self) -> None:
         lo, hi = self.store.sample_bounds()
         if lo is None:
             lo = hi = datetime.datetime.now()
+            self.day_date.setToolTip("No stored data yet")
+        else:
+            self.day_date.setToolTip(
+                f"Stored data: {lo:%d %b %Y} – {hi:%d %b %Y}")
         for de, value in ((self.date_from, lo), (self.date_to, hi)):
             de.blockSignals(True)
             de.setDate(QtCore.QDate(value.year, value.month, value.day))
@@ -2226,12 +2407,10 @@ class MainWindow(QtWidgets.QMainWindow):
         if last:
             self.status.setText(
                 f"Last synced {_to_local(last['time']):%d %b, %H:%M} · "
-                f"{last['n_records']} records. Heart rate is verified; other "
-                f"named channels are evidence-based but not vendor-confirmed.")
+                f"{last['n_records']} records.")
         else:
             self.status.setText(
-                "No sync yet — connect the band and press Sync. Heart rate is "
-                "verified; other names are evidence-based only.")
+                "No sync yet — connect the band and press Sync.")
         self.info_banner.show()
         self.error_banner.hide()
 
@@ -2254,6 +2433,8 @@ class MainWindow(QtWidgets.QMainWindow):
         today = datetime.date.today()
         if mode == "today":
             start_d, end_d = today, today
+        elif mode == "day":
+            start_d = end_d = self.day_date.date().toPython()
         elif mode == "7d":
             start_d, end_d = today - datetime.timedelta(days=6), today
         elif mode == "30d":
@@ -2281,7 +2462,7 @@ class MainWindow(QtWidgets.QMainWindow):
             span = f"{start:%d %b} – {end:%d %b %Y}"
         else:
             span = f"{start:%d %b %Y} – {end:%d %b %Y}"
-        labels = {"today": "Today", "7d": "Last 7 days",
+        labels = {"today": "Today", "day": "Day", "7d": "Last 7 days",
                   "30d": "Last 30 days", "all": "All data",
                   "custom": "Selected range"}
         label = labels.get(self._range_mode, "")
@@ -2296,11 +2477,30 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_range_mode_changed(self, index: int) -> None:
         self._range_mode = RANGE_MODES[max(0, index)][0]
         self.custom_row.setVisible(self._range_mode == "custom")
+        self._show_day_nav()
         if self._range_mode == "custom":
             self._sync_dates_to_bounds()
+        elif self._range_mode == "day":
+            self._default_day()
         self._refresh_header()
         self._populate_overview()
         if self._detail_metric:
+            self._plot_detail()
+
+    def _show_day_nav(self) -> None:
+        visible = self._range_mode == "day"
+        for widget in (self.prev_day_btn, self.day_date, self.next_day_btn):
+            widget.setVisible(visible)
+
+    def _shift_day(self, delta: int) -> None:
+        self.day_date.setDate(self.day_date.date().addDays(delta))
+
+    def _on_day_changed(self, *_args) -> None:
+        if self._range_mode != "day":
+            return
+        self._refresh_header()
+        self._populate_overview()
+        if self._detail_metric and self.stack.currentIndex() == 1:
             self._plot_detail()
 
     def _on_range_changed(self, *_args) -> None:
@@ -2509,8 +2709,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 extra += f", +{counts['sleep']} sleep"
             self._set_status(
                 f"Synced +{counts['samples']} samples and +{counts['files']} "
-                f"files{extra}. Heart rate is verified; other names are "
-                f"evidence-based only.")
+                f"files{extra}.")
             self._refresh_device()
             self._sync_dates_to_bounds()
             self._refresh_header()

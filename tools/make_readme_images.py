@@ -166,9 +166,15 @@ def main() -> int:
     app.processEvents()
     window.grab().save(str(OUT / "overview.png"))
 
-    window.range_combo.setCurrentIndex(3)    # All data
+    window.range_combo.setCurrentIndex(4)    # All data
     app.processEvents()
     window.grab().save(str(OUT / "channels.png"))
+
+    window._show_overview()
+    window.resize(1180, 620)
+    window.range_combo.setCurrentIndex(1)    # Day…
+    app.processEvents()
+    window.grab().save(str(OUT / "day.png"))
 
     session = store.sleep_sessions()[-1]
     window._open_sleep_detail(session)
@@ -179,7 +185,8 @@ def main() -> int:
 
     _menubar_mock()
 
-    for name in ("overview.png", "channels.png", "sleep.png", "menubar.png"):
+    for name in ("overview.png", "channels.png", "day.png", "sleep.png",
+                 "menubar.png"):
         path = OUT / name
         print(f"wrote {path.relative_to(ROOT)} ({path.stat().st_size:,} bytes)")
     store.close()

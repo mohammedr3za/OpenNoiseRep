@@ -346,15 +346,18 @@ def vitals(store, start=None, end=None) -> dict[str, Vital]:
     # vendor day reads 27-31 (consistent with degrees Celsius) while an unworn
     # live day reads 0 and 213, so expose it as a candidate without a unit.
     temp = _latest(store, "metric_23", start, end)
+    # 27-31 appears on a worn vendor day and reads as °C; 213 appears off-wrist
+    # and is most likely a raw sensor/ADC value.  Only show a plausible value.
+    plausible = (temp is not None and 20.0 <= float(temp[1]) <= 45.0)
     out["temperature"] = Vital(
         key="temperature",
-        label="Temperature (candidate)",
-        value=float(temp[1]) if temp is not None else None,
+        label="Temperature",
+        value=float(temp[1]) if plausible else None,
         unit=None,
-        source="latest metric_23 sample (temperature candidate)",
+        source="latest temperature sample",
         confidence="candidate",
         at=temp[0] if temp is not None else None,
-        note="Unit and meaning unverified; do not treat as body temperature.",
+        note="Raw values outside 20-45 are treated as sensor/ADC readings.",
     )
     return out
 
