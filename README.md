@@ -10,7 +10,7 @@
   <img alt="License MIT" src="https://img.shields.io/badge/license-MIT-CC785C">
   <img alt="Platform macOS and Linux" src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-CC785C">
   <img alt="Status alpha" src="https://img.shields.io/badge/status-alpha-D4A27F">
-  <img alt="Tests" src="https://img.shields.io/badge/tests-177%20passing-879A77">
+  <img alt="Tests" src="https://img.shields.io/badge/tests-216%20passing-879A77">
 </p>
 
 noiserep connects to the **Noise REP** fitness band over BLE, reads the history it
@@ -26,7 +26,7 @@ rate, a CLI, and CSV/JSON exports. No account. No cloud. No vendor app.
 
 | Today | Sleep & recovery |
 |---|---|
-| ![Today overview with heart-rate hero, trend chart, Last Night card, workouts and other channels](docs/images/overview.png) | ![Sleep detail with heart-rate timeline, HRV stats and an explicit stages-unavailable panel](docs/images/sleep.png) |
+| ![Today overview with vitals cards, heart-rate trend, Last Night highlights, heart/stress, movement goals and workouts](docs/images/overview.png) | ![Sleep detail with heart-rate timeline, HRV stats and an explicit stages-unavailable panel](docs/images/sleep.png) |
 
 | All channels | Live menu-bar states |
 |---|---|
@@ -40,9 +40,11 @@ The screenshots are generated from **synthetic data** by
 - **Historical sync.** Scan by advertised name (`Noise_REP_*`), fetch device
   info, the data index, the `113`/`115` series and the pushed `4097` activity
   files. Chunking, start/end acks and auto-discovery work live.
-- **A clean desktop app.** A health-style overview, per-channel charts, date
-  ranges, sleep/rest detail, CSV/JSON export and a **♥ Live** button for the
-  menu bar.
+- **A clean desktop app.** A health-style overview with **Vitals** (HRV, resting
+  HR estimate, SpO2, temperature candidate, stress), **Highlights** (last
+  night), **Heart & stress**, **Movement & goals** (steps, active minutes,
+  distance, calories), per-channel charts, date ranges, sleep detail, CSV/JSON
+  export and a **♥ Live** button for the menu bar.
 - **Live heart rate in the menu bar.** `♥ 72` when worn, `♥ ~` when the band is
   off-wrist, `♥ —` when disconnected. It tries the realtime stream, falls back
   to the confirmed `113` series, and retries a failed connection every 60 s
