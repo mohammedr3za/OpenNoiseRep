@@ -345,6 +345,10 @@ def main(argv: list[str] | None = None) -> int:
     m.add_argument("--away-seconds", dest="away_seconds", type=float,
                    default=15.0,
                    help="grace period before the away-lock (default 15)")
+    m.add_argument("--retry-seconds", dest="retry_seconds", type=float,
+                   default=60.0,
+                   help="retry a failed connection after this many seconds; "
+                        "0 disables (default 60)")
     b = sub.add_parser(
         "buzz", help="EXPERIMENTAL: vibrate the band (write; requires --yes)")
     from .protocol import vibration
@@ -384,11 +388,16 @@ def main(argv: list[str] | None = None) -> int:
         if args.away_seconds < 0:
             print("invalid --away-seconds: must not be negative", file=sys.stderr)
             return 2
+        if args.retry_seconds < 0:
+            print("invalid --retry-seconds: must not be negative",
+                  file=sys.stderr)
+            return 2
         from .gui.menubar import main as menubar_main
         return menubar_main(band_name=args.name, db_path=args.db,
                             poll_seconds=args.poll,
                             lock_on_away=args.lock_on_away,
-                            away_seconds=args.away_seconds)
+                            away_seconds=args.away_seconds,
+                            retry_seconds=args.retry_seconds)
     if args.cmd == "buzz":
         if not args.yes:
             print("refusing to vibrate the band without --yes "

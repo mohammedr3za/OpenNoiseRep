@@ -147,7 +147,8 @@ class MenubarApp(QtCore.QObject):
                  min_update_interval: float = 1.0,
                  with_tray: bool = True,
                  lock_on_away: bool = False,
-                 away_seconds: float = AWAY_GRACE_SECONDS):
+                 away_seconds: float = AWAY_GRACE_SECONDS,
+                 retry_seconds: float = 60.0):
         super().__init__()
         self.app = app
         self.band_name = band_name            # None -> auto-discover Noise_REP_*
@@ -158,6 +159,7 @@ class MenubarApp(QtCore.QObject):
         self.min_update_interval = max(0.0, float(min_update_interval))
         self.lock_on_away = bool(lock_on_away)
         self.away_seconds = max(0.0, float(away_seconds))
+        self.retry_seconds = max(0.0, float(retry_seconds))
         self.store = Store(db_path or default_db_path())
 
         self._hr: int | None = None
@@ -173,6 +175,7 @@ class MenubarApp(QtCore.QObject):
         self._worker_task: asyncio.Task | None = None
         self._connect_task: asyncio.Task | None = None
         self._away_task: asyncio.Task | None = None
+        self._retry_task: asyncio.Task | None = None
         self._had_connection = False
         self._removed = False
         self._hr_misses = 0
@@ -403,6 +406,29 @@ class MenubarApp(QtCore.QObject):
             self._status = "Band removed or no heart rate"
             self._render(force=True)
 
+    def _schedule_reconnect(self) -> None:
+        """Try again after a failed/lost connection, without a tight loop."""
+        if (self.retry_seconds <= 0 or self._connected
+                or self._connecting or self._quitting):
+            return
+        if self._retry_task is not None and not self._retry_task.done():
+            return
+        self._retry_task = self._spawn(self._retry_once())
+
+    async def _retry_once(self) -> None:
+        try:
+            await asyncio.sleep(self.retry_seconds)
+        except asyncio.CancelledError:
+            raise
+        if self._connected or self._connecting or self._quitting:
+            return
+        self.connect()
+
+    def _cancel_reconnect(self) -> None:
+        task, self._retry_task = self._retry_task, None
+        if task is not None and not task.done():
+            task.cancel()
+
     def _set_lock_on_away(self, enabled: bool) -> None:
         self.lock_on_away = bool(enabled)
         self._status = ("Will lock the Mac if the band goes away"
@@ -473,6 +499,7 @@ class MenubarApp(QtCore.QObject):
     def connect(self) -> None:
         if self._connected or self._connecting:
             return
+        self._cancel_reconnect()
         self._connecting = True
         self._status = "Scanning for band…"
         self._render(force=True)
@@ -485,13 +512,17 @@ class MenubarApp(QtCore.QObject):
             band = await ctx.__aenter__()
         except BandNotFound as exc:
             self._connecting = False
-            self._status = f"{exc} — put the band on its charger"
+            retry = (f" · retrying in {int(self.retry_seconds)}s"
+                     if self.retry_seconds else "")
+            self._status = f"{exc} — put the band on its charger{retry}"
             self._render(force=True)
+            self._schedule_reconnect()
             return
         except TransportError as exc:
             self._connecting = False
             self._status = f"Transport error: {exc}"
             self._render(force=True)
+            self._schedule_reconnect()
             return
         except asyncio.CancelledError:
             self._connecting = False
@@ -500,6 +531,7 @@ class MenubarApp(QtCore.QObject):
             self._connecting = False
             self._status = f"Could not connect: {exc}"
             self._render(force=True)
+            self._schedule_reconnect()
             return
         self._ctx, self._band = ctx, band
         self._connected = True
@@ -508,6 +540,7 @@ class MenubarApp(QtCore.QObject):
         self._removed = False
         self._hr_misses = 0
         self._cancel_away_lock()
+        self._cancel_reconnect()
         self._status = "Connected"
         self._render(force=True)
         self._start_worker()
@@ -563,6 +596,7 @@ class MenubarApp(QtCore.QObject):
 
     async def _do_disconnect(self, status: str = "Disconnected") -> None:
         self._cancel_away_lock()
+        self._cancel_reconnect()
         worker, self._worker_task = self._worker_task, None
         if (worker is not None and worker is not asyncio.current_task()
                 and not worker.done()):
@@ -769,7 +803,8 @@ def main(argv: list[str] | None = None, band_name: str | None = None,
          db_path: str | None = None,
          poll_seconds: float = DEFAULT_POLL_SECONDS,
          lock_on_away: bool = False,
-         away_seconds: float = AWAY_GRACE_SECONDS) -> int:
+         away_seconds: float = AWAY_GRACE_SECONDS,
+         retry_seconds: float = 60.0) -> int:
     """Run the menu-bar app until Quit. ``band_name=None`` auto-discovers."""
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(
         list(argv) if argv is not None else sys.argv)
@@ -780,7 +815,8 @@ def main(argv: list[str] | None = None, band_name: str | None = None,
     menubar = MenubarApp(app, band_name=band_name, db_path=db_path,
                          poll_seconds=poll_seconds,
                          lock_on_away=lock_on_away,
-                         away_seconds=away_seconds)
+                         away_seconds=away_seconds,
+                         retry_seconds=retry_seconds)
     if menubar.tray is None and menubar._status_item is None:
         print("menubar: no system tray available on this desktop", file=sys.stderr)
         return 1

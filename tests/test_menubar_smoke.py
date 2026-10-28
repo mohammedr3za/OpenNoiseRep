@@ -91,6 +91,20 @@ def test_removed_state_shows_tilde_and_outlined_heart(monkeypatch):
         mb.store.close()
 
 
+def test_retry_calls_connect_when_still_disconnected():
+    _app()
+    mb = MenubarApp(_app(), db_path=":memory:", with_tray=False,
+                    retry_seconds=0.01)
+    calls = []
+    try:
+        mb.connect = lambda: calls.append("connect")
+        import asyncio
+        asyncio.run(mb._retry_once())
+        assert calls == ["connect"]
+    finally:
+        mb.store.close()
+
+
 def test_away_lock_runs_after_grace(monkeypatch):
     _app()
     calls = []

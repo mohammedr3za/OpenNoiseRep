@@ -44,8 +44,10 @@ The screenshots are generated from **synthetic data** by
   ranges, sleep/rest detail, CSV/JSON export and a **♥ Live** button for the
   menu bar.
 - **Live heart rate in the menu bar.** `♥ 72` when worn, `♥ ~` when the band is
-  off-wrist, `♥ —` when disconnected. It tries the realtime stream and falls
-  back to the confirmed `113` series.
+  off-wrist, `♥ —` when disconnected. It tries the realtime stream, falls back
+  to the confirmed `113` series, and retries a failed connection every 60 s
+  (`--retry-seconds`, `0` disables). If it stays at `—`, the band is asleep or
+  the phone holds it: put it on the charger and turn the phone's Bluetooth off.
 - **Walk-away lock (opt-in).** If the band disconnects and does not return
   within a grace period, noiserep can lock the Mac locally.
 - **Rest/sleep analytics.** Overnight RRI becomes a rest window with average and
