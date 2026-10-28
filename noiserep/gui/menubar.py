@@ -209,8 +209,9 @@ class MenubarApp(QtCore.QObject):
             try:
                 self._create_native_status_item()
                 return
-            except Exception:            # no AppKit / no GUI session
-                pass
+            except Exception as exc:     # no AppKit / no GUI session
+                print(f"menubar: native status item failed: {exc}",
+                      file=sys.stderr)
         if QtWidgets.QSystemTrayIcon.isSystemTrayAvailable():
             self.tray = QtWidgets.QSystemTrayIcon(
                 make_icon(False), self)
@@ -259,7 +260,9 @@ class MenubarApp(QtCore.QObject):
         # A real NSMenu on the status item (not a Qt QMenu popup) is what makes
         # the menu work while another app is in full screen, and it gets the
         # native icons/checkmarks/key equivalents for free.
-        button.setMenu_(self._build_native_menu())
+        # The menu belongs to the NSStatusItem, not its button; setting it on
+        # the button leaves clicks doing nothing.
+        item.setMenu_(self._build_native_menu())
         item.setVisible_(True)
 
     def _build_native_menu(self):
