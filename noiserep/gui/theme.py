@@ -56,6 +56,12 @@ def gutter(width: int) -> int:
     return int(max(GUTTER_MIN, min(g, (width - CONTENT_MIN) / 2)))
 
 
+def page_gutter(widget, width: int) -> int:
+    """Roomy centered pages when maximized; compact margins when restored."""
+    window = widget.window()
+    return gutter(width) if window.isMaximized() or window.isFullScreen() else 16
+
+
 def apply(new_mode: str) -> None:
     """Switch the palette ("light" or "dark") and rebuild ``QSS``.
 
@@ -343,12 +349,12 @@ QDateEdit::drop-down {{ border: none; width: 20px; }}
 /* scrolling */
 QScrollArea {{ border: none; background: transparent; }}
 QScrollArea > QWidget > QWidget {{ background: transparent; }}
-QScrollBar:vertical {{ background: transparent; width: 9px; margin: 0; }}
+QScrollBar:vertical {{ background: transparent; width: 0px; margin: 0; }}
 QScrollBar::handle:vertical {{ background: {BORDER}; border-radius: 4px;
     min-height: 24px; }}
 QScrollBar::handle:vertical:hover {{ background: {FG_MUTED}; }}
 QScrollBar::add-line, QScrollBar::sub-line {{ height: 0; }}
-QScrollBar:horizontal {{ background: transparent; height: 9px; margin: 0; }}
+QScrollBar:horizontal {{ background: transparent; height: 0px; margin: 0; }}
 QScrollBar::handle:horizontal {{ background: {BORDER}; border-radius: 4px;
     min-width: 24px; }}
 QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{ width: 0; }}

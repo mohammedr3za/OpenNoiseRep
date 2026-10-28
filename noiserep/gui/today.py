@@ -172,14 +172,18 @@ class RingCell(QtWidgets.QWidget):
         super().__init__(parent)
         h = QtWidgets.QHBoxLayout(self)
         h.setContentsMargins(0, 0, 0, 0)
-        h.setSpacing(14)
+        h.setSpacing(8)
         self.ring = Ring(color)
         h.addWidget(self.ring)
         v = QtWidgets.QVBoxLayout()
         v.setSpacing(1)
         self.name = style(QtWidgets.QLabel(title), 14, QtGui.QFont.Weight.DemiBold, color)
+        self.name.setWordWrap(True)
         self.caption = style(QtWidgets.QLabel(""), 12, color=theme.FG_MUTED)
         self.caption.setWordWrap(True)
+        for label in (self.name, self.caption):
+            label.setMinimumWidth(0)
+            label.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Preferred)
         v.addStretch(1)
         v.addWidget(self.name)
         v.addWidget(self.caption)
@@ -359,15 +363,25 @@ class BodyBattery(Animated):
         p.setPen(QtGui.QPen(qcolor(theme.FG_MUTED, 0.65), 2))
         p.setBrush(qcolor(theme.FG, 0.04))
         p.drawRoundedRect(rect, 14, 14)
-        inner = rect.adjusted(6, 6, -6, -6)
-        if self.value is not None and self.value > 0:
-            clip = QtGui.QPainterPath()
-            clip.addRoundedRect(inner, 9, 9)
-            p.setClipPath(clip)
-            fill = QtCore.QRectF(inner)
-            fill.setWidth(inner.width() * self.value / 100 * self.progress)
-            p.fillRect(fill, qcolor(theme.ACCENT, 0.28))
-            p.setClipping(False)
+        inner = rect.adjusted(7, 7, -7, -7)
+        cells, gap = 10, 4
+        cell_width = (inner.width() - gap * (cells - 1)) / cells
+        charge = 0 if self.value is None else self.value / 10 * self.progress
+        for index in range(cells):
+            cell = QtCore.QRectF(inner.left() + index * (cell_width + gap),
+                                 inner.top(), cell_width, inner.height())
+            p.setPen(QtCore.Qt.NoPen)
+            p.setBrush(qcolor(theme.FG, 0.055))
+            p.drawRoundedRect(cell, 4, 4)
+            fraction = min(1.0, max(0.0, charge - index))
+            if fraction:
+                clip = QtGui.QPainterPath()
+                clip.addRoundedRect(cell, 4, 4)
+                p.setClipPath(clip)
+                fill = QtCore.QRectF(cell)
+                fill.setWidth(cell.width() * fraction)
+                p.fillRect(fill, qcolor(theme.ACCENT, 0.38))
+                p.setClipping(False)
         p.setPen(qcolor(theme.FG))
         p.setFont(font(36, QtGui.QFont.Weight.Bold))
         p.drawText(rect, QtCore.Qt.AlignCenter, "—" if self.value is None else f"{self.value:.0f}%")
@@ -658,7 +672,7 @@ class TodayPage(QtWidgets.QScrollArea):
     def _build_cards(self) -> None:
         self.rings_card = Card("Summary")
         row = QtWidgets.QHBoxLayout()
-        row.setSpacing(18)
+        row.setSpacing(10)
         self.cell_recovery = RingCell("Recovery", theme.RECOVERY_GOOD)
         self.cell_strain = RingCell("Strain", theme.STRAIN)
         self.cell_sleep = RingCell("Sleep", theme.SLEEP)
@@ -669,7 +683,7 @@ class TodayPage(QtWidgets.QScrollArea):
 
         self.live_card = Card("Live", theme.HEART)
         row = QtWidgets.QHBoxLayout()
-        row.setSpacing(28)
+        row.setSpacing(12)
         self.live_hr = LiveMetric("Heart rate", "bpm", theme.HEART, 44)
         self.live_spo2 = LiveMetric("Blood oxygen", "%", theme.OXYGEN, 30)
         self.live_stress = LiveMetric("Stress", "", theme.STRESS, 30)
@@ -757,7 +771,13 @@ class TodayPage(QtWidgets.QScrollArea):
 
     def _relayout(self) -> None:
         content = self.viewport().width() - 2 * max(self._gutter, 0)
-        cols = 12 if content >= 1000 else 6 if content >= 640 else 1
+        ring_size = 40 if content < 1100 else 76
+        for cell in (self.cell_recovery, self.cell_strain, self.cell_sleep):
+            cell.ring.setFixedSize(ring_size, ring_size)
+            style(cell.name, 12 if content < 1100 else 14,
+                  QtGui.QFont.Weight.DemiBold, cell.ring.color)
+            style(cell.caption, 10 if content < 1100 else 12, color=theme.FG_MUTED)
+        cols = 12 if content >= 800 else 6 if content >= 640 else 1
         if cols == self._cols:
             return
         self._cols = cols
@@ -771,7 +791,7 @@ class TodayPage(QtWidgets.QScrollArea):
             self.grid.setColumnStretch(i, 1)
 
     def _apply_gutter(self) -> None:
-        g = theme.gutter(self.viewport().width())
+        g = theme.page_gutter(self, self.viewport().width())
         if g != self._gutter:
             self._gutter = g
             self._outer.setContentsMargins(g, 22, g, 36)

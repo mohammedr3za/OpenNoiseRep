@@ -346,7 +346,8 @@ def main(argv: list[str] | None = None) -> int:
     e.add_argument("--until", dest="until", default=None, help="YYYY-MM-DD")
     e.add_argument("--format", dest="fmt", choices=["csv", "json"], default="csv")
     e.add_argument("--out", dest="out", required=True, help="output file path")
-    sub.add_parser("gui", help="launch the desktop app")
+    g = sub.add_parser("gui", help="launch the desktop app")
+    g.add_argument("--reload", action="store_true", help="restart automatically after source edits (development)")
     lv = sub.add_parser("live", help="stay connected: live values + periodic history")
     lv.add_argument("--name", dest="name", default=None)
     lv.add_argument("--db", dest="db", default=None)
@@ -405,7 +406,7 @@ def main(argv: list[str] | None = None) -> int:
         return _export(args.db, args.metric, args.since, args.until, args.fmt, args.out)
     if args.cmd == "gui":
         from .gui.app import main as gui_main
-        return gui_main([])
+        return gui_main(["--reload"] if args.reload else [])
     if args.cmd == "live":
         return _live(args.name, args.db, args.interval, args.history_every)
     if args.cmd == "sleep":

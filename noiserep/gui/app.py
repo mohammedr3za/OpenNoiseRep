@@ -26,6 +26,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 from . import theme
 from .syncbar import SyncBar
+from .window_chrome import AppWindow, TitleSurface, WindowButton
 from .today import TodayPage
 from .. import analytics
 from ..export import export_csv, export_json
@@ -455,6 +456,24 @@ class SmartDateAxis(pg.DateAxisItem):
         return out
 
 
+class GutterScrollArea(QtWidgets.QScrollArea):
+    """Recalculate page gutters when a previously hidden viewport is shown."""
+
+    def sync_gutters(self):
+        host = self.widget()
+        if host is not None and host.layout() is not None:
+            gutter = theme.page_gutter(self, self.viewport().width())
+            host.layout().setContentsMargins(gutter, 22, gutter, 36)
+
+    def resizeEvent(self, event):  # noqa: N802
+        super().resizeEvent(event)
+        self.sync_gutters()
+
+    def showEvent(self, event):  # noqa: N802
+        super().showEvent(event)
+        self.sync_gutters()
+
+
 class GlassReadout(pg.TextItem):
     """Rounded translucent chart readout, using the active theme palette."""
 
@@ -730,7 +749,7 @@ class ClickableCard(QtWidgets.QFrame):
         super().keyPressEvent(event)
 
 
-class MainWindow(QtWidgets.QMainWindow):
+class MainWindow(AppWindow):
     def __init__(self, store: Store, band_name: str | None = DEFAULT_BAND):
         super().__init__()
         if band_name is None:
@@ -809,13 +828,13 @@ class MainWindow(QtWidgets.QMainWindow):
     # app bar
     # ------------------------------------------------------------------
     def _build_appbar(self) -> QtWidgets.QWidget:
-        bar = QtWidgets.QFrame()
+        bar = TitleSurface()
         bar.setObjectName("appbar")
         outer = QtWidgets.QVBoxLayout(bar)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
-        top = QtWidgets.QWidget()
+        top = TitleSurface()
         h = QtWidgets.QHBoxLayout(top)
         self._bar_layout = h
         h.setContentsMargins(26, 10, 26, 10)
@@ -854,7 +873,7 @@ class MainWindow(QtWidgets.QMainWindow):
         sl.setContentsMargins(3, 3, 3, 3)
         sl.setSpacing(2)
         group = QtWidgets.QButtonGroup(self)
-        for key, text in (("today", "Today"), ("metrics", "All metrics"),
+        for key, text in (("today", "Today"), ("metrics", "Health Trends"),
                           ("settings", "Settings")):
             tab = QtWidgets.QPushButton(text)
             tab.setObjectName("navTab")
@@ -870,8 +889,11 @@ class MainWindow(QtWidgets.QMainWindow):
         # QComboBox is native AppKit on macOS (theme.QSS omits its styling
         # there); the explicit height keeps it aligned with the app bar.
         self.range_combo = QtWidgets.QComboBox()
-        for _, text in RANGE_MODES:
-            self.range_combo.addItem(text)
+        for key, text in RANGE_MODES:
+            if key not in ("today", "day"):
+                self.range_combo.addItem(text, key)
+        self.range_combo.setPlaceholderText("Date range")
+        self.range_combo.setCurrentIndex(-1)
         self.range_combo.setAccessibleName("Date range")
         self.range_combo.setToolTip("Choose the period shown")
         self.range_combo.setMinimumHeight(32)
@@ -950,6 +972,19 @@ class MainWindow(QtWidgets.QMainWindow):
             "Scan for the band and download new history")
         self.sync_btn.clicked.connect(self._on_sync)
         h.addWidget(self.sync_btn)
+        self.window_controls = QtWidgets.QWidget(bar)
+        controls = QtWidgets.QHBoxLayout(self.window_controls)
+        controls.setContentsMargins(0, 0, 0, 0)
+        controls.setSpacing(3)
+        self.minimize_button = WindowButton("minimize")
+        self.maximize_button = WindowButton("maximize")
+        self.close_button = WindowButton("close")
+        self.minimize_button.clicked.connect(self.showMinimized)
+        self.maximize_button.clicked.connect(self._toggle_maximized)
+        self.close_button.clicked.connect(self.close)
+        for button in (self.minimize_button, self.maximize_button, self.close_button):
+            controls.addWidget(button)
+        self.window_controls.setFixedSize(108, 32)
 
         outer.addWidget(top)
         self.sync_bar = SyncBar()
@@ -1033,27 +1068,30 @@ class MainWindow(QtWidgets.QMainWindow):
     # overview
     # ------------------------------------------------------------------
     def _make_page(self):
-        """A scroll page whose content is centred and capped at a readable width."""
-        scroll = QtWidgets.QScrollArea()
+        """Detail pages use the same window-aware gutters as Today and Trends."""
+        scroll = GutterScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        inner = QtWidgets.QWidget()
+        scroll.setWidget(inner)
+        lay = QtWidgets.QVBoxLayout(inner)
+        lay.setSpacing(16)
+        scroll.sync_gutters()
+        return scroll, inner, lay
+
+    def _build_overview(self) -> QtWidgets.QWidget:
+        scroll = GutterScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
         scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
         host = QtWidgets.QWidget()
         scroll.setWidget(host)
-        h = QtWidgets.QHBoxLayout(host)
-        h.setContentsMargins(0, 0, 0, 0)
-        h.addStretch(1)
-        inner = QtWidgets.QWidget()
-        inner.setMaximumWidth(1040)
-        h.addWidget(inner, 10)
-        h.addStretch(1)
-        lay = QtWidgets.QVBoxLayout(inner)
-        lay.setContentsMargins(28, 24, 28, 24)
+        lay = QtWidgets.QVBoxLayout(host)
         lay.setSpacing(16)
-        return scroll, inner, lay
-
-    def _build_overview(self) -> QtWidgets.QWidget:
-        scroll, _inner, lay = self._make_page()
+        self._trends_scroll, self._trends_layout = scroll, lay
+        g = theme.page_gutter(self, scroll.viewport().width())
+        lay.setContentsMargins(g, 22, g, 36)
 
         row = QtWidgets.QHBoxLayout()
         head = QtWidgets.QVBoxLayout()
@@ -2016,6 +2054,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.stack.setCurrentWidget(self.settings_page)
         else:
             self.stack.setCurrentIndex(0)
+            QtCore.QTimer.singleShot(0, self._relayout_tiles)
         self._show_day_nav()
 
     def _plot_detail(self) -> None:
@@ -2692,11 +2731,11 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             mode = "all"
         self._range_mode = mode
-        index = next((i for i, (m, _) in enumerate(RANGE_MODES) if m == mode), 0)
+        index = self.range_combo.findData(mode)
         self.range_combo.blockSignals(True)
         self.range_combo.setCurrentIndex(index)
         self.range_combo.blockSignals(False)
-        self.custom_row.setVisible(mode == "custom")
+        self.custom_row.hide()
         self._show_day_nav()
 
     def _default_day(self) -> None:
@@ -2811,13 +2850,37 @@ class MainWindow(QtWidgets.QMainWindow):
         return f"{start:%d %b} – {end:%d %b}"
 
     def _on_range_mode_changed(self, index: int) -> None:
-        self._range_mode = RANGE_MODES[max(0, index)][0]
-        self.custom_row.setVisible(self._range_mode == "custom")
+        mode = self.range_combo.itemData(index)
+        if mode is None:
+            return
+        if mode == "custom":
+            dialog = QtWidgets.QDialog(self)
+            dialog.setWindowTitle("Custom date range")
+            layout = QtWidgets.QFormLayout(dialog)
+            layout.setContentsMargins(24, 24, 24, 24)
+            start = QtWidgets.QDateEdit(self.date_from.date())
+            end = QtWidgets.QDateEdit(self.date_to.date())
+            for field in (start, end):
+                field.setCalendarPopup(True)
+                field.setDisplayFormat("dd MMM yyyy")
+            end.setMinimumDate(start.date())
+            start.dateChanged.connect(end.setMinimumDate)
+            layout.addRow("From", start)
+            layout.addRow("To", end)
+            buttons = QtWidgets.QDialogButtonBox(
+                QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+            buttons.accepted.connect(dialog.accept)
+            buttons.rejected.connect(dialog.reject)
+            layout.addRow(buttons)
+            if dialog.exec() != QtWidgets.QDialog.Accepted:
+                blocker = QtCore.QSignalBlocker(self.range_combo)
+                self.range_combo.setCurrentIndex(self.range_combo.findData(self._range_mode))
+                return
+            self.date_from.setDate(start.date())
+            self.date_to.setDate(end.date())
+        self._range_mode = mode
+        self.custom_row.hide()
         self._show_day_nav()
-        if self._range_mode == "custom":
-            self._sync_dates_to_bounds()
-        elif self._range_mode == "day":
-            self._default_day()
         self._refresh_header()
         self._populate_overview()
         if self._detail_metric:
@@ -2825,14 +2888,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _show_day_nav(self) -> None:
         day = self._range_mode == "day"
-        self.day_date.setVisible(day)
+        self.day_date.hide()
         if hasattr(self, "ov_day_nav"):
             self.ov_day_nav.set_day(
                 self.day_date.date().toPython() if day
                 else datetime.date.today() if self._range_mode == "today" else None)
 
     def _overview_shift(self, delta: int) -> None:
-        """‹ Today › on All metrics: step through single days."""
+        """‹ Today › on Health Trends: step through single days."""
         today = QtCore.QDate.currentDate()
         if delta == 0:
             target = today
@@ -2841,9 +2904,14 @@ class MainWindow(QtWidgets.QMainWindow):
             target = min(base.addDays(delta), today)
         mode = "today" if target == today else "day"
         self.day_date.setDate(target)
-        index = next(i for i, (m, _) in enumerate(RANGE_MODES) if m == mode)
-        self.range_combo.setCurrentIndex(index)
+        self._range_mode = mode
+        blocker = QtCore.QSignalBlocker(self.range_combo)
+        self.range_combo.setCurrentIndex(-1)
         self._show_day_nav()
+        self._refresh_header()
+        self._populate_overview()
+        if self._detail_metric:
+            self._plot_detail()
 
     def _shift_day(self, delta: int) -> None:
         self.day_date.setDate(self.day_date.date().addDays(delta))
@@ -2865,17 +2933,22 @@ class MainWindow(QtWidgets.QMainWindow):
             self._plot_detail()
 
     def _show_all_data(self) -> None:
-        index = next(i for i, (m, _) in enumerate(RANGE_MODES) if m == "all")
+        index = self.range_combo.findData("all")
         self.range_combo.setCurrentIndex(index)
 
     def _apply_gutter(self) -> None:
         """Align the app bar and banners with the centred content column."""
         width = self.width()
-        g = theme.gutter(width)
+        g = theme.page_gutter(self, width)
         bar = max(26, min(g, (width - 1000) // 2))
-        self._bar_layout.setContentsMargins(bar, 10, bar, 10)
+        self._bar_layout.setContentsMargins(bar, 10, max(bar, 128), 10)
+        self.window_controls.move(width - 118, 14)
+        self.window_controls.raise_()
         self._banner_layout.setContentsMargins(g, 14, g, 0)
         self._settings_layout.setContentsMargins(g, 30, g, 40)
+        if hasattr(self, "_trends_scroll"):
+            content_gutter = theme.page_gutter(self, self._trends_scroll.viewport().width())
+            self._trends_layout.setContentsMargins(content_gutter, 22, content_gutter, 36)
 
     def _sync_theme_btn(self) -> None:
         dark = theme.mode == "dark"
@@ -2910,6 +2983,23 @@ class MainWindow(QtWidgets.QMainWindow):
         if save:
             QtCore.QSettings("NoiseREP", "Sync").setValue("theme", mode)
 
+    def _toggle_maximized(self):
+        self.showNormal() if self.isMaximized() else self.showMaximized()
+
+    def changeEvent(self, event):  # noqa: N802
+        super().changeEvent(event)
+        if event.type() == QtCore.QEvent.WindowStateChange and hasattr(self, "maximize_button"):
+            label = "Restore" if self.isMaximized() else "Maximize"
+            self.maximize_button.setAccessibleName(label)
+            self.maximize_button.setToolTip(label)
+            self.maximize_button.update()
+            if hasattr(self, "today"):
+                self._apply_gutter()
+                self.today._apply_gutter()
+                self.today._relayout()
+                for page in self.findChildren(GutterScrollArea):
+                    page.sync_gutters()
+
     def resizeEvent(self, event):  # noqa: N802 - Qt override
         super().resizeEvent(event)
         self._apply_gutter()
@@ -2927,12 +3017,12 @@ class MainWindow(QtWidgets.QMainWindow):
             root.setFocus(QtCore.Qt.OtherFocusReason)
 
     def _content_width(self) -> int:
-        # `stack.width()` can still be its pre-show hint width during the
-        # first populate; the window width is already authoritative.
-        return max(0, max(self.stack.width(), self.width() - 56) - 56)
+        width = self.width()
+        return max(0, width - 2 * theme.page_gutter(self, width))
 
     def _relayout_tiles(self) -> None:
         # Channel rows remain full-width; vitals and goals still reflow.
+        self._apply_gutter()
         self._relayout_vitals()
         self._relayout_movement()
 
@@ -3313,10 +3403,22 @@ def main(argv: list[str] | None = None) -> int:
     store = Store(default_db_path())
     app.aboutToQuit.connect(store.close)
     win = MainWindow(store)
+    reloader = None
+    if "--reload" in (argv or []):
+        from .dev_reload import DevReloader
+        settings = QtCore.QSettings("NoiseREP", "Development")
+        geometry = settings.value("geometry")
+        if geometry is not None:
+            win.restoreGeometry(geometry)
+        win._show_home(settings.value("page", "today"))
+        reloader = DevReloader(win)
     win.show()
     win.start_link()
     with loop:
         loop.run_forever()
+    if reloader is not None and reloader.requested:
+        subprocess.Popen([sys.executable, "-m", "noiserep.cli", "gui", "--reload"],
+                         start_new_session=True)
     return 0
 
 
