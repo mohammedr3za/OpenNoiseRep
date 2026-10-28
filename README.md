@@ -27,12 +27,6 @@ still named `noiserep`. Screenshots use synthetic demo data.
 |---|---|
 | ![Menu-bar heart states: 72, tilde, dash](docs/images/menubar.png) | ![All channels with daily activity, HRV and stress](docs/images/channels.png) |
 
-## Demo
-
-[Watch the 19-second MP4](docs/media/OpenNoiseRep-demo.mp4)
-
-![OpenNoiseRep demo](docs/media/OpenNoiseRep-demo.gif)
-
 ## Features
 
 - Historical sync: device info, data index, heart-rate/activity series and
@@ -85,6 +79,7 @@ and turn the phone's Bluetooth off while syncing.
 - [RRI and sleep file formats](docs/FILES.md)
 - [Roadmap](docs/ROADMAP.md)
 - [Release notes and data caveats](docs/RELEASE-NOTES.md)
+- [Experimental haptics](docs/VIBRATION.md)
 
 ## Contributing
 

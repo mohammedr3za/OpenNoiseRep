@@ -6,8 +6,7 @@ today and orders the work by user trust first, daily usefulness second, reach
 last.
 
 Read [`README.md`](../README.md) for the current status and
-[`docs/PROTOCOL.md`](PROTOCOL.md) for the wire format. The review of the original
-spec and plans is in [`docs/SPEC-REVIEW.md`](SPEC-REVIEW.md).
+[`docs/PROTOCOL.md`](PROTOCOL.md) for the wire format.
 
 ## The rule that outranks the roadmap
 
