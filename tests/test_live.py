@@ -64,3 +64,30 @@ def test_store_keeps_latest_live_and_hr_series():
     assert s.live()["heart_rate"] == 75
     assert [v for _, v in s.samples("live_hr")] == [70.0, 75.0]
     s.close()
+
+
+def test_history_forwards_progress_to_run_sync(monkeypatch):
+    import asyncio
+
+    import noiserep.sync as sync
+    from noiserep.live import _history
+
+    class Band:
+        async def send(self, _):
+            pass
+
+        async def recv(self, timeout=0):
+            raise asyncio.TimeoutError
+
+    seen = {}
+
+    async def fake(band, since, progress=None, **_):
+        seen["progress"] = progress
+        return sync.SyncResult()
+
+    monkeypatch.setattr(sync, "run_sync", fake)
+    s = Store(":memory:")
+    cb = lambda *a: None  # noqa: E731
+    asyncio.run(_history(Band(), s, cb))
+    assert seen["progress"] is cb
+    s.close()

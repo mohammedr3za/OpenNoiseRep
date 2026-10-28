@@ -1,55 +1,83 @@
-"""Light, airy theme for the NoiseREP window (Anthropic-inspired palette).
+"""Apple-inspired light (default) and dark themes for the NoiseREP window.
 
 Token names are part of the GUI's minimal API and stay stable for other
 modules (``BG``, ``PANEL``, ``BORDER``, ``FG``, ``FG_MUTED``, ``ACCENT``,
 ``ACCENT_HOVER``, ``ON_ACCENT``, ``SERIES``, ``QSS``).
 
-The palette is warm ivory + white cards, slate text, and one Book Cloth
-terracotta accent.  ``ACCENT`` is used for charts and large numerals;
-``ACCENT_DEEP`` is a slightly deeper shade of the same hue used wherever small
-text sits on the accent so that it clears WCAG AA.  ``FOCUS`` is reserved for
-keyboard focus rings so focus is never conveyed by colour alone.
+Soft off-white / near-black surfaces, hairline borders, no shadows, and Apple's health colours:
+each metric owns one hue (``HEART``, ``STRAIN``, ``SLEEP``...) so a colour
+means the same thing everywhere.  ``FOCUS`` stays reserved for keyboard focus.
 """
 from __future__ import annotations
 
 import sys
 
-BG = "#FAFAF7"            # Ivory Light
-PANEL = "#FFFFFF"         # White
-PANEL_HOVER = "#F0F0EB"   # Ivory Medium
-BORDER = "#E8E4DF"        # Ivory Dark (hairline)
-FG = "#191919"            # Slate Dark
-FG_MUTED = "#666663"      # Cloud Dark (>=5:1 on white / ivory)
-ACCENT = "#CC785C"        # Book Cloth
-ACCENT_HOVER = "#D4A27F"  # Kraft
-ON_ACCENT = "#FFFFFF"
-ERROR = "#BF4D43"
-FOCUS = "#6A9BCC"
-SERIES = ["#CC785C", "#D4A27F", "#6A9BCC", "#91918D"]
-
-# Supporting shades (same hue families, tuned for text/AA and soft banners).
-ACCENT_DEEP = "#A85B44"        # AA (4.6:1) with white, for small accent text
-ACCENT_DEEP_HOVER = "#96503B"
-ACCENT_FILL = "rgba(204,120,92,0.12)"
-ACCENT_LINE = "rgba(204,120,92,0.55)"
-INFO_BG = "#EBDBCF"            # Manilla — soft accent info banner
-INFO_BORDER = "#E2CDBD"
-INFO_FG = "#5A4638"
-ERROR_BG = "#FBEDEB"
-ERROR_BORDER = "#E9C6C0"
-ERROR_TEXT = "#8E3A32"
-
-# Kept for any legacy importer; values now point at the light palette.
-PALETTE = {
-    "ivory_light": BG, "white": PANEL, "ivory_medium": PANEL_HOVER,
-    "ivory_dark": BORDER, "slate_dark": FG, "cloud_dark": FG_MUTED,
-    "book_cloth": ACCENT, "kraft": ACCENT_HOVER, "manilla": INFO_BG,
-    # legacy names
-    "black": FG, "charcoal": FG_MUTED, "gray": BORDER, "pale_blue": FOCUS,
-    "beige": ACCENT_HOVER, "taupe": ACCENT_DEEP, "soft_green": ACCENT,
+LIGHT = {
+    "BG": "#F5F5F7", "PANEL": "#FFFFFF", "PANEL_HOVER": "#F0F0F3",
+    "BORDER": "#E5E5EA", "FG": "#1D1D1F", "FG_MUTED": "#6E6E73",
+    "ACCENT": "#007AFF", "ACCENT_HOVER": "#0A6BDB", "ON_ACCENT": "#FFFFFF",
+    "ERROR": "#FF3B30", "FOCUS": "#007AFF",
+    "HEART": "#FF2D55", "STRAIN": "#007AFF", "SLEEP": "#AF52DE",
+    "RECOVERY_GOOD": "#34C759", "RECOVERY_MID": "#FFB000",
+    "RECOVERY_LOW": "#FF3B30", "STRESS": "#FF9500", "OXYGEN": "#32ADE6",
+    "STEPS": "#34C759", "ENERGY": "#FF9500",
+    "ACCENT_FILL": "rgba(0,122,255,0.10)", "ACCENT_LINE": "rgba(0,122,255,0.6)",
+    "INFO_BG": "#EAF3FF", "INFO_BORDER": "#CFE2FA", "INFO_FG": "#1F4A7A",
+    "ERROR_BG": "#FFECEA", "ERROR_BORDER": "#F6C9C4", "ERROR_TEXT": "#B3261E",
+}
+DARK = {
+    "BG": "#000000", "PANEL": "#1C1C1E", "PANEL_HOVER": "#2C2C2E",
+    "BORDER": "#2C2C2E", "FG": "#F5F5F7", "FG_MUTED": "#98989D",
+    "ACCENT": "#0A84FF", "ACCENT_HOVER": "#409CFF", "ON_ACCENT": "#FFFFFF",
+    "ERROR": "#FF453A", "FOCUS": "#64D2FF",
+    "HEART": "#FF375F", "STRAIN": "#0A84FF", "SLEEP": "#BF5AF2",
+    "RECOVERY_GOOD": "#30D158", "RECOVERY_MID": "#FFD60A",
+    "RECOVERY_LOW": "#FF453A", "STRESS": "#FF9F0A", "OXYGEN": "#64D2FF",
+    "STEPS": "#32D74B", "ENERGY": "#FF9F0A",
+    "ACCENT_FILL": "rgba(10,132,255,0.16)", "ACCENT_LINE": "rgba(10,132,255,0.6)",
+    "INFO_BG": "#16263A", "INFO_BORDER": "#1F3A5A", "INFO_FG": "#C9DDF5",
+    "ERROR_BG": "#3A1715", "ERROR_BORDER": "#5C2420", "ERROR_TEXT": "#FF9F97",
 }
 
-FONT_FAMILY = ('"SF Pro Text", "Helvetica Neue", "Segoe UI", '
+# Layout: the content column is centred; each side gutter is the larger of
+# GUTTER_FRAC of the window width and whatever keeps content <= CONTENT_MAX.
+GUTTER_FRAC = 0.15
+CONTENT_MAX = 1600
+CONTENT_MIN = 720
+GUTTER_MIN = 24
+
+mode = "light"
+ACCENT_DEEP = ACCENT_DEEP_HOVER = SERIES = PALETTE = None  # set by apply()
+
+
+def gutter(width: int) -> int:
+    """Side gutter in px for a window ``width`` wide."""
+    g = max(width * GUTTER_FRAC, (width - CONTENT_MAX) / 2)
+    return int(max(GUTTER_MIN, min(g, (width - CONTENT_MIN) / 2)))
+
+
+def apply(new_mode: str) -> None:
+    """Switch the palette ("light" or "dark") and rebuild ``QSS``.
+
+    Modules read ``theme.X`` at use time, so the switch takes effect on the
+    next paint / ``app.setStyleSheet(theme.QSS)``.
+    """
+    g = globals()
+    g["mode"] = new_mode
+    g.update(DARK if new_mode == "dark" else LIGHT)
+    g["ACCENT_DEEP"], g["ACCENT_DEEP_HOVER"] = g["ACCENT"], g["ACCENT_HOVER"]
+    g["SERIES"] = [g[k] for k in ("HEART", "STRAIN", "SLEEP", "STEPS", "STRESS", "OXYGEN")]
+    g["PALETTE"] = {
+        "bg": g["BG"], "panel": g["PANEL"], "panel_hover": g["PANEL_HOVER"],
+        "border": g["BORDER"], "fg": g["FG"], "fg_muted": g["FG_MUTED"],
+        "accent": g["ACCENT"],
+    }
+    if "QSS" in g:
+        g["QSS"] = build_qss()
+
+
+FONT_FAMILY = ('"SF Pro Display", "SF Pro Text", "Segoe UI Variable Display", '
+               '"Segoe UI Variable Text", "Segoe UI", "Helvetica Neue", '
                'system-ui, sans-serif')
 
 
@@ -109,17 +137,52 @@ QLabel#devicePill {{ color: {FG_MUTED}; font-size: 11px; }}
 QFrame#devicePill {{ background: {PANEL_HOVER}; border: 1px solid {BORDER};
     border-radius: 11px; }}
 QLabel#bandDot {{ font-size: 11px; color: {FG_MUTED}; }}
-QLabel#bandDot[state="live"] {{ color: #34A853; }}
-QLabel#bandDot[state="charging"] {{ color: #E8A33D; }}
+QLabel#bandDot[state="live"] {{ color: {RECOVERY_GOOD}; }}
+QLabel#bandDot[state="charging"] {{ color: {RECOVERY_MID}; }}
 QLabel#bandDot[state="searching"] {{ color: {FOCUS}; }}
 QLabel#bandDot[state="idle"] {{ color: {FG_MUTED}; }}
 QLabel#bandState {{ color: {FG}; font-size: 11px; font-weight: 600; }}
 QFrame#liveStrip {{ background: {PANEL}; border-bottom: 1px solid {BORDER}; }}
-QLabel#liveHeart {{ color: {ERROR}; font-size: 26px; }}
+QLabel#liveHeart {{ color: {HEART}; font-size: 26px; }}
 QLabel#liveValue {{ color: {FG}; font-size: 22px; font-weight: 650; }}
 QLabel#liveUnit {{ color: {FG_MUTED}; font-size: 11px; padding-bottom: 3px; }}
 QLabel#liveCaption {{ color: {FG_MUTED}; font-size: 10px; font-weight: 600;
     letter-spacing: 0.8px; }}
+
+/* Today page */
+QWidget#todayHost {{ background: {BG}; }}
+QFrame#todayCard {{ background: {PANEL}; border: 1px solid {BORDER};
+    border-radius: 16px; }}
+QPushButton#pillBtn {{ background: {PANEL}; color: {FG}; border: 1px solid {BORDER};
+    border-radius: 15px; padding: 5px 14px; font-size: 13px; font-weight: 600; }}
+QPushButton#pillBtn:hover {{ background: {PANEL_HOVER}; }}
+QPushButton#navTab {{ background: transparent; color: {FG_MUTED}; border: none;
+    border-radius: 14px; padding: 6px 16px; font-size: 13px; font-weight: 600; }}
+QPushButton#navTab:checked {{ background: {PANEL_HOVER}; color: {FG}; }}
+QPushButton#navTab:hover {{ color: {FG}; }}
+QPushButton#liveBtn, QPushButton#themeBtn {{ background: transparent;
+    color: {FG}; border: 1px solid {BORDER}; border-radius: 10px;
+    padding: 7px 13px; font-size: 13px; }}
+QPushButton#liveBtn:hover, QPushButton#themeBtn:hover {{ background: {PANEL_HOVER}; }}
+QPushButton#liveBtn[active="true"] {{ background: {ACCENT_FILL}; color: {HEART};
+    border: 1px solid {HEART}; font-weight: 600; }}
+QPushButton#themeBtn {{ padding: 7px 11px; }}
+QLabel#syncPct {{ color: {ACCENT}; font-size: 12px; font-weight: 600; }}
+
+/* icon guide */
+QFrame#guideCard {{ background: {PANEL}; border: 1px solid {BORDER};
+    border-radius: 16px; }}
+QLabel#guidePill {{ background: {BG}; border: 1px solid {BORDER};
+    border-radius: 14px; padding: 6px 16px; font-size: 17px; font-weight: 600;
+    color: {FG}; }}
+QLabel#guidePill[on="true"] {{ color: {HEART}; }}
+QLabel#guideTitle {{ font-size: 30px; font-weight: 700; color: {FG}; }}
+QLabel#guideLead {{ font-size: 15px; color: {FG_MUTED}; }}
+QLabel#guideState {{ font-size: 16px; font-weight: 600; color: {FG}; }}
+QLabel#guideBody {{ font-size: 13px; color: {FG_MUTED}; }}
+QLabel#guideNum {{ background: {BG}; border-radius: 11px; color: {FG_MUTED};
+    font-size: 12px; font-weight: 600; min-width: 22px; max-width: 22px;
+    min-height: 22px; max-height: 22px; }}
 
 /* typography */
 QLabel#greeting {{ font-size: 30px; font-weight: 700; color: {FG}; }}
@@ -277,4 +340,5 @@ QProgressBar::chunk {{ background: {ACCENT}; border-radius: 2px; }}
 
 
 #: Final stylesheet for the host platform.
+apply("light")
 QSS = build_qss()

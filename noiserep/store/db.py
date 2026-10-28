@@ -198,18 +198,63 @@ def _derive_rest_sessions(conn: sqlite3.Connection) -> int:
         ((_from_ts(ts), rr) for ts, rr in rows))
     if summary is None:
         return 0
-    conn.execute("DELETE FROM sleep_sessions WHERE source='rri'")
+    lo, hi = _to_ts(summary.start), _to_ts(summary.end)
+    # A derived session is ours to refresh; a band session is never touched.
+    _drop_sessions(conn, "source IN ('rri','derived') AND wake>=? AND bedtime<=?",
+                   (lo, hi))
     if conn.execute(
             "SELECT 1 FROM sleep_sessions WHERE wake>=? AND bedtime<=?",
-            (_to_ts(summary.start), _to_ts(summary.end))).fetchone():
+            (lo, hi)).fetchone():
         return 0                 # the band's own session covers this night
     conn.execute(
         "INSERT INTO sleep_sessions(bedtime, wake, total_min, source) "
-        "VALUES(?,?,?,?) ON CONFLICT(bedtime, wake) DO UPDATE SET "
-        "total_min=excluded.total_min, source=excluded.source",
-        (_to_ts(summary.start), _to_ts(summary.end), summary.duration_min, "rri"),
-    )
+        "VALUES(?,?,?,?)", (lo, hi, summary.duration_min, "rri"))
+    _stage_rest_session(conn, summary.start, summary.end)
     return 1
+
+
+def _drop_sessions(conn: sqlite3.Connection, where: str, args: tuple) -> None:
+    ids = [r[0] for r in conn.execute(
+        f"SELECT id FROM sleep_sessions WHERE {where}", args)]
+    for i in ids:
+        conn.execute("DELETE FROM sleep_stages WHERE session_id=?", (i,))
+        conn.execute("DELETE FROM sleep_sessions WHERE id=?", (i,))
+
+
+def _stage_rest_session(conn: sqlite3.Connection, start, end) -> bool:
+    """Upgrade the stage-less 'rri' session to an estimated 'derived' one."""
+    from .. import sleepstage
+
+    def series(metric, lo, hi):
+        return [(_from_ts(t), v) for t, v in conn.execute(
+            "SELECT ts, value FROM samples WHERE metric=? AND ts BETWEEN ? AND ? "
+            "ORDER BY ts", (metric, _to_ts(lo), _to_ts(hi)))]
+
+    # Zero movement is not stored; an empty night only means "still" when the
+    # series was synced for that day at all.
+    synced = conn.execute(
+        "SELECT 1 FROM samples WHERE metric='movement_level' AND ts BETWEEN ? AND ?",
+        (_to_ts(start), _to_ts(end + _dt.timedelta(hours=12)))).fetchone()
+    rri = [(_from_ts(t), r) for t, r in conn.execute(
+        "SELECT ts, rr_ms FROM rri_samples WHERE ts BETWEEN ? AND ? ORDER BY ts",
+        (_to_ts(start), _to_ts(end)))]
+    night = sleepstage.stage_night(
+        start, end, series("heart_rate", start, end),
+        series("movement_level", start, end) if synced else None, rri)
+    if night is None:
+        return False
+    conn.execute(
+        "UPDATE sleep_sessions SET total_min=?, deep_min=?, light_min=?, rem_min=?, "
+        "awake_min=?, latency_min=?, efficiency=?, time_in_bed_min=?, "
+        "source='derived' WHERE bedtime=? AND wake=?",
+        (night.total_min, night.deep_min, night.light_min, night.rem_min,
+         night.awake_min, night.latency_min, night.efficiency,
+         night.time_in_bed_min, _to_ts(start), _to_ts(end)))
+    sid = conn.execute("SELECT id FROM sleep_sessions WHERE bedtime=? AND wake=?",
+                       (_to_ts(start), _to_ts(end))).fetchone()[0]
+    conn.executemany("INSERT INTO sleep_stages(session_id, ts, stage) VALUES(?,?,?)",
+                     [(sid, _to_ts(t), int(st)) for t, st in night.stages])
+    return True
 
 
 def _migrate_metric_names(conn: sqlite3.Connection) -> None:
@@ -421,6 +466,9 @@ class Store:
         if bedtime is None or wake is None:
             return None
         src = source or _attr(session, "source") or "file"
+        if src != "nap":     # the band's record supersedes our estimate
+            _drop_sessions(self._conn, "source IN ('rri','derived') AND "
+                           "wake>=? AND bedtime<=?", (bedtime, wake))
         cur.execute(
             "INSERT INTO sleep_sessions(bedtime, wake, total_min, deep_min, "
             "light_min, rem_min, awake_min, quality, source, latency_min, "

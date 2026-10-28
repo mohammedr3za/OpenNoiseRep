@@ -193,7 +193,8 @@ def _night(store, day: dt.date):
     lo = dt.datetime.combine(day - dt.timedelta(days=1), dt.time(18))
     hi = dt.datetime.combine(day, dt.time(14))
     sessions = [s for s in store.sleep_sessions(lo, hi)
-                if s["source"] != "nap" and lo <= s["wake"] <= hi]
+                if isinstance(s, dict) and s.get("source") != "nap"
+                and s.get("wake") and lo <= s["wake"] <= hi]
     if sessions:
         best = max(sessions, key=lambda s: s.get("total_min") or 0)
         return best, (best["bedtime"], best["wake"])

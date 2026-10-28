@@ -25,6 +25,8 @@ import qasync
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from . import theme
+from .syncbar import SyncBar
+from .today import TodayPage
 from .. import analytics
 from ..export import export_csv, export_json
 from ..protocol.files import STAGE_NAMES
@@ -328,6 +330,14 @@ class AnimatedNumber(QtWidgets.QLabel):
         self._anim.start()
 
 
+def _profile_age() -> int | None:
+    try:
+        from ..config import ConfigError, load
+        return load().profile.age
+    except (ConfigError, OSError):
+        return None
+
+
 def _fmt_min(minutes) -> str:
     return _fmt_span(minutes * 60) if minutes is not None else "—"
 
@@ -375,15 +385,7 @@ def _shortcut_label(seq: str) -> str:
 
 def _add_shadow(widget: QtWidgets.QWidget, blur: int = 26, dy: int = 4,
                 alpha: int = 14) -> None:
-    """Subtle drop shadow; cards stay flat when the platform ignores it."""
-    try:
-        eff = QtWidgets.QGraphicsDropShadowEffect(widget)
-        eff.setBlurRadius(blur)
-        eff.setOffset(0, dy)
-        eff.setColor(QtGui.QColor(25, 25, 25, alpha))
-        widget.setGraphicsEffect(eff)
-    except Exception:  # noqa: BLE001 - purely cosmetic
-        pass
+    """No-op: cards are flat hairline frames (graphics effects are costly)."""
 
 
 class SmartDateAxis(pg.DateAxisItem):
@@ -461,12 +463,27 @@ class ChartView(pg.PlotWidget):
             brush=pg.mkBrush(theme.ACCENT))
         self._label = pg.TextItem(
             "", anchor=(0, 0), color=theme.FG,
-            fill=pg.mkBrush(255, 255, 255, 238),
+            fill=pg.mkBrush(theme.PANEL),
             border=pg.mkPen(theme.BORDER))
         self._hover = False
         self._show_hover(False)
         self._proxy = pg.SignalProxy(
             self.scene().sigMouseMoved, rateLimit=30, slot=self._on_mouse)
+
+    def retheme(self) -> None:
+        """Re-read the palette after a light/dark switch."""
+        self.setBackground(theme.PANEL)
+        pi = self.getPlotItem()
+        for side in ("left", "bottom"):
+            axis = pi.getAxis(side)
+            axis.setPen(pg.mkPen(theme.BORDER))
+            axis.setTextPen(pg.mkPen(theme.FG_MUTED))
+        self._vline.setPen(pg.mkPen(theme.FG_MUTED, width=1, style=QtCore.Qt.DashLine))
+        self._marker.setPen(pg.mkPen(theme.PANEL, width=2))
+        self._marker.setBrush(pg.mkBrush(theme.ACCENT))
+        self._label.setColor(theme.FG)
+        self._label.fill = pg.mkBrush(theme.PANEL)
+        self._label.border = pg.mkPen(theme.BORDER)
 
     # -- data ------------------------------------------------------------
     def set_data(self, rows, unit: str | None = None, fill: bool = True) -> int:
@@ -641,6 +658,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._detail_metric: str | None = None
         self._range_mode = "today"
         self._syncing = False
+        self._sync_ok = False
         self._tile_widgets: list[QtWidgets.QWidget] = []
         self.tiles_grid: QtWidgets.QGridLayout | None = None
         self._tile_cols = 0
@@ -657,12 +675,18 @@ class MainWindow(QtWidgets.QMainWindow):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
         outer.addWidget(self._build_appbar())
-        outer.addWidget(self._build_live_strip())
         self._link_task = None
         self._sync_now = None
+        self._menubar_proc = None
+        self._menubar_stopping = False
+        self._last_live = None
+        self._menubar_poll = QtCore.QTimer(self)
+        self._menubar_poll.setInterval(1000)
+        self._menubar_poll.timeout.connect(self._poll_menubar)
 
         banner_host = QtWidgets.QWidget()
         banners = QtWidgets.QVBoxLayout(banner_host)
+        self._banner_layout = banners
         banners.setContentsMargins(26, 14, 26, 0)
         banners.setSpacing(8)
         banners.addWidget(self._build_error_banner())
@@ -676,10 +700,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.guide_page = self._build_guide()
         self.stack.addWidget(self.guide_page)             # index 3
         self.stack.addWidget(self._build_vital_detail())  # index 4
+        self.today = TodayPage(store, _profile_age(), on_open_metric=self._open_detail)
+        self.stack.addWidget(self.today)                  # index 5
         outer.addWidget(self.stack, 1)
 
         self._install_shortcuts()
         self._load()
+        self._show_home("today")
+        self._apply_gutter()
 
     # ------------------------------------------------------------------
     # app bar
@@ -693,8 +721,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         top = QtWidgets.QWidget()
         h = QtWidgets.QHBoxLayout(top)
-        h.setContentsMargins(26, 13, 26, 13)
-        h.setSpacing(12)
+        self._bar_layout = h
+        h.setContentsMargins(26, 10, 26, 10)
+        h.setSpacing(10)
 
         brand = QtWidgets.QHBoxLayout()
         brand.setSpacing(8)
@@ -732,6 +761,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self._set_band_state("off", "Band link off")
         h.addWidget(pill)
         h.addStretch(1)
+        self.nav_tabs = {}
+        group = QtWidgets.QButtonGroup(self)
+        for key, text in (("today", "Today"), ("metrics", "All metrics")):
+            tab = QtWidgets.QPushButton(text)
+            tab.setObjectName("navTab")
+            tab.setCheckable(True)
+            tab.setCursor(QtCore.Qt.PointingHandCursor)
+            tab.clicked.connect(lambda _=False, k=key: self._show_home(k))
+            group.addButton(tab)
+            self.nav_tabs[key] = tab
+            h.addWidget(tab)
+        h.addSpacing(12)
 
         # QComboBox is native AppKit on macOS (theme.QSS omits its styling
         # there); the explicit height keeps it aligned with the app bar.
@@ -801,23 +842,36 @@ class MainWindow(QtWidgets.QMainWindow):
         h.addWidget(self.export_menu_btn)
 
         self.live_btn = QtWidgets.QPushButton("♥ Live")
-        self.live_btn.setObjectName("ghost")
-        self.live_btn.setMinimumHeight(36)
-        self.live_btn.setToolTip(
-            "Open live heart rate in the macOS menu bar (separate app; the "
-            "band accepts one central)")
-        self.live_btn.setAccessibleName("Open live heart rate in the menu bar")
-        self.live_btn.clicked.connect(self._launch_menubar)
+        self.live_btn.setObjectName("liveBtn")
+        self.live_btn.setMinimumHeight(34)
+        self.live_btn.setCursor(QtCore.Qt.PointingHandCursor)
+        self.live_btn.clicked.connect(self._toggle_menubar)
+        self._set_live_btn(False)
         h.addWidget(self.live_btn)
 
         self.guide_btn = QtWidgets.QPushButton("? Icon guide")
         self.guide_btn.setObjectName("ghost")
-        self.guide_btn.setMinimumHeight(36)
+        self.guide_btn.setMinimumHeight(34)
         self.guide_btn.setToolTip("How to read the menu-bar heart icon")
         self.guide_btn.setAccessibleName("Menu-bar icon guide")
         self.guide_btn.clicked.connect(self._show_guide)
         h.addWidget(self.guide_btn)
 
+        self.theme_btn = QtWidgets.QPushButton()
+        self.theme_btn.setObjectName("themeBtn")
+        self.theme_btn.setMinimumHeight(34)
+        self.theme_btn.setCursor(QtCore.Qt.PointingHandCursor)
+        self.theme_btn.setAccessibleName("Switch light or dark theme")
+        self.theme_btn.clicked.connect(self._toggle_theme)
+        self._sync_theme_btn()
+        h.addWidget(self.theme_btn)
+
+        self.sync_pct = QtWidgets.QLabel("0%")
+        self.sync_pct.setObjectName("syncPct")
+        self.sync_pct.setMinimumWidth(40)
+        self.sync_pct.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+        self.sync_pct.hide()
+        h.addWidget(self.sync_pct)
         self.sync_btn = QtWidgets.QPushButton("Sync band")
         self.sync_btn.setObjectName("primary")
         self.sync_btn.setMinimumHeight(40)
@@ -829,6 +883,10 @@ class MainWindow(QtWidgets.QMainWindow):
         h.addWidget(self.sync_btn)
 
         outer.addWidget(top)
+        self.sync_bar = SyncBar()
+        self.sync_bar.percent.connect(lambda n: self.sync_pct.setText(f"{n}%"))
+        self.sync_bar.activeChanged.connect(self.sync_pct.setVisible)
+        outer.addWidget(self.sync_bar)
 
         self.custom_row = QtWidgets.QWidget()
         cr = QtWidgets.QHBoxLayout(self.custom_row)
@@ -875,11 +933,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.status.setWordWrap(True)
         self.status.setAccessibleName("Status")
         v.addWidget(self.status)
-        self.progress = QtWidgets.QProgressBar()
-        self.progress.setTextVisible(False)
-        self.progress.setFixedHeight(4)
-        self.progress.hide()
-        v.addWidget(self.progress)
         h.addLayout(v, 1)
         self.info_banner = frame
         return frame
@@ -1879,7 +1932,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self.back_btn.setFocus(QtCore.Qt.OtherFocusReason)
 
     def _show_overview(self) -> None:
-        self.stack.setCurrentIndex(0)
+        self._show_home(self._home)
+
+    def _show_home(self, key: str) -> None:
+        """Switch between the Today page and the all-metrics overview."""
+        self._home = key
+        self.nav_tabs[key].setChecked(True)
+        if key == "today":
+            self.stack.setCurrentWidget(self.today)
+            self.today.refresh()
+        else:
+            self.stack.setCurrentIndex(0)
+        for w in (self.range_combo, self.export_menu_btn):
+            w.setVisible(key != "today")
 
     def _plot_detail(self) -> None:
         metric = self._detail_metric
@@ -2019,108 +2084,104 @@ class MainWindow(QtWidgets.QMainWindow):
     # -- menu-bar icon guide ---------------------------------------------
     def _build_guide(self) -> QtWidgets.QWidget:
         scroll, _inner, lay = self._make_page()
+        lay.setSpacing(18)
 
-        header = QtWidgets.QWidget()
-        h = QtWidgets.QHBoxLayout(header)
-        h.setContentsMargins(0, 0, 0, 0)
-        h.setSpacing(8)
         self.guide_back_btn = QtWidgets.QPushButton("‹  Back")
         self.guide_back_btn.setObjectName("backBtn")
         self.guide_back_btn.setCursor(QtCore.Qt.PointingHandCursor)
-        self.guide_back_btn.setFixedWidth(110)
-        self.guide_back_btn.setMinimumHeight(36)
+        self.guide_back_btn.setFixedWidth(96)
+        self.guide_back_btn.setMinimumHeight(34)
         self.guide_back_btn.setAccessibleName("Back to overview")
         self.guide_back_btn.clicked.connect(self._show_overview)
-        h.addWidget(self.guide_back_btn, 0, QtCore.Qt.AlignLeft)
-        h.addStretch(1)
-        center = QtWidgets.QVBoxLayout()
-        center.setSpacing(1)
+        lay.addWidget(self.guide_back_btn, 0, QtCore.Qt.AlignLeft)
+
         title = QtWidgets.QLabel("Menu-bar icon guide")
-        title.setObjectName("metricTitle")
-        title.setAlignment(QtCore.Qt.AlignCenter)
+        title.setObjectName("guideTitle")
         sub = QtWidgets.QLabel(
             "The Live HR app sits in the macOS menu bar and shows the band's "
             "state as a heart and a value.")
-        sub.setObjectName("rangeLabel")
-        sub.setAlignment(QtCore.Qt.AlignCenter)
+        sub.setObjectName("guideLead")
         sub.setWordWrap(True)
-        sub.setMinimumWidth(420)
-        center.addWidget(title)
-        center.addWidget(sub)
-        h.addLayout(center)
-        h.addStretch(1)
-        spacer = QtWidgets.QWidget()
-        spacer.setFixedWidth(110)
-        h.addWidget(spacer)
-        lay.addWidget(header)
+        head = QtWidgets.QVBoxLayout()
+        head.setSpacing(4)
+        head.addWidget(title)
+        head.addWidget(sub)
+        lay.addLayout(head)
 
         states = [
-            ("♥ 72", "guideGlyph",
+            ("♥ 72", True,
              "Connected — heart rate live",
              "The band is connected and a heart rate is being read (worn). "
              "The number is the current beats per minute."),
-            ("♡ ~", "guideGlyphMuted",
+            ("♡ ~", False,
              "Connected — no heart rate",
              "The band is connected but no heart rate is available: it may be "
              "off the wrist, removed, or the sensor has no reading yet."),
-            ("♡ —", "guideGlyphMuted",
+            ("♡ —", False,
              "Not connected",
              "The band is not connected: asleep or off its charger, out of "
              "range, or the phone is holding the BLE link."),
         ]
-        for glyph, glyph_obj, state, detail in states:
-            lay.addWidget(
-                self._guide_state_card(glyph, glyph_obj, state, detail))
+        row = QtWidgets.QHBoxLayout()
+        row.setSpacing(14)
+        for glyph, on, state, detail in states:
+            row.addWidget(self._guide_state_card(glyph, on, state, detail), 1)
+        lay.addLayout(row)
 
-        notes_label = QtWidgets.QLabel("NOTES")
-        notes_label.setObjectName("sectionLabel")
-        lay.addWidget(notes_label)
         notes = QtWidgets.QFrame()
-        notes.setObjectName("card")
+        notes.setObjectName("guideCard")
         nv = QtWidgets.QVBoxLayout(notes)
-        nv.setContentsMargins(20, 14, 20, 14)
-        nv.setSpacing(7)
-        for line in (
+        nv.setContentsMargins(22, 18, 22, 18)
+        nv.setSpacing(12)
+        heading = QtWidgets.QLabel("Good to know")
+        heading.setObjectName("guideState")
+        nv.addWidget(heading)
+        for i, line in enumerate((
             "The number is bpm — beats per minute.",
             "The app tries the realtime stream first; when that is unavailable "
             "or goes silent, it polls the confirmed 113 heart-rate series.",
             "A failed connection retries every 60 seconds.",
             "Run the menu-bar app with --lock-on-away to lock the Mac after "
             "the band disconnects.",
-        ):
+        ), 1):
+            r = QtWidgets.QHBoxLayout()
+            r.setSpacing(12)
+            num = QtWidgets.QLabel(str(i))
+            num.setObjectName("guideNum")
+            num.setAlignment(QtCore.Qt.AlignCenter)
             label = QtWidgets.QLabel(line)
-            label.setObjectName("muted")
+            label.setObjectName("guideBody")
             label.setWordWrap(True)
-            nv.addWidget(label)
+            r.addWidget(num, 0, QtCore.Qt.AlignTop)
+            r.addWidget(label, 1)
+            nv.addLayout(r)
         lay.addWidget(notes)
         lay.addStretch(1)
         return scroll
 
-    def _guide_state_card(self, glyph: str, glyph_obj: str, state: str,
+    def _guide_state_card(self, glyph: str, on: bool, state: str,
                           detail: str) -> QtWidgets.QWidget:
         card = QtWidgets.QFrame()
-        card.setObjectName("card")
+        card.setObjectName("guideCard")
         card.setAccessibleName(f"{state}: {glyph}")
-        h = QtWidgets.QHBoxLayout(card)
-        h.setContentsMargins(20, 14, 20, 14)
-        h.setSpacing(16)
+        v = QtWidgets.QVBoxLayout(card)
+        v.setContentsMargins(22, 20, 22, 22)
+        v.setSpacing(10)
         preview = QtWidgets.QLabel(glyph)
-        preview.setObjectName(glyph_obj)
-        preview.setFixedWidth(92)
-        preview.setMinimumHeight(46)
+        preview.setObjectName("guidePill")
+        preview.setProperty("on", "true" if on else "false")
         preview.setAlignment(QtCore.Qt.AlignCenter)
-        h.addWidget(preview)
-        v = QtWidgets.QVBoxLayout()
-        v.setSpacing(3)
+        v.addWidget(preview, 0, QtCore.Qt.AlignLeft)
+        v.addSpacing(4)
         state_label = QtWidgets.QLabel(state)
-        state_label.setObjectName("chipValue")
+        state_label.setObjectName("guideState")
+        state_label.setWordWrap(True)
         body = QtWidgets.QLabel(detail)
-        body.setObjectName("muted")
+        body.setObjectName("guideBody")
         body.setWordWrap(True)
         v.addWidget(state_label)
         v.addWidget(body)
-        h.addLayout(v, 1)
-        _add_shadow(card)
+        v.addStretch(1)
         return card
 
     def _show_guide(self) -> None:
@@ -2607,9 +2668,50 @@ class MainWindow(QtWidgets.QMainWindow):
         index = next(i for i, (m, _) in enumerate(RANGE_MODES) if m == "all")
         self.range_combo.setCurrentIndex(index)
 
+    def _apply_gutter(self) -> None:
+        """Align the app bar and banners with the centred content column."""
+        width = self.width()
+        g = theme.gutter(width)
+        bar = max(26, min(g, (width - 1000) // 2))
+        self._bar_layout.setContentsMargins(bar, 10, bar, 10)
+        self._banner_layout.setContentsMargins(g, 14, g, 0)
+
+    def _sync_theme_btn(self) -> None:
+        dark = theme.mode == "dark"
+        self.theme_btn.setText("Light" if dark else "Dark")
+        self.theme_btn.setToolTip("Switch to the %s theme" % ("light" if dark else "dark"))
+
+    def _toggle_theme(self) -> None:
+        self.set_theme("light" if theme.mode == "dark" else "dark", save=True)
+
+    def set_theme(self, mode: str, save: bool = False) -> None:
+        """Switch light/dark everywhere without restarting."""
+        theme.apply(mode)
+        app = QtWidgets.QApplication.instance()
+        app.setStyleSheet(theme.QSS)
+        self._sync_theme_btn()
+        old = self.today
+        showing = self.stack.currentWidget() is old
+        new = TodayPage(self.store, _profile_age(), on_open_metric=self._open_detail,
+                        cache=old._cache)
+        self.stack.insertWidget(self.stack.indexOf(old), new)
+        self.stack.removeWidget(old)
+        old.deleteLater()
+        self.today = new
+        if showing:
+            self.stack.setCurrentWidget(new)
+        new.refresh(animate=False)
+        if self._last_live is not None:
+            new.on_live(self._last_live)
+        for chart in self.findChildren(ChartView):
+            chart.retheme()
+        if save:
+            QtCore.QSettings("NoiseREP", "Sync").setValue("theme", mode)
+
     def resizeEvent(self, event):  # noqa: N802 - Qt override
         super().resizeEvent(event)
         width = self.width()
+        self._apply_gutter()
         self.dev_sync.setVisible(width >= 1000)
         self.dev_fw.setVisible(width >= 900)
         self.app_tag.setVisible(width >= 1040)
@@ -2654,25 +2756,93 @@ class MainWindow(QtWidgets.QMainWindow):
     # ------------------------------------------------------------------
     # banner helpers
     # ------------------------------------------------------------------
-    def _launch_menubar(self) -> None:
-        """Open the separate menu-bar HR app, or say it is already running."""
-        if self._menubar_running():
-            self._set_status("Live HR is already in the menu bar (♥ icon).")
-            return
+    def _set_live_btn(self, active: bool, text: str | None = None) -> None:
+        self.live_btn.setText(text or ("● Live on" if active else "♥ Live"))
+        self.live_btn.setProperty("active", "true" if active else "false")
+        self.live_btn.style().unpolish(self.live_btn)
+        self.live_btn.style().polish(self.live_btn)
+        self.live_btn.setToolTip(
+            "Stop the menu-bar Live HR app and resume the in-app band link"
+            if active else
+            "Start live heart rate in the macOS menu bar (separate app; the "
+            "band accepts one central, so the in-app link pauses meanwhile)")
+        self.live_btn.setAccessibleName(
+            "Stop live heart rate in the menu bar" if active
+            else "Start live heart rate in the menu bar")
+
+    def _menubar_active(self) -> bool:
+        proc = self._menubar_proc
+        return proc is not None and proc.poll() is None
+
+    def _toggle_menubar(self) -> None:
+        """Start the menu-bar HR app (pausing our band link), or stop it."""
+        if self._menubar_active():
+            self._stop_menubar()
+        elif self._menubar_proc is None and self._menubar_running():
+            self._set_status("Live HR is already running outside this window; "
+                             "quit it from the menu bar first.")
+        elif self._menubar_proc is None:
+            self._set_live_btn(True, "Starting…")
+            self.live_btn.setEnabled(False)
+            self._release_link(self._start_menubar)
+
+    def _release_link(self, then) -> None:
+        """Cancel the in-app band link, then call ``then`` once it let go."""
+        task = self._link_task
+        if task is None or task.done():
+            self._link_task = None
+            return then()
+        self._set_band_state("idle", "Releasing the band…")
+        fired = []
+
+        def go(*_):
+            if not fired:
+                fired.append(1)
+                self._link_task = None
+                then()
+
+        task.add_done_callback(go)
+        QtCore.QTimer.singleShot(5000, go)
+        task.cancel()
+
+    def _start_menubar(self) -> None:
+        self.live_btn.setEnabled(True)
         try:
-            proc = subprocess.Popen(
+            self._menubar_proc = subprocess.Popen(
                 [sys.executable, "-m", "noiserep.cli", "menubar"],
                 start_new_session=True)
         except OSError as exc:
+            self._set_live_btn(False)
             self._show_error(f"Could not open the menu-bar app: {exc}")
+            self.start_link()
             return
-        self._set_status(
-            "Live HR opened in the menu bar. It runs separately because the "
-            "band accepts one BLE central.")
-        # An import or tray failure kills the child within a second or two;
-        # say so instead of leaving the success message up.
-        QtCore.QTimer.singleShot(
-            3000, lambda: self._check_menubar_started(proc))
+        self._menubar_stopping = False
+        self._set_live_btn(True)
+        self._set_band_state("idle", "Paused · Live HR app has the band")
+        self._set_status("Live HR is running in the menu bar. The in-app band "
+                         "link is paused until you click Live again.")
+        self._menubar_poll.start()
+
+    def _stop_menubar(self) -> None:
+        proc = self._menubar_proc
+        self._menubar_stopping = True
+        self.live_btn.setEnabled(False)
+        self._set_live_btn(True, "Stopping…")
+        proc.terminate()
+        QtCore.QTimer.singleShot(3000, lambda: proc.poll() is None and proc.kill())
+
+    def _poll_menubar(self) -> None:
+        proc = self._menubar_proc
+        if proc is None or proc.poll() is None:
+            return
+        self._menubar_poll.stop()
+        self._menubar_proc = None
+        if not getattr(self, "_menubar_stopping", False):
+            self._check_menubar_started(proc)
+        self.live_btn.setEnabled(True)
+        self._set_live_btn(False)
+        self._set_status("Live HR stopped; resuming the band link.")
+        self.start_link()
 
     def _check_menubar_started(self, proc) -> None:
         code = proc.poll()
@@ -2700,7 +2870,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.error_banner.setAccessibleName("Error: " + message)
         self.error_banner.show()
         self.info_banner.hide()
-        self.progress.hide()
+        self.sync_bar.finish(ok=False)
 
     def _clear_error(self) -> None:
         self.error_banner.hide()
@@ -2754,49 +2924,6 @@ class MainWindow(QtWidgets.QMainWindow):
     # ------------------------------------------------------------------
     # live band link
     # ------------------------------------------------------------------
-    def _build_live_strip(self) -> QtWidgets.QWidget:
-        strip = QtWidgets.QFrame()
-        strip.setObjectName("liveStrip")
-        h = QtWidgets.QHBoxLayout(strip)
-        h.setContentsMargins(26, 10, 26, 10)
-        h.setSpacing(34)
-        self.live_heart = QtWidgets.QLabel("♥")
-        self.live_heart.setObjectName("liveHeart")
-        self._heart_fx = QtWidgets.QGraphicsOpacityEffect(self.live_heart)
-        self.live_heart.setGraphicsEffect(self._heart_fx)
-        self._heart_anim = QtCore.QPropertyAnimation(self._heart_fx, b"opacity", self)
-        self._heart_anim.setKeyValueAt(0.0, 1.0)
-        self._heart_anim.setKeyValueAt(0.25, 0.35)
-        self._heart_anim.setKeyValueAt(1.0, 1.0)
-        self._heart_anim.setEasingCurve(QtCore.QEasingCurve.InOutSine)
-        self._heart_anim.setLoopCount(-1)
-        h.addWidget(self.live_heart)
-        self.live_values: dict[str, AnimatedNumber] = {}
-        for key, caption, unit in LIVE_FIELDS:
-            cell = QtWidgets.QVBoxLayout()
-            cell.setSpacing(0)
-            row = QtWidgets.QHBoxLayout()
-            row.setSpacing(4)
-            value = AnimatedNumber()
-            value.setObjectName("liveValue")
-            row.addWidget(value, 0, QtCore.Qt.AlignBottom)
-            if unit:
-                u = QtWidgets.QLabel(unit)
-                u.setObjectName("liveUnit")
-                row.addWidget(u, 0, QtCore.Qt.AlignBottom)
-            row.addStretch(1)
-            cap = QtWidgets.QLabel(caption)
-            cap.setObjectName("liveCaption")
-            cell.addLayout(row)
-            cell.addWidget(cap)
-            h.addLayout(cell)
-            self.live_values[key] = value
-        h.addStretch(1)
-        self.live_when = QtWidgets.QLabel("")
-        self.live_when.setObjectName("muted")
-        h.addWidget(self.live_when)
-        return strip
-
     def _set_band_state(self, kind: str, text: str) -> None:
         self.band_state.setText(text)
         self.band_dot.setProperty("state", kind)
@@ -2815,7 +2942,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._link_task = asyncio.ensure_future(keep_linked(
             self.store, self.band_name, on_sample=self._on_live,
             on_status=self._on_link_status, sync_now=self._sync_now,
-            on_history=self._after_history))
+            on_history=self._after_history, on_progress=self._sync_progress))
 
     def _on_link_status(self, text: str) -> None:
         print(f"{datetime.datetime.now():%H:%M:%S} [band link] {text}", flush=True)
@@ -2825,25 +2952,17 @@ class MainWindow(QtWidgets.QMainWindow):
             self._set_band_state("live", "Syncing history…")
             self._set_status("Syncing history from the band…")
         elif text.startswith("disconnected"):
+            self.sync_bar.finish(ok=False)
             self._set_band_state("searching", "Band not in range · retrying")
 
     def _on_live(self, sample) -> None:
+        self._last_live = sample
         place = {"charging": ("charging", f"⚡ Charging · {sample.battery}%"),
                  "wrist": ("live", f"On wrist · {sample.battery}%"),
                  "off_wrist": ("idle", f"Off wrist · {sample.battery}%"),
                  "unknown": ("live", f"Live · {sample.battery}%")}[sample.place]
         self._set_band_state(*place)
-        for key, value in self.live_values.items():
-            value.animate_to(getattr(sample, key))
-        bpm = sample.heart_rate if sample.place != "charging" else None
-        if bpm:
-            self._heart_anim.setDuration(int(60000 / bpm))
-            if self._heart_anim.state() != QtCore.QAbstractAnimation.Running:
-                self._heart_anim.start()
-        else:
-            self._heart_anim.stop()
-            self._heart_fx.setOpacity(0.35)
-        self.live_when.setText(f"Updated {sample.at:%H:%M:%S}")
+        self.today.on_live(sample)
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt API
         """Disconnect the band before closing.
@@ -2851,6 +2970,8 @@ class MainWindow(QtWidgets.QMainWindow):
         A link that is dropped without a clean disconnect makes the band
         refuse the next connection until its supervision timeout passes.
         """
+        if self._menubar_active():
+            self._menubar_proc.terminate()
         task = self._link_task
         if task is None or task.done():
             return super().closeEvent(event)
@@ -2871,24 +2992,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self._populate_overview()
         if self._detail_metric:
             self._plot_detail()
+        self.today.invalidate()
+        if self.stack.currentWidget() is self.today:
+            self.today.refresh(animate=False)
         self._set_status("History synced from the band.")
 
     # ------------------------------------------------------------------
     # sync
     # ------------------------------------------------------------------
     def _sync_progress(self, done: int, total: int, stage: str) -> None:
-        self._set_status(_STAGE_TEXT.get(stage, "Syncing…"))
-        if stage == "done":
-            self.progress.setRange(0, 1)
-            self.progress.setValue(1)
-        elif total > 0:
-            if self.progress.maximum() != total:
-                self.progress.setRange(0, total)
-            self.progress.setValue(done)
-            self._set_status(
-                f"{_STAGE_TEXT.get(stage, 'Syncing…')}  {done}/{total}")
-        else:
-            self.progress.setRange(0, 0)  # indeterminate / busy
+        text = _STAGE_TEXT.get(stage, "Syncing…")
+        self._set_status(f"{text}  {done}/{total}" if total > 0 and stage != "done"
+                         else text)
+        self.sync_bar.progress(done, total, stage)
 
     def _set_syncing(self, syncing: bool) -> None:
         self._syncing = syncing
@@ -2897,14 +3013,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sync_btn.setText("Syncing…" if syncing else "Sync band")
         self.empty_sync_btn.setText("Syncing…" if syncing else "Sync band")
         if syncing:
-            self.progress.show()
-            self.progress.setRange(0, 0)
+            self.sync_bar.begin()
         else:
-            self.progress.hide()
-
-    def _hide_progress(self) -> None:
-        if not self._syncing:
-            self.progress.hide()
+            self.sync_bar.finish(ok=self._sync_ok)
 
     @qasync.asyncSlot()
     async def _on_sync(self) -> None:
@@ -2916,6 +3027,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         self._clear_error()
+        self._sync_ok = False
         self._set_syncing(True)
         self._set_status("Scanning for band…")
         try:
@@ -2928,8 +3040,7 @@ class MainWindow(QtWidgets.QMainWindow):
             async with connect(self.band_name) as band:
                 result = await run_sync(band, since, progress=self._sync_progress)
             counts = self.store.ingest(result, note="gui sync")
-            self.progress.setRange(0, 1)
-            self.progress.setValue(1)
+            self._sync_ok = True
             self._clear_error()
             extra = ""
             if counts.get("rri"):
@@ -2960,7 +3071,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self._show_error(message)
         finally:
             self._set_syncing(False)
-            QtCore.QTimer.singleShot(1600, self._hide_progress)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -2969,6 +3079,8 @@ def main(argv: list[str] | None = None) -> int:
         sys.argv if argv is None else argv)
     app.setApplicationName("NoiseREP Sync")
     app.setApplicationDisplayName("NoiseREP Sync")
+    saved = QtCore.QSettings("NoiseREP", "Sync").value("theme", "light")
+    theme.apply("dark" if saved == "dark" else "light")
     app.setStyleSheet(theme.QSS)
     loop = qasync.QEventLoop(app)
     asyncio.set_event_loop(loop)

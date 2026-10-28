@@ -110,13 +110,29 @@ def test_only_verified_metric_gets_a_unit():
     assert display_unit("heart_rate") == "bpm"
 
 
-def test_light_palette_tokens_kept():
-    assert theme.BG == "#FAFAF7"
+def test_light_is_default_and_dark_is_switchable():
+    assert theme.mode == "light"
+    assert theme.BG == "#F5F5F7"
     assert theme.PANEL == "#FFFFFF"
-    assert theme.FG == "#191919"
-    assert theme.ACCENT == "#CC785C"
-    assert theme.ERROR == "#BF4D43"
-    assert theme.SERIES[0] == "#CC785C"
+    assert theme.SERIES[0] == theme.HEART
+    try:
+        theme.apply("dark")
+        assert theme.BG == "#000000"
+        assert theme.PANEL == "#1C1C1E"
+        assert theme.FG == "#F5F5F7"
+        assert theme.ACCENT == "#0A84FF"
+        assert "#1C1C1E" in theme.QSS
+    finally:
+        theme.apply("light")
+    assert "#1C1C1E" not in theme.QSS
+
+
+def test_gutter_centres_a_capped_column():
+    for width in (1000, 1600, 2560, 3840):
+        g = theme.gutter(width)
+        assert theme.GUTTER_MIN <= g
+        assert width - 2 * g <= max(theme.CONTENT_MAX, theme.CONTENT_MIN)
+    assert theme.gutter(3840) > theme.gutter(2560) > theme.gutter(1600)
 
 
 def test_macos_stylesheet_leaves_native_controls_unstyled():
@@ -139,8 +155,9 @@ def test_macos_stylesheet_leaves_native_controls_unstyled():
     assert "\nQWidget {" not in mac
     assert "\nQWidget {" in other
     # Base text properties move to concrete non-native widget types instead.
-    assert "QLabel { background: transparent; color: #191919; font-size: 13px; }" in mac
-    assert "QMainWindow, QWidget#root { background: #FAFAF7; }" in mac
+    assert (f"QLabel {{ background: transparent; color: {theme.FG}; "
+            "font-size: 13px; }") in mac
+    assert f"QMainWindow, QWidget#root {{ background: {theme.BG}; }}" in mac
     # Shared styling still applies on both platforms.
     for qss in (mac, other):
         assert "QDateEdit" in qss
@@ -157,6 +174,8 @@ def test_is_macos_helper_and_host_stylesheet():
 # -- overview / detail ------------------------------------------------------
 def test_overview_lists_metrics_and_opens_detail():
     w = _window()
+    assert w.stack.currentWidget() is w.today          # Today is home
+    w._show_home("metrics")
     assert "heart_rate" in w._shown_metrics
     assert w.stack.currentIndex() == 0
     w._open_detail("heart_rate")
@@ -392,7 +411,7 @@ def test_export_control_keeps_menu_actions_and_accessible_name():
 
 def test_icon_guide_button_opens_page_and_names_all_states():
     w = _window()
-    assert w.stack.currentIndex() == 0
+    assert w.stack.currentWidget() is w.today
     assert w.guide_btn.accessibleName() == "Menu-bar icon guide"
 
     w.guide_btn.click()
@@ -413,21 +432,86 @@ def test_icon_guide_button_opens_page_and_names_all_states():
     assert "--lock-on-away" in text
 
     w.guide_back_btn.click()
-    assert w.stack.currentIndex() == 0
+    assert w.stack.currentWidget() is w.today
     w.close()
 
 
 def test_progress_is_hidden_until_sync():
     w = _window()
-    assert w.progress.isHidden()
+    assert not w.sync_bar.active
     w._set_syncing(True)
     w._sync_progress(3, 10, "series")
-    assert not w.progress.isHidden()
+    assert w.sync_bar.active
     assert "Fetching metrics" in w.status.text()
     assert not w.sync_btn.isEnabled()
     w._set_syncing(False)
-    assert w.progress.isHidden()
     assert w.sync_btn.text() == "Sync band"
+    w.close()
+
+
+def test_sync_bar_eases_forward_only_and_fades_out():
+    from noiserep.gui.syncbar import SyncBar
+    _app()
+    bar = SyncBar()
+    bar.progress(5, 10, "series")
+    assert bar.active and bar.target == 0.485
+    bar.progress(2, 10, "series")                  # a late, lower report
+    assert bar.target == 0.485                     # never backwards
+    bar.progress(0, 0, "files")                    # indeterminate: shimmer only
+    assert bar.indeterminate and bar.target == 0.485
+    shown = []
+    for _ in range(40):
+        bar._tick(0.5)
+        shown.append(bar.shown)
+    assert shown == sorted(shown) and abs(shown[-1] - 0.485) < 0.01
+    bar.progress(10, 10, "done")
+    for _ in range(80):
+        bar._tick(0.5)
+    assert bar.shown == 1.0 and bar._fade_t0 is not None
+    bar._fade_t0 -= 700                            # past the 0.6 s fade
+    bar._tick(0.5)
+    assert not bar.active and bar.opacity == 0.0
+
+
+def test_live_button_toggles_menubar_app_and_link(monkeypatch):
+    import subprocess
+
+    class Proc:
+        def __init__(self, *a, **k):
+            self.code = None
+
+        def poll(self):
+            return self.code
+
+        def terminate(self):
+            self.code = -15
+
+        kill = terminate
+
+    w = _window()
+    monkeypatch.setattr(subprocess, "Popen", Proc)
+    monkeypatch.setattr(MainWindow, "_menubar_running", staticmethod(lambda: False))
+    resumed = []
+    monkeypatch.setattr(w, "start_link", lambda: resumed.append(1))
+    w.live_btn.click()                              # no link task: starts at once
+    assert w._menubar_active() and w.live_btn.property("active") == "true"
+    assert "Paused" in w.band_state.text()
+    w.live_btn.click()                              # click again terminates it
+    w._poll_menubar()
+    assert w._menubar_proc is None and resumed == [1]
+    assert w.live_btn.property("active") == "false" and w.error_banner.isHidden()
+    w.close()
+
+
+def test_theme_switch_rebuilds_today_in_dark_and_back():
+    w = _window()
+    try:
+        w.set_theme("dark")
+        assert theme.mode == "dark" and w.stack.currentWidget() is w.today
+        assert "Light" in w.theme_btn.text()
+    finally:
+        w.set_theme("light")
+    assert "Dark" in w.theme_btn.text()
     w.close()
 
 

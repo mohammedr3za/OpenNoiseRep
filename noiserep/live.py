@@ -115,12 +115,12 @@ async def _drain(band) -> None:
             return
 
 
-async def _history(band, store) -> None:
+async def _history(band, store, on_progress=None) -> None:
     from .sync import run_sync
 
     await band.send(basic_data(False))
     await _drain(band)
-    result = await run_sync(band, dt.datetime(2000, 1, 1))
+    result = await run_sync(band, dt.datetime(2000, 1, 1), progress=on_progress)
     store.ingest(result, note="live link history sync")
 
 
@@ -155,10 +155,11 @@ async def keep_linked(store, name: str | None = None, interval: float = 10.0,
                       history_every: float = 1800.0, retry_s: float = 5.0,
                       on_sample=lambda s: None, on_status=lambda s: None,
                       sync_now: asyncio.Event | None = None,
-                      on_history=lambda: None) -> None:
+                      on_history=lambda: None, on_progress=None) -> None:
     """Run forever: connect, sync history, poll live values, reconnect.
 
     Setting ``sync_now`` forces a history sync at the next poll boundary.
+    ``on_progress(done, total, stage)`` is forwarded to ``run_sync``.
     """
     from bleak.exc import BleakError
 
@@ -176,7 +177,7 @@ async def keep_linked(store, name: str | None = None, interval: float = 10.0,
                         if sync_now is not None:
                             sync_now.clear()
                         on_status("syncing history")
-                        await _history(band, store)
+                        await _history(band, store, on_progress)
                         last_history = time.monotonic()
                         on_history()
                         on_status("live")
