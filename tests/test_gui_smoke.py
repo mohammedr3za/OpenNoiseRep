@@ -540,3 +540,21 @@ def test_unparsable_sleep_api_is_ignored():
     w = _window(store)          # must not raise
     assert w.sleep_card is None
     w.close()
+
+
+class _FakeProc:
+    def __init__(self, code):
+        self.code = code
+
+    def poll(self):
+        return self.code
+
+
+def test_live_hr_reports_a_menubar_that_exits_at_once():
+    w = _window()
+    w._check_menubar_started(_FakeProc(None))      # still running
+    assert w.error_banner.isHidden()
+    w._check_menubar_started(_FakeProc(1))
+    assert not w.error_banner.isHidden()
+    assert "exit code 1" in w.error_text.text()
+    w.close()

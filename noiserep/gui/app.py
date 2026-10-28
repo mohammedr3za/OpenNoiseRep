@@ -2568,7 +2568,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._set_status("Live HR is already in the menu bar (♥ icon).")
             return
         try:
-            subprocess.Popen(
+            proc = subprocess.Popen(
                 [sys.executable, "-m", "noiserep.cli", "menubar"],
                 start_new_session=True)
         except OSError as exc:
@@ -2577,6 +2577,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self._set_status(
             "Live HR opened in the menu bar. It runs separately because the "
             "band accepts one BLE central.")
+        # An import or tray failure kills the child within a second or two;
+        # say so instead of leaving the success message up.
+        QtCore.QTimer.singleShot(
+            3000, lambda: self._check_menubar_started(proc))
+
+    def _check_menubar_started(self, proc) -> None:
+        code = proc.poll()
+        if code:
+            self._show_error(
+                f"Live HR stopped right after starting (exit code {code}). "
+                "Run `noiserep menubar` in a terminal to see why.")
 
     @staticmethod
     def _menubar_running() -> bool:
