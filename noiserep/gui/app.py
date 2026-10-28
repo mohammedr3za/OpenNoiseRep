@@ -291,6 +291,43 @@ _MOVEMENT_GOALS = (
 )
 
 
+#: Live strip: SEBasicData field, caption, unit.
+LIVE_FIELDS = (
+    ("heart_rate", "Heart rate", "bpm"),
+    ("spo2", "SpO2", "%"),
+    ("stress", "Stress", None),
+    ("steps", "Steps", None),
+    ("active_calories", "Active", "kcal"),
+    ("calories", "Total", "kcal"),
+    ("distance_m", "Distance", "m"),
+)
+
+
+class AnimatedNumber(QtWidgets.QLabel):
+    """An integer label that eases to each new value instead of jumping."""
+
+    def __init__(self, parent=None):
+        super().__init__("—", parent)
+        self._value = None
+        self._anim = QtCore.QVariantAnimation(self)
+        self._anim.setDuration(650)
+        self._anim.setEasingCurve(QtCore.QEasingCurve.OutCubic)
+        self._anim.valueChanged.connect(lambda v: self.setText(f"{round(v):,}"))
+
+    def animate_to(self, value) -> None:
+        if value is None:
+            self._anim.stop()
+            self._value = None
+            self.setText("—")
+            return
+        start = self._value if self._value is not None else value
+        self._value = value
+        self._anim.stop()
+        self._anim.setStartValue(float(start))
+        self._anim.setEndValue(float(value))
+        self._anim.start()
+
+
 def _fmt_min(minutes) -> str:
     return _fmt_span(minutes * 60) if minutes is not None else "—"
 
@@ -620,6 +657,9 @@ class MainWindow(QtWidgets.QMainWindow):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
         outer.addWidget(self._build_appbar())
+        outer.addWidget(self._build_live_strip())
+        self._link_task = None
+        self._sync_now = None
 
         banner_host = QtWidgets.QWidget()
         banners = QtWidgets.QVBoxLayout(banner_host)
@@ -678,11 +718,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self.dev_model = QtWidgets.QLabel("Noise REP")
         self.dev_fw = QtWidgets.QLabel("")
         self.dev_sync = QtWidgets.QLabel("")
+        self.band_dot = QtWidgets.QLabel("●")
+        self.band_dot.setObjectName("bandDot")
+        self.band_state = QtWidgets.QLabel("Band link off")
+        self.band_state.setObjectName("bandState")
+        pl.addWidget(self.band_dot)
+        pl.addWidget(self.band_state)
         for label, obj in ((self.dev_model, "devicePill"),
                            (self.dev_fw, "muted"),
                            (self.dev_sync, "muted")):
             label.setObjectName(obj)
             pl.addWidget(label)
+        self._set_band_state("off", "Band link off")
         h.addWidget(pill)
         h.addStretch(1)
 
@@ -2705,6 +2752,128 @@ class MainWindow(QtWidgets.QMainWindow):
             f"Exported {count} rows to {os.path.basename(path)} · {fmt.upper()}")
 
     # ------------------------------------------------------------------
+    # live band link
+    # ------------------------------------------------------------------
+    def _build_live_strip(self) -> QtWidgets.QWidget:
+        strip = QtWidgets.QFrame()
+        strip.setObjectName("liveStrip")
+        h = QtWidgets.QHBoxLayout(strip)
+        h.setContentsMargins(26, 10, 26, 10)
+        h.setSpacing(34)
+        self.live_heart = QtWidgets.QLabel("♥")
+        self.live_heart.setObjectName("liveHeart")
+        self._heart_fx = QtWidgets.QGraphicsOpacityEffect(self.live_heart)
+        self.live_heart.setGraphicsEffect(self._heart_fx)
+        self._heart_anim = QtCore.QPropertyAnimation(self._heart_fx, b"opacity", self)
+        self._heart_anim.setKeyValueAt(0.0, 1.0)
+        self._heart_anim.setKeyValueAt(0.25, 0.35)
+        self._heart_anim.setKeyValueAt(1.0, 1.0)
+        self._heart_anim.setEasingCurve(QtCore.QEasingCurve.InOutSine)
+        self._heart_anim.setLoopCount(-1)
+        h.addWidget(self.live_heart)
+        self.live_values: dict[str, AnimatedNumber] = {}
+        for key, caption, unit in LIVE_FIELDS:
+            cell = QtWidgets.QVBoxLayout()
+            cell.setSpacing(0)
+            row = QtWidgets.QHBoxLayout()
+            row.setSpacing(4)
+            value = AnimatedNumber()
+            value.setObjectName("liveValue")
+            row.addWidget(value, 0, QtCore.Qt.AlignBottom)
+            if unit:
+                u = QtWidgets.QLabel(unit)
+                u.setObjectName("liveUnit")
+                row.addWidget(u, 0, QtCore.Qt.AlignBottom)
+            row.addStretch(1)
+            cap = QtWidgets.QLabel(caption)
+            cap.setObjectName("liveCaption")
+            cell.addLayout(row)
+            cell.addWidget(cap)
+            h.addLayout(cell)
+            self.live_values[key] = value
+        h.addStretch(1)
+        self.live_when = QtWidgets.QLabel("")
+        self.live_when.setObjectName("muted")
+        h.addWidget(self.live_when)
+        return strip
+
+    def _set_band_state(self, kind: str, text: str) -> None:
+        self.band_state.setText(text)
+        self.band_dot.setProperty("state", kind)
+        self.band_dot.style().unpolish(self.band_dot)
+        self.band_dot.style().polish(self.band_dot)
+
+    def start_link(self) -> None:
+        """Keep the band connected for as long as the window is open."""
+        import asyncio
+        from ..live import keep_linked
+
+        if self._link_task is not None:
+            return
+        self._sync_now = asyncio.Event()
+        self._set_band_state("searching", "Searching for band…")
+        self._link_task = asyncio.ensure_future(keep_linked(
+            self.store, self.band_name, on_sample=self._on_live,
+            on_status=self._on_link_status, sync_now=self._sync_now,
+            on_history=self._after_history))
+
+    def _on_link_status(self, text: str) -> None:
+        print(f"{datetime.datetime.now():%H:%M:%S} [band link] {text}", flush=True)
+        if text == "connected":
+            self._set_band_state("live", "Connected")
+        elif text == "syncing history":
+            self._set_band_state("live", "Syncing history…")
+            self._set_status("Syncing history from the band…")
+        elif text.startswith("disconnected"):
+            self._set_band_state("searching", "Band not in range · retrying")
+
+    def _on_live(self, sample) -> None:
+        place = {"charging": ("charging", f"⚡ Charging · {sample.battery}%"),
+                 "wrist": ("live", f"On wrist · {sample.battery}%"),
+                 "off_wrist": ("idle", f"Off wrist · {sample.battery}%"),
+                 "unknown": ("live", f"Live · {sample.battery}%")}[sample.place]
+        self._set_band_state(*place)
+        for key, value in self.live_values.items():
+            value.animate_to(getattr(sample, key))
+        bpm = sample.heart_rate if sample.place != "charging" else None
+        if bpm:
+            self._heart_anim.setDuration(int(60000 / bpm))
+            if self._heart_anim.state() != QtCore.QAbstractAnimation.Running:
+                self._heart_anim.start()
+        else:
+            self._heart_anim.stop()
+            self._heart_fx.setOpacity(0.35)
+        self.live_when.setText(f"Updated {sample.at:%H:%M:%S}")
+
+    def closeEvent(self, event) -> None:  # noqa: N802 - Qt API
+        """Disconnect the band before closing.
+
+        A link that is dropped without a clean disconnect makes the band
+        refuse the next connection until its supervision timeout passes.
+        """
+        task = self._link_task
+        if task is None or task.done():
+            return super().closeEvent(event)
+        event.ignore()
+        self._set_band_state("idle", "Disconnecting…")
+        task.add_done_callback(lambda _: self.close())
+        QtCore.QTimer.singleShot(5000, lambda: task.done() or self._force_close())
+        task.cancel()
+
+    def _force_close(self) -> None:
+        self._link_task = None
+        self.close()
+
+    def _after_history(self) -> None:
+        self._refresh_device()
+        self._sync_dates_to_bounds()
+        self._refresh_header()
+        self._populate_overview()
+        if self._detail_metric:
+            self._plot_detail()
+        self._set_status("History synced from the band.")
+
+    # ------------------------------------------------------------------
     # sync
     # ------------------------------------------------------------------
     def _sync_progress(self, done: int, total: int, stage: str) -> None:
@@ -2740,6 +2909,10 @@ class MainWindow(QtWidgets.QMainWindow):
     @qasync.asyncSlot()
     async def _on_sync(self) -> None:
         if self._syncing:
+            return
+        if self._link_task is not None and not self._link_task.done():
+            self._sync_now.set()          # the link owns the band's one connection
+            self._set_status("Syncing on the live link…")
             return
 
         self._clear_error()
@@ -2803,6 +2976,7 @@ def main(argv: list[str] | None = None) -> int:
     app.aboutToQuit.connect(store.close)
     win = MainWindow(store)
     win.show()
+    win.start_link()
     with loop:
         loop.run_forever()
     return 0

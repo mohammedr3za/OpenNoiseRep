@@ -10,6 +10,7 @@ with the live stream paused.  Any drop reconnects after ``retry_s``.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import datetime as dt
 import time
 from dataclasses import dataclass
@@ -18,7 +19,29 @@ from . import wire
 
 BASIC_DATA_REPORT = 164
 REPORT_BASIC_DATA = 165
+GET_RING_WEAR_STATUS = 420
 MICRO_FUNCTION_FIELD = 12
+WEARING_FIELD = 12          # SEMicroFunction.inquiry_wearing_status
+
+
+def wear_query() -> bytes:
+    return wire.encode([(1, GET_RING_WEAR_STATUS)])
+
+
+def parse_wear(payload: bytes) -> bool | None:
+    """``420`` reply -> worn?  Reads 0 on the charger.
+
+    ponytail: any non-zero value is taken as "on the wrist"; confirm the exact
+    worn code on a live band before trusting other values.
+    """
+    try:
+        if wire.field(payload, 1) != GET_RING_WEAR_STATUS:
+            return None
+        mf = wire.sub(payload, MICRO_FUNCTION_FIELD)
+        value = wire.field(mf, WEARING_FIELD) if mf is not None else None
+        return bool(value) if isinstance(value, int) else None
+    except (ValueError, TypeError):
+        return None
 
 
 def basic_data(start: bool) -> bytes:
@@ -41,6 +64,16 @@ class LiveSample:
     stress: int | None
     battery: int | None
     charging: bool | None
+    worn: bool | None = None
+
+    @property
+    def place(self) -> str:
+        """``"charging"``, ``"wrist"``, ``"off_wrist"`` or ``"unknown"``."""
+        if self.charging:
+            return "charging"
+        if self.worn is None:
+            return "unknown"
+        return "wrist" if self.worn else "off_wrist"
 
 
 def _int(buf: bytes, fno: int):
@@ -91,28 +124,42 @@ async def _history(band, store) -> None:
     store.ingest(result, note="live link history sync")
 
 
-async def _poll(band, store, interval: float, on_sample) -> None:
+async def _poll(band, store, interval: float, on_sample, wake=None) -> None:
+    """One poll: wear status, then live reports until ``interval`` or ``wake``."""
+    await band.send(wear_query())
     await band.send(basic_data(True))
     deadline = time.monotonic() + interval
-    last = None
+    last, worn = None, None
     while (left := deadline - time.monotonic()) > 0:
-        try:
-            msg = await band.recv(timeout=left)
-        except asyncio.TimeoutError:
+        if wake is not None and wake.is_set():
             return
+        try:
+            msg = await band.recv(timeout=min(left, 1.0))
+        except asyncio.TimeoutError:
+            continue
         if msg == last:
             continue                  # the band often sends a report twice
         last = msg
+        state = parse_wear(msg)
+        if state is not None:
+            worn = state
+            continue
         sample = parse_basic(msg)
         if sample is not None:
+            sample = dataclasses.replace(sample, worn=worn)
             store.write_live(sample)
             on_sample(sample)
 
 
 async def keep_linked(store, name: str | None = None, interval: float = 10.0,
                       history_every: float = 1800.0, retry_s: float = 5.0,
-                      on_sample=lambda s: None, on_status=lambda s: None) -> None:
-    """Run forever: connect, sync history, poll live values, reconnect."""
+                      on_sample=lambda s: None, on_status=lambda s: None,
+                      sync_now: asyncio.Event | None = None,
+                      on_history=lambda: None) -> None:
+    """Run forever: connect, sync history, poll live values, reconnect.
+
+    Setting ``sync_now`` forces a history sync at the next poll boundary.
+    """
     from bleak.exc import BleakError
 
     from .ble.connection import connect
@@ -124,13 +171,17 @@ async def keep_linked(store, name: str | None = None, interval: float = 10.0,
                 on_status("connected")
                 last_history = float("-inf")
                 while band.c.is_connected:
-                    if time.monotonic() - last_history >= history_every:
+                    forced = sync_now is not None and sync_now.is_set()
+                    if forced or time.monotonic() - last_history >= history_every:
+                        if sync_now is not None:
+                            sync_now.clear()
                         on_status("syncing history")
                         await _history(band, store)
                         last_history = time.monotonic()
+                        on_history()
                         on_status("live")
-                    await _poll(band, store, interval, on_sample)
+                    await _poll(band, store, interval, on_sample, sync_now)
         except (BandNotFound, TransportError, BleakError, OSError,
                 asyncio.TimeoutError) as exc:
-            on_status(f"disconnected ({exc or type(exc).__name__}); retrying")
+            on_status(f"disconnected ({str(exc) or type(exc).__name__}); retrying")
         await asyncio.sleep(retry_s)

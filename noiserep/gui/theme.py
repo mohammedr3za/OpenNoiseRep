@@ -108,6 +108,18 @@ QLabel#brandDot {{ font-size: 18px; color: {ACCENT}; }}
 QLabel#devicePill {{ color: {FG_MUTED}; font-size: 11px; }}
 QFrame#devicePill {{ background: {PANEL_HOVER}; border: 1px solid {BORDER};
     border-radius: 11px; }}
+QLabel#bandDot {{ font-size: 11px; color: {FG_MUTED}; }}
+QLabel#bandDot[state="live"] {{ color: #34A853; }}
+QLabel#bandDot[state="charging"] {{ color: #E8A33D; }}
+QLabel#bandDot[state="searching"] {{ color: {FOCUS}; }}
+QLabel#bandDot[state="idle"] {{ color: {FG_MUTED}; }}
+QLabel#bandState {{ color: {FG}; font-size: 11px; font-weight: 600; }}
+QFrame#liveStrip {{ background: {PANEL}; border-bottom: 1px solid {BORDER}; }}
+QLabel#liveHeart {{ color: {ERROR}; font-size: 26px; }}
+QLabel#liveValue {{ color: {FG}; font-size: 22px; font-weight: 650; }}
+QLabel#liveUnit {{ color: {FG_MUTED}; font-size: 11px; padding-bottom: 3px; }}
+QLabel#liveCaption {{ color: {FG_MUTED}; font-size: 10px; font-weight: 600;
+    letter-spacing: 0.8px; }}
 
 /* typography */
 QLabel#greeting {{ font-size: 30px; font-weight: 700; color: {FG}; }}

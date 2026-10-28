@@ -29,6 +29,34 @@ def test_parse_report_and_reject_others():
     assert parse_basic(wire.encode([(1, 113)]), NOW) is None
 
 
+def test_wear_reply_and_place():
+    from dataclasses import replace
+    from noiserep.live import parse_wear
+
+    on_charger = wire.encode([(1, 420), (12, wire.encode([(12, 0)]))])
+    worn = wire.encode([(1, 420), (12, wire.encode([(12, 1)]))])
+    assert parse_wear(on_charger) is False and parse_wear(worn) is True
+    assert parse_wear(_report()) is None
+    s = parse_basic(_report(), NOW)
+    assert replace(s, worn=True).place == "wrist"
+    assert replace(s, worn=False).place == "off_wrist"
+    assert s.place == "unknown"
+    assert parse_basic(_report(status=1), NOW).place == "charging"
+
+
+def test_window_shows_band_place_and_live_values():
+    from dataclasses import replace
+    pytest = __import__("pytest")
+    pytest.importorskip("PySide6")
+    from tests.test_gui_smoke import _window
+    w = _window()
+    w._on_live(replace(parse_basic(_report(), NOW), worn=True))
+    assert w.band_state.text() == "On wrist · 74%"
+    w._on_live(parse_basic(_report(status=1), NOW))
+    assert w.band_state.text().startswith("⚡ Charging")
+    w.close()
+
+
 def test_store_keeps_latest_live_and_hr_series():
     s = Store(":memory:")
     s.write_live(parse_basic(_report(hr=70), NOW))
