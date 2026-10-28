@@ -45,6 +45,10 @@ the full reverse-engineering notes.
   on 2026-10-28), the app derives a rest span with average/5–95% heart rate,
   HRV (RMSSD, SDNN, pNN50), beat coverage and plain-language observations. This
   is labelled **from RRI**, not a staged sleep file.
+- **Sleep detail timeline.** Clicking Last Night opens an HR timeline across the
+  rest window, the RRI coverage gaps, HRV/coverage stats and all insights. A
+  **Sleep Stages** panel says explicitly when light/deep/REM data is
+  unavailable rather than inventing a stage chart.
 - **Workouts are visible when they exist.** The GUI always shows a Workouts
   section; today it says none have been received because this band's sync has
   only pushed RRI files. Sport/workout file names are detected and will be
@@ -70,6 +74,9 @@ the full reverse-engineering notes.
   descriptive, not medical.
 - **No workout data has been received.** The band's sync pushes RRI files only;
   the GUI makes that empty state explicit rather than hiding it.
+- **No light/deep/REM stages exist in this dataset.** The band has not sent a
+  staged sleep file. The app shows an explicit “Not available” panel; stage
+  charts appear only if `sleep_stages` contains decoded stage records.
 - **A freshly-unpaired band's clock is unset**, so timestamps can read around
   2002. The read-only client does not send a time-sync; timestamps are
   device-relative. `sync` now defaults to the whole device timeline rather than
@@ -163,6 +170,14 @@ noiserep buzz --pattern find-band --duration 3 --yes
 ```
 
 See [`docs/VIBRATION.md`](docs/VIBRATION.md) for the evidence and safety rails.
+
+Headless sleep and workout views:
+
+```sh
+noiserep sleep                  # last night's rest summary + insights
+noiserep sleep --json out.json
+noiserep workouts               # lists sport files, or explains that none arrived
+```
 
 ## Privacy
 

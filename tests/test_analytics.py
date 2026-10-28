@@ -53,6 +53,14 @@ def test_overnight_rest_picks_the_longest_window():
     assert summary.beats == 1200
 
 
+def test_hr_series_buckets_by_minute_and_omits_empty_buckets():
+    samples = _beats(120)                  # two minutes at 1 s
+    series = analytics.hr_series(samples, bucket_s=60)
+    assert len(series) == 2
+    assert all(hr == 60.0 for _, hr in series)
+    assert series[0][0].second == 0
+
+
 def test_insights_are_non_medical_and_mention_hrv():
     summary = analytics.summarize(_beats(600))
     lines = analytics.insights(summary)

@@ -226,6 +226,77 @@ def _export(db, metric, since_str, until_str, fmt, out):
     return 0
 
 
+def _sleep(db, json_path):
+    import json
+    from . import analytics
+    from .store import Store, default_db_path
+    path = db or default_db_path()
+    if not os.path.exists(path):
+        print(f"no database at {path}; run `noiserep sync` first", file=sys.stderr)
+        return 5
+    with Store(path) as store:
+        sessions = store.sleep_sessions()
+        if not sessions:
+            print("no rest window stored yet; sync the band first",
+                  file=sys.stderr)
+            return 0
+        session = sessions[-1]
+        summary = store.rest_summary(session["bedtime"], session["wake"])
+        doc = {
+            "session": {
+                "bedtime": session["bedtime"].isoformat(),
+                "wake": session["wake"].isoformat(),
+                "total_min": session["total_min"],
+                "source": session["source"],
+            },
+            "summary": None if summary is None else {
+                "avg_hr": summary.avg_hr, "min_hr": summary.min_hr,
+                "max_hr": summary.max_hr, "rmssd_ms": summary.rmssd_ms,
+                "sdnn_ms": summary.sdnn_ms, "pnn50": summary.pnn50,
+                "coverage_pct": summary.coverage_pct, "beats": summary.beats,
+            },
+            "insights": [] if summary is None else analytics.insights(summary),
+        }
+        if json_path:
+            with open(json_path, "w") as fh:
+                json.dump(doc, fh, indent=1)
+            print(f"wrote {json_path}")
+            return 0
+        s = doc["session"]
+        print(f"last night: {s['total_min'] // 60}h {s['total_min'] % 60:02d}m "
+              f"{s['bedtime'][11:16]}–{s['wake'][11:16]}  ({s['source']})")
+        if summary is not None:
+            print(f"heart rate: {summary.avg_hr:.0f} bpm "
+                  f"(5-95% {summary.min_hr}-{summary.max_hr})")
+            print(f"HRV: RMSSD {summary.rmssd_ms:.0f} ms, "
+                  f"SDNN {summary.sdnn_ms:.0f} ms, pNN50 {summary.pnn50:.0f}%")
+            print(f"coverage: {summary.coverage_pct:.0f}% "
+                  f"({summary.beats:,} beats)")
+            for line in doc["insights"]:
+                print(f"- {line}")
+    return 0
+
+
+def _workouts(db):
+    from .store import Store, default_db_path
+    path = db or default_db_path()
+    if not os.path.exists(path):
+        print(f"no database at {path}; run `noiserep sync` first", file=sys.stderr)
+        return 5
+    with Store(path) as store:
+        workouts = store.workouts()
+    if not workouts:
+        print("no workout files received. This band's sync has only pushed "
+              "RRI files; record a workout on the band and sync again.")
+        return 0
+    for workout in workouts:
+        when = workout.get("time")
+        stamp = f"{when:%Y-%m-%d %H:%M}" if when else "unknown time"
+        print(f"workout: {workout.get('id')}  {stamp}  "
+              f"{workout.get('size', 0):,} bytes")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     from . import __version__
     parser = argparse.ArgumentParser(prog="noiserep")
@@ -253,6 +324,14 @@ def main(argv: list[str] | None = None) -> int:
     e.add_argument("--format", dest="fmt", choices=["csv", "json"], default="csv")
     e.add_argument("--out", dest="out", required=True, help="output file path")
     sub.add_parser("gui", help="launch the desktop app")
+    sl = sub.add_parser("sleep", help="summarise last night's rest from stored RRI")
+    sl.add_argument("--db", dest="db", default=None,
+                    help="SQLite DB path; default per-OS user-data dir")
+    sl.add_argument("--json", dest="json_path", default=None,
+                    help="write the summary as JSON")
+    wo = sub.add_parser("workouts", help="list stored workout files")
+    wo.add_argument("--db", dest="db", default=None,
+                    help="SQLite DB path; default per-OS user-data dir")
     m = sub.add_parser("menubar", help="live heart rate in the macOS menu bar")
     m.add_argument("--name", dest="name", default=None,
                    help="advertised band name; default auto-detect Noise_REP_*")
@@ -288,6 +367,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "gui":
         from .gui.app import main as gui_main
         return gui_main([])
+    if args.cmd == "sleep":
+        return _sleep(args.db, args.json_path)
+    if args.cmd == "workouts":
+        return _workouts(args.db)
     if args.cmd == "menubar":
         if args.poll <= 0:
             print("invalid --poll: must be greater than 0", file=sys.stderr)

@@ -143,6 +143,30 @@ def summarize(samples: Sequence[tuple[dt.datetime, int]]) -> RestSummary | None:
     )
 
 
+def hr_series(samples: Iterable, bucket_s: int = 60) -> list[tuple[dt.datetime, float]]:
+    """Average heart rate per time bucket, for charting a rest window.
+
+    ``bucket_s=60`` gives one point per minute.  Empty buckets are omitted, so
+    charts show real recorded time rather than invented zeros.
+    """
+    pairs = _as_pairs(samples)
+    if bucket_s <= 0:
+        raise ValueError("bucket_s must be positive")
+    buckets: dict[dt.datetime, list[float]] = {}
+    for ts, rr in pairs:
+        if bucket_s % 60 == 0:
+            minutes = bucket_s // 60
+            bucket = ts.replace(second=0, microsecond=0) - dt.timedelta(
+                minutes=ts.minute % minutes)
+        else:
+            epoch = int((ts - dt.datetime(1970, 1, 1)).total_seconds())
+            bucket = dt.datetime(1970, 1, 1) + dt.timedelta(
+                seconds=(epoch // bucket_s) * bucket_s)
+        buckets.setdefault(bucket, []).append(60000.0 / rr)
+    return [(bucket, round(statistics.fmean(values), 1))
+            for bucket, values in sorted(buckets.items())]
+
+
 def overnight_rest(samples: Iterable, gap_s: int = DEFAULT_GAP_S,
                    min_minutes: int = DEFAULT_MIN_MINUTES) -> RestSummary | None:
     """The longest RRI window, i.e. the likely overnight rest period."""
@@ -188,6 +212,7 @@ __all__ = [
     "DEFAULT_GAP_S",
     "DEFAULT_MIN_MINUTES",
     "RestSummary",
+    "hr_series",
     "insights",
     "overnight_rest",
     "rest_windows",

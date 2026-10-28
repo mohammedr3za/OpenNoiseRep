@@ -26,6 +26,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from . import theme
 from .. import analytics
 from ..export import export_csv, export_json
+from ..protocol.files import STAGE_NAMES
 from ..store import Store, default_db_path
 
 #: None means auto-detect a single ``Noise_REP_*`` band (see ble.connection).
@@ -496,8 +497,9 @@ class MainWindow(QtWidgets.QMainWindow):
         outer.addWidget(banner_host)
 
         self.stack = QtWidgets.QStackedWidget()
-        self.stack.addWidget(self._build_overview())   # index 0
-        self.stack.addWidget(self._build_detail())     # index 1
+        self.stack.addWidget(self._build_overview())      # index 0
+        self.stack.addWidget(self._build_detail())        # index 1
+        self.stack.addWidget(self._build_sleep_detail())  # index 2
         outer.addWidget(self.stack, 1)
 
         self._install_shortcuts()
@@ -971,8 +973,10 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:  # noqa: BLE001
             pass
 
-        frame = QtWidgets.QFrame()
-        frame.setObjectName("card")
+        frame = ClickableCard("card")
+        frame.setCursor(QtCore.Qt.PointingHandCursor)
+        frame.clicked.connect(
+            lambda _=None, s=session: self._open_sleep_detail(s))
         v = QtWidgets.QVBoxLayout(frame)
         v.setContentsMargins(22, 16, 22, 16)
         v.setSpacing(8)
@@ -1407,6 +1411,223 @@ class MainWindow(QtWidgets.QMainWindow):
                      ("Time span", "—", "no readings")]
         for spec in specs:
             self.detail_stats_layout.addWidget(self._stat_card(*spec), 1)
+
+    # -- sleep detail ----------------------------------------------------
+    def _build_sleep_detail(self) -> QtWidgets.QWidget:
+        scroll, _inner, lay = self._make_page()
+
+        header = QtWidgets.QWidget()
+        h = QtWidgets.QHBoxLayout(header)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(8)
+        back = QtWidgets.QPushButton("‹  Back")
+        back.setObjectName("backBtn")
+        back.setCursor(QtCore.Qt.PointingHandCursor)
+        back.setFixedWidth(110)
+        back.setMinimumHeight(36)
+        back.setAccessibleName("Back to overview")
+        back.clicked.connect(self._show_overview)
+        h.addWidget(back, 0, QtCore.Qt.AlignLeft)
+        h.addStretch(1)
+        center = QtWidgets.QVBoxLayout()
+        center.setSpacing(1)
+        self.sleep_detail_title = QtWidgets.QLabel("Last Night")
+        self.sleep_detail_title.setObjectName("metricTitle")
+        self.sleep_detail_title.setAlignment(QtCore.Qt.AlignCenter)
+        self.sleep_detail_sub = QtWidgets.QLabel("")
+        self.sleep_detail_sub.setObjectName("rangeLabel")
+        self.sleep_detail_sub.setAlignment(QtCore.Qt.AlignCenter)
+        center.addWidget(self.sleep_detail_title)
+        center.addWidget(self.sleep_detail_sub)
+        h.addLayout(center)
+        h.addStretch(1)
+        spacer = QtWidgets.QWidget()
+        spacer.setFixedWidth(110)
+        h.addWidget(spacer)
+        lay.addWidget(header)
+
+        self.sleep_detail_value = QtWidgets.QLabel("—")
+        self.sleep_detail_value.setObjectName("heroValue")
+        self.sleep_detail_value.setAlignment(QtCore.Qt.AlignCenter)
+        lay.addWidget(self.sleep_detail_value)
+
+        stat_bar = QtWidgets.QFrame()
+        stat_bar.setObjectName("card")
+        self.sleep_stat_row = QtWidgets.QHBoxLayout(stat_bar)
+        self.sleep_stat_row.setContentsMargins(22, 14, 22, 14)
+        self.sleep_stat_row.setSpacing(30)
+        self.sleep_stat_row.addStretch(1)
+        lay.addWidget(stat_bar)
+
+        self.sleep_chart = ChartView(interactive=True)
+        self.sleep_chart.setAccessibleName("Heart rate across the sleep window")
+        lay.addWidget(self._chart_card(
+            self.sleep_chart, "Heart rate across the rest window", height=280))
+
+        self.sleep_stages_host = QtWidgets.QWidget()
+        self.sleep_stages_layout = QtWidgets.QVBoxLayout(self.sleep_stages_host)
+        self.sleep_stages_layout.setContentsMargins(0, 0, 0, 0)
+        self.sleep_stages_layout.setSpacing(8)
+        lay.addWidget(self.sleep_stages_host)
+
+        self.sleep_insight_host = QtWidgets.QWidget()
+        self.sleep_insight_layout = QtWidgets.QVBoxLayout(self.sleep_insight_host)
+        self.sleep_insight_layout.setContentsMargins(0, 0, 0, 0)
+        self.sleep_insight_layout.setSpacing(4)
+        lay.addWidget(self.sleep_insight_host)
+
+        note = QtWidgets.QLabel(
+            "Derived from RRI beat-to-beat data. This is a recorded rest "
+            "window, not a scored sleep study; interpretations are descriptive.")
+        note.setObjectName("muted")
+        note.setWordWrap(True)
+        lay.addWidget(note)
+        lay.addStretch(1)
+        return scroll
+
+    def _open_sleep_detail(self, session: dict) -> None:
+        bedtime = session.get("bedtime")
+        wake = session.get("wake")
+        total_min = session.get("total_min")
+        if not (bedtime and wake and total_min):
+            return
+        self._sleep_session = session
+        source = session.get("source") or "rri"
+        self.sleep_detail_sub.setText(
+            f"{bedtime:%A, %d %B} · {bedtime:%H:%M} – {wake:%H:%M} · "
+            f"{'from RRI' if source == 'rri' else source}")
+        self.sleep_detail_value.setText(_fmt_span(total_min * 60))
+
+        summary = None
+        try:
+            summary = self.store.rest_summary(bedtime, wake)
+        except Exception:  # noqa: BLE001
+            pass
+
+        self._clear_layout(self.sleep_stat_row)
+        specs = [("Duration", _fmt_span(total_min * 60), True)]
+        if summary is not None:
+            specs += [
+                ("Avg HR", f"{summary.avg_hr:.0f} bpm" if summary.avg_hr else "—",
+                 False),
+                ("HRV (RMSSD)",
+                 f"{summary.rmssd_ms:.0f} ms" if summary.rmssd_ms else "—", False),
+                ("Coverage",
+                 f"{summary.coverage_pct:.0f}%" if summary.coverage_pct is not None
+                 else "—", False),
+                ("Beats", f"{summary.beats:,}", False),
+            ]
+        for label, value, accent in specs:
+            self.sleep_stat_row.addWidget(self._sleep_stat_cell(
+                label, value, accent))
+        self.sleep_stat_row.addStretch(1)
+
+        try:
+            rows = analytics.hr_series(self.store.rri(bedtime, wake), bucket_s=60)
+        except Exception:  # noqa: BLE001
+            rows = []
+        self.sleep_chart.set_data(rows, "bpm")
+        self._render_sleep_stages(session, wake)
+
+        self._clear_layout(self.sleep_insight_layout)
+        if summary is not None:
+            cap = QtWidgets.QLabel("WHAT THE DATA SAYS")
+            cap.setObjectName("sectionLabel")
+            self.sleep_insight_layout.addWidget(cap)
+            for line in analytics.insights(summary):
+                note = QtWidgets.QLabel(line)
+                note.setObjectName("muted")
+                note.setWordWrap(True)
+                self.sleep_insight_layout.addWidget(note)
+
+        self.stack.setCurrentIndex(2)
+
+    def _sleep_stat_cell(self, label: str, value: str,
+                         accent: bool) -> QtWidgets.QWidget:
+        cell = QtWidgets.QWidget()
+        v = QtWidgets.QVBoxLayout(cell)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(1)
+        num = QtWidgets.QLabel(value)
+        num.setObjectName("statNumAccent" if accent else "statNum")
+        lab = QtWidgets.QLabel(label.upper())
+        lab.setObjectName("statLabel")
+        v.addWidget(num)
+        v.addWidget(lab)
+        return cell
+
+    def _render_sleep_stages(self, session: dict, wake: datetime.datetime) -> None:
+        self._clear_layout(self.sleep_stages_layout)
+        cap = QtWidgets.QLabel("SLEEP STAGES")
+        cap.setObjectName("sectionLabel")
+        self.sleep_stages_layout.addWidget(cap)
+
+        session_id = session.get("id")
+        stages = []
+        if session_id is not None:
+            try:
+                stages = self.store.sleep_stages(session_id)
+            except Exception:  # noqa: BLE001
+                stages = []
+
+        if not stages:
+            card = QtWidgets.QFrame()
+            card.setObjectName("card")
+            v = QtWidgets.QVBoxLayout(card)
+            v.setContentsMargins(20, 14, 20, 14)
+            v.setSpacing(4)
+            title = QtWidgets.QLabel("Not available")
+            title.setObjectName("chipValue")
+            v.addWidget(title)
+            hint = QtWidgets.QLabel(
+                "The band has not sent a staged sleep file, so light, deep and "
+                "REM cannot be shown. Only RRI beats arrived for this window; "
+                "inventing stages would be worse than showing none.")
+            hint.setObjectName("muted")
+            hint.setWordWrap(True)
+            v.addWidget(hint)
+            self.sleep_stages_layout.addWidget(card)
+            return
+
+        colors = {
+            0: theme.FG_MUTED,      # not sleep
+            1: "#BFBFBA",           # unknown
+            2: theme.FG,            # deep
+            3: theme.ACCENT_HOVER,  # light
+            4: theme.FOCUS,         # rem
+            5: theme.ACCENT,        # awake
+        }
+        bar = QtWidgets.QFrame()
+        h = QtWidgets.QHBoxLayout(bar)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(1)
+        for i, stage in enumerate(stages):
+            start = stage.get("ts")
+            end = stages[i + 1]["ts"] if i + 1 < len(stages) else wake
+            if not start or not end or end <= start:
+                continue
+            minutes = max(1, int((end - start).total_seconds() // 60))
+            seg = QtWidgets.QFrame()
+            seg.setFixedHeight(18)
+            seg.setStyleSheet(
+                f"background:{colors.get(stage.get('stage'), theme.FG_MUTED)};"
+                "border-radius:3px;")
+            seg.setToolTip(
+                f"{STAGE_NAMES.get(stage.get('stage'), 'stage')} · {minutes} min")
+            h.addWidget(seg, minutes)
+        self.sleep_stages_layout.addWidget(bar)
+
+        legend = QtWidgets.QHBoxLayout()
+        legend.setSpacing(16)
+        for code, name in sorted(STAGE_NAMES.items()):
+            dot = QtWidgets.QLabel("●")
+            dot.setStyleSheet(f"color:{colors.get(code, theme.FG_MUTED)};")
+            label = QtWidgets.QLabel(name.replace("_", " ").title())
+            label.setObjectName("muted")
+            legend.addWidget(dot)
+            legend.addWidget(label)
+        legend.addStretch(1)
+        self.sleep_stages_layout.addLayout(legend)
 
     # -- stat row helpers ------------------------------------------------
     def _clear_stats(self) -> None:
