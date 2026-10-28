@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import os
+import subprocess
 import sys
 import time
 
@@ -36,23 +38,35 @@ FIRST_EVENT_TIMEOUT = 8.0
 REALTIME_SILENCE = 20.0
 # How long to wait for the reply to one poll before trying again next tick.
 POLL_REPLY_TIMEOUT = 6.0
+# Consecutive polls with no heart rate before the band counts as removed.
+REMOVED_AFTER_POLLS = 2
+# Grace period before a lost band locks the Mac (opt-in feature).
+AWAY_GRACE_SECONDS = 15.0
 
 
-def format_title(bpm: int | None, connected: bool) -> str:
-    """The tray title/tooltip value: ``♥ 72`` or ``♥ —``."""
-    if not connected or bpm is None:
+def format_title(bpm: int | None, connected: bool,
+                 removed: bool = False) -> str:
+    """The menu/tooltip value: ``♥ 72``, ``♥ ~`` (removed) or ``♥ —``."""
+    if not connected:
         return "♥ —"
+    if bpm is None:
+        return "♥ ~" if removed else "♥ —"
     return f"♥ {int(bpm)}"
 
 
-def make_icon(connected: bool, size: int = 22) -> QtGui.QIcon:
-    """A monochrome heart template icon drawn with QPainter (no assets).
+def make_icon(connected: bool, bpm: int | None = None,
+              removed: bool = False, size: int = 18) -> QtGui.QIcon:
+    """A monochrome heart + number template, drawn with QPainter.
 
-    Filled when connected, outlined when not. ``setIsMask`` lets macOS render
-    it as a template image that adapts to the light/dark menu bar.
+    macOS shows only the tray *icon*, not ``setTitle`` text, so the number is
+    painted beside the heart. The heart is filled only while a real BPM is
+    known; when the band is off-wrist it is outlined and the label is ``~``.
+    ``setIsMask`` makes macOS treat it as a template image that adapts to the
+    menu bar's light/dark appearance.
     """
     ratio = 2
-    pix = QtGui.QPixmap(size * ratio, size * ratio)
+    width = size + 40
+    pix = QtGui.QPixmap(width * ratio, size * ratio)
     pix.setDevicePixelRatio(ratio)
     pix.fill(QtCore.Qt.transparent)
     painter = QtGui.QPainter(pix)
@@ -65,14 +79,28 @@ def make_icon(connected: bool, size: int = 22) -> QtGui.QIcon:
     path.cubicTo(s * 0.52, s * 0.23, s * 0.62, s * 0.16, s * 0.75, s * 0.24)
     path.cubicTo(s * 0.92, s * 0.34, s * 0.90, s * 0.58, s * 0.50, s * 0.88)
     path.closeSubpath()
-    if connected:
+
+    filled = connected and bpm is not None
+    if filled:
         painter.setPen(QtCore.Qt.NoPen)
         painter.setBrush(QtGui.QColor(0, 0, 0))
     else:
         painter.setBrush(QtCore.Qt.NoBrush)
-        painter.setPen(QtGui.QPen(QtGui.QColor(0, 0, 0, 140), 1.6))
+        painter.setPen(QtGui.QPen(QtGui.QColor(0, 0, 0, 170), 1.6))
     painter.drawPath(path)
+
+    label = (str(int(bpm)) if filled else
+             ("~" if removed else "—"))
+    font = QtGui.QFont("Helvetica Neue")
+    font.setPixelSize(13)
+    font.setBold(True)
+    painter.setFont(font)
+    painter.setPen(QtGui.QColor(0, 0, 0))
+    painter.drawText(
+        QtCore.QRectF(s + 3, 0, width - s - 3, s),
+        QtCore.Qt.AlignVCenter | QtCore.Qt.AlignLeft, label)
     painter.end()
+
     icon = QtGui.QIcon(pix)
     if hasattr(icon, "setIsMask"):
         icon.setIsMask(True)          # macOS template rendering
@@ -93,7 +121,9 @@ class MenubarApp(QtCore.QObject):
                  realtime_silence: float = REALTIME_SILENCE,
                  reply_timeout: float = POLL_REPLY_TIMEOUT,
                  min_update_interval: float = 1.0,
-                 with_tray: bool = True):
+                 with_tray: bool = True,
+                 lock_on_away: bool = False,
+                 away_seconds: float = AWAY_GRACE_SECONDS):
         super().__init__()
         self.app = app
         self.band_name = band_name            # None -> auto-discover Noise_REP_*
@@ -102,6 +132,8 @@ class MenubarApp(QtCore.QObject):
         self.realtime_silence = realtime_silence
         self.reply_timeout = reply_timeout
         self.min_update_interval = max(0.0, float(min_update_interval))
+        self.lock_on_away = bool(lock_on_away)
+        self.away_seconds = max(0.0, float(away_seconds))
         self.store = Store(db_path or default_db_path())
 
         self._hr: int | None = None
@@ -116,9 +148,12 @@ class MenubarApp(QtCore.QObject):
         self._ctx = None
         self._worker_task: asyncio.Task | None = None
         self._connect_task: asyncio.Task | None = None
+        self._away_task: asyncio.Task | None = None
+        self._had_connection = False
+        self._removed = False
+        self._hr_misses = 0
         self._op_lock = asyncio.Lock()
         self._window: QtWidgets.QMainWindow | None = None
-        self._icon_cache: dict[bool, QtGui.QIcon] = {}
         self._last_render = 0.0
         self._dirty = False
         self._render_timer = QtCore.QTimer(self)
@@ -160,6 +195,13 @@ class MenubarApp(QtCore.QObject):
         self.sync_action = QtGui.QAction("Sync now", self)
         self.sync_action.triggered.connect(self.sync_now)
         self.menu.addAction(self.sync_action)
+
+        self.lock_action = QtGui.QAction(
+            "Lock Mac when band goes away", self)
+        self.lock_action.setCheckable(True)
+        self.lock_action.setChecked(self.lock_on_away)
+        self.lock_action.toggled.connect(self._set_lock_on_away)
+        self.menu.addAction(self.lock_action)
         self.menu.addSeparator()
 
         self.open_action = QtGui.QAction("Open main window", self)
@@ -178,6 +220,8 @@ class MenubarApp(QtCore.QObject):
     def _tooltip(self) -> str:
         if not self._connected:
             return "NoiseREP — not connected"
+        if self._removed:
+            return "NoiseREP — band removed or no heart rate"
         if self._hr is None:
             return "NoiseREP — waiting for heart rate"
         return f"NoiseREP — ♥ {self._hr} bpm ({self._source or 'live'})"
@@ -197,7 +241,7 @@ class MenubarApp(QtCore.QObject):
         if self._render_timer.isActive():
             self._render_timer.stop()
 
-        title = format_title(self._hr, self._connected)
+        title = format_title(self._hr, self._connected, self._removed)
         self.header_action.setText(title)
         self.source_action.setText(self._source_text())
         self.status_action.setText(self._status)
@@ -215,7 +259,8 @@ class MenubarApp(QtCore.QObject):
         self.quit_action.setEnabled(not self._quitting)
 
         if self.tray is not None:
-            self.tray.setIcon(self._icon(self._connected))
+            self.tray.setIcon(
+                make_icon(self._connected, self._hr, self._removed))
             self.tray.setToolTip(self._tooltip())
 
     def _on_render_timer(self) -> None:
@@ -224,11 +269,6 @@ class MenubarApp(QtCore.QObject):
         else:
             self._render_timer.stop()
 
-    def _icon(self, connected: bool) -> QtGui.QIcon:
-        if connected not in self._icon_cache:
-            self._icon_cache[connected] = make_icon(connected)
-        return self._icon_cache[connected]
-
     # -- state helpers ---------------------------------------------------
     def _apply_hr(self, bpm: int, source: str) -> None:
         value = int(bpm)
@@ -236,8 +276,71 @@ class MenubarApp(QtCore.QObject):
             return
         self._hr = value
         self._source = source
+        self._removed = False
+        self._hr_misses = 0
         self._status = "Live" if source == "live" else "Polled"
         self._render()
+
+    def _mark_no_hr(self) -> None:
+        """Count a poll with no BPM; after two, show the removed state."""
+        if not self._connected:
+            return
+        self._hr_misses += 1
+        if self._hr_misses >= REMOVED_AFTER_POLLS and not self._removed:
+            self._removed = True
+            self._hr = None
+            self._source = None
+            self._status = "Band removed or no heart rate"
+            self._render(force=True)
+
+    def _set_lock_on_away(self, enabled: bool) -> None:
+        self.lock_on_away = bool(enabled)
+        self._status = ("Will lock the Mac if the band goes away"
+                        if self.lock_on_away else "Away-lock off")
+        self._render(force=True)
+
+    def _schedule_away_lock(self) -> None:
+        """After an unexpected disconnect, lock the Mac if opted in."""
+        if (not self.lock_on_away or not self._had_connection
+                or self._quitting):
+            return
+        if self._away_task is not None and not self._away_task.done():
+            return
+        self._away_task = self._spawn(self._lock_after_grace())
+
+    async def _lock_after_grace(self) -> None:
+        seconds = max(0.0, self.away_seconds)
+        self._status = (f"Band away — locking Mac in {int(seconds)}s"
+                        if seconds else "Band away — locking Mac")
+        self._render(force=True)
+        try:
+            await asyncio.sleep(seconds)
+        except asyncio.CancelledError:
+            raise
+        if self._connected or self._quitting:
+            return
+        self._lock_screen()
+        self._status = "Locked the Mac because the band went away"
+        self._render(force=True)
+
+    @staticmethod
+    def _lock_screen():
+        """Lock the Mac locally. Returns the command used, or None."""
+        candidates = [
+            ["/System/Library/CoreServices/Menu Extras/User.menu/Contents/"
+             "Resources/CGSession", "-suspend"],
+            ["/usr/bin/pmset", "displaysleepnow"],
+            ["/usr/bin/open", "-a", "ScreenSaverEngine"],
+        ]
+        for command in candidates:
+            if command[0] != "/usr/bin/open" and not os.path.exists(command[0]):
+                continue
+            try:
+                subprocess.run(command, timeout=5, check=False)
+                return command[0]
+            except (OSError, subprocess.SubprocessError):
+                continue
+        return None
 
     def _spawn(self, coro) -> asyncio.Task | None:
         try:
@@ -289,6 +392,10 @@ class MenubarApp(QtCore.QObject):
         self._ctx, self._band = ctx, band
         self._connected = True
         self._connecting = False
+        self._had_connection = True
+        self._removed = False
+        self._hr_misses = 0
+        self._cancel_away_lock()
         self._status = "Connected"
         self._render(force=True)
         self._start_worker()
@@ -314,10 +421,12 @@ class MenubarApp(QtCore.QObject):
             await self._teardown()
             self._status = f"Connection lost: {exc}"
             self._render(force=True)
+            self._schedule_away_lock()
         except Exception as exc:                 # never kill the tray silently
             await self._teardown()
             self._status = f"Live update stopped: {exc}"
             self._render(force=True)
+            self._schedule_away_lock()
 
     async def _teardown(self) -> None:
         ctx, self._ctx = self._ctx, None
@@ -327,13 +436,21 @@ class MenubarApp(QtCore.QObject):
         self._realtime_active = False
         self._hr = None
         self._source = None
+        self._removed = False
+        self._hr_misses = 0
         if ctx is not None:
             try:
                 await asyncio.wait_for(ctx.__aexit__(None, None, None), timeout=5.0)
             except Exception:
                 pass
 
+    def _cancel_away_lock(self) -> None:
+        task, self._away_task = self._away_task, None
+        if task is not None and not task.done():
+            task.cancel()
+
     async def _do_disconnect(self, status: str = "Disconnected") -> None:
+        self._cancel_away_lock()
         worker, self._worker_task = self._worker_task, None
         if (worker is not None and worker is not asyncio.current_task()
                 and not worker.done()):
@@ -403,17 +520,20 @@ class MenubarApp(QtCore.QObject):
                 await self._teardown()
                 self._status = f"Connection lost: {exc}"
                 self._render(force=True)
+                self._schedule_away_lock()
                 return
             if bpm is not None:
                 self._apply_hr(bpm, "polled")
+            else:
+                self._mark_no_hr()
             await asyncio.sleep(self.poll_seconds)
 
     async def _poll_once(self) -> int | None:
         band = self._band
         if band is None:
             return None
-        now = datetime.datetime.now()
-        since = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        # Use the whole device timeline: the band's RTC may be unset (~2002).
+        since = datetime.datetime(2000, 1, 1)
         async with self._op_lock:
             await band.send(commands.series(113, since, realtime.HEART_RATE_METRIC))
         loop = asyncio.get_running_loop()
@@ -457,8 +577,7 @@ class MenubarApp(QtCore.QObject):
         self._render(force=True)
         await self._pause_worker()
         try:
-            since = datetime.datetime.now().replace(
-                hour=0, minute=0, second=0, microsecond=0)
+            since = datetime.datetime(2000, 1, 1)
             result = await run_sync(self._band, since,
                                     progress=self._on_sync_progress)
             counts = self.store.ingest(result, note="menubar sync")
@@ -534,7 +653,9 @@ class MenubarApp(QtCore.QObject):
 
 def main(argv: list[str] | None = None, band_name: str | None = None,
          db_path: str | None = None,
-         poll_seconds: float = DEFAULT_POLL_SECONDS) -> int:
+         poll_seconds: float = DEFAULT_POLL_SECONDS,
+         lock_on_away: bool = False,
+         away_seconds: float = AWAY_GRACE_SECONDS) -> int:
     """Run the menu-bar app until Quit. ``band_name=None`` auto-discovers."""
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(
         list(argv) if argv is not None else sys.argv)
@@ -543,7 +664,9 @@ def main(argv: list[str] | None = None, band_name: str | None = None,
     loop = qasync.QEventLoop(app)
     asyncio.set_event_loop(loop)
     menubar = MenubarApp(app, band_name=band_name, db_path=db_path,
-                         poll_seconds=poll_seconds)
+                         poll_seconds=poll_seconds,
+                         lock_on_away=lock_on_away,
+                         away_seconds=away_seconds)
     if menubar.tray is None:
         print("menubar: no system tray available on this desktop", file=sys.stderr)
         return 1

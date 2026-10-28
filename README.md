@@ -1,231 +1,165 @@
-# noiserep
+<p align="center">
+  <img src="docs/images/menubar.png" alt="NoiseREP live heart rate in the macOS menu bar: a filled heart with 72, an outlined heart with ~ when removed, and an outlined heart with — when disconnected" width="900">
+</p>
 
-Pull raw heart-rate and activity data off the **Noise REP** fitness band without
-the vendor app. Cross-platform (Linux + macOS), open source, no cloud account.
+<h1 align="center">noiserep</h1>
+<p align="center"><b>Your Noise REP band's data — without the vendor app.</b></p>
 
-The band advertises the standard Heart Rate Service but doesn't implement it — it
-speaks the Xiaomi wear protocol over a vendor GATT service, with **no
-authentication and no BLE bond**. See [`docs/PROTOCOL.md`](docs/PROTOCOL.md) for
-the full reverse-engineering notes.
+<p align="center">
+  <img alt="Python 3.10+" src="https://img.shields.io/badge/python-3.10%2B-CC785C">
+  <img alt="License MIT" src="https://img.shields.io/badge/license-MIT-CC785C">
+  <img alt="Platform macOS and Linux" src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-CC785C">
+  <img alt="Status alpha" src="https://img.shields.io/badge/status-alpha-D4A27F">
+  <img alt="Tests" src="https://img.shields.io/badge/tests-177%20passing-879A77">
+</p>
 
-> **Read-only by default.** noiserep sends only the historical-fetch commands
-> (`32`, `112`, `113`, `115`, `117`, `123`) and the transport acks they require.
-> It does not write settings, alarms or the band clock, and it never deletes
-> on-device history. The one explicit exception is the **experimental,
-> `--yes`-gated `noiserep buzz`** haptics command; sync and the GUI never call it.
+noiserep connects to the **Noise REP** fitness band over BLE, reads the history it
+already stores, decodes it, and gives you a desktop app, a live menu-bar heart
+rate, a CLI, and CSV/JSON exports. No account. No cloud. No vendor app.
 
-## Status
+> **Read-only by default.** The allowed traffic is the historical-fetch set
+> (`32`, `112`, `113`, `115`, `117`, `123`) plus the transport acks. No auth, no
+> BLE bond, no settings writes, no time-sync. The one explicit exception is the
+> opt-in, `--yes`-gated `buzz` haptics command; sync and the GUI never call it.
 
-### What works
+## See it
 
-- **Offline decode (Phase 0, done).** `noiserep decode` reassembles a PacketLogger
-  `.pklg` capture and decodes device info, the data index, metric series and named
-  files. The core is pure standard library, and the suite runs without hardware.
-- **Live historical sync (Phase 1, confirmed on hardware 2026-10-28).** Scan by
-  advertised name, subscribe to the three notify characteristics, then fetch
-  device info (`32`), the data index (`112`), the `113`/`115` series and the
-  `117`/`123` controls; the band then pushes its `4097` activity files. Chunking
-  and start/end acks work live.
-- **Local store + export (Phase 2, implemented).** SQLite with idempotent upserts,
-  CSV/JSON export, and the `sync` / `export` commands. Unit-tested with an
-  in-memory store. Sleep sessions/stages and RR intervals have dedicated tables
-  and queries.
-- **Desktop app (Phase 3, implemented).** A PySide6 GUI (`noiserep gui`) with an
-  overview, per-metric charts and export. Covered by an offscreen smoke test; a
-  full hardware run of the GUI sync path is still pending.
-- **Live menu bar (experimental).** `noiserep menubar` shows the current heart
-  rate in the macOS menu bar. It tries the Xiaomi realtime command and falls
-  back to polling the confirmed `113` heart-rate series.
-- **RRI + sleep decoding (implemented, offline-validated).** A vendor capture
-  yields 425 RR intervals (448–960 ms) whose timestamps land at ~15:15, matching
-  the capture's manual measurement. Sleep layouts from the Xiaomi reference are
-  implemented; no live sleep file has been captured yet. See
-  [`docs/FILES.md`](docs/FILES.md).
-- **Last-night rest analytics.** When the band sends overnight RRI (as it did
-  on 2026-10-28), the app derives a rest span with average/5–95% heart rate,
-  HRV (RMSSD, SDNN, pNN50), beat coverage and plain-language observations. This
-  is labelled **from RRI**, not a staged sleep file.
-- **Sleep detail timeline.** Clicking Last Night opens an HR timeline across the
-  rest window, the RRI coverage gaps, HRV/coverage stats and all insights. A
-  **Sleep Stages** panel says explicitly when light/deep/REM data is
-  unavailable rather than inventing a stage chart.
-- **Workouts are visible when they exist.** The GUI always shows a Workouts
-  section; today it says none have been received because this band's sync has
-  only pushed RRI files. Sport/workout file names are detected and will be
-  listed automatically if the band sends them.
-- **Release tooling (Phase 4, in progress).** GitHub Actions CI, a PyInstaller
-  build script, issue forms and a security policy. No signed or published
-  binaries yet.
+| Today | Sleep & recovery |
+|---|---|
+| ![Today overview with heart-rate hero, trend chart, Last Night card, workouts and other channels](docs/images/overview.png) | ![Sleep detail with heart-rate timeline, HRV stats and an explicit stages-unavailable panel](docs/images/sleep.png) |
 
-### Known limits
+| All channels | Live menu-bar states |
+|---|---|
+| ![All channels view with daily activity, HRV, stress and unknown channels](docs/images/channels.png) | ![Menu bar showing filled heart 72, outlined heart tilde when removed, and outlined heart dash when disconnected](docs/images/menubar.png) |
 
-- **Metric identity is evidence-based, not vendor-confirmed.** Heart rate (2) is
-  verified. Daily activity (0), SpO2 (4), HRV (21), stress (22) and RR interval
-  (27) are marked **likely** and shown with a `(likely)` suffix in the GUI. The
-  rest stay neutral (`Channel N`). Do not treat a likely channel as a medical
-  reading; see the evidence table in [`docs/PROTOCOL.md`](docs/PROTOCOL.md).
-- **RRI decoding is implemented; the millisecond unit is inferred.** The layout
-  is validated against a real vendor file, and the store/GUI consume it, but the
-  unit was not confirmed against the band's own readout. Sleep decoders are
-  implemented from the Xiaomi reference and are untested on a real sleep file.
-- **“Last night” is an RRI rest span, not scored sleep.** It reports the recorded
-  span and HRV, not sleep stages or a sleep score. The band records RRI in
-  bursts, so coverage is shown alongside the span. Interpretations are
-  descriptive, not medical.
-- **No workout data has been received.** The band's sync pushes RRI files only;
-  the GUI makes that empty state explicit rather than hiding it.
-- **No light/deep/REM stages exist in this dataset.** The band has not sent a
-  staged sleep file. The app shows an explicit “Not available” panel; stage
-  charts appear only if `sleep_stages` contains decoded stage records.
-- **A freshly-unpaired band's clock is unset**, so timestamps can read around
-  2002. The read-only client does not send a time-sync; timestamps are
-  device-relative. `sync` now defaults to the whole device timeline rather than
-  the host's today, so this no longer hides the band's series data.
-- The GUI's live sync uses the same tested orchestration as `noiserep sync`, but
-  the window itself has only had offscreen smoke tests.
-- macOS and Linux are supported; Windows is untested.
-- This is not a medical device. Values are raw sensor readings.
+The screenshots are generated from **synthetic data** by
+`tools/make_readme_images.py`; they contain no personal health data.
 
-## Install
+## What you get
+
+- **Historical sync.** Scan by advertised name (`Noise_REP_*`), fetch device
+  info, the data index, the `113`/`115` series and the pushed `4097` activity
+  files. Chunking, start/end acks and auto-discovery work live.
+- **A clean desktop app.** A health-style overview, per-channel charts, date
+  ranges, sleep/rest detail, CSV/JSON export and a **♥ Live** button for the
+  menu bar.
+- **Live heart rate in the menu bar.** `♥ 72` when worn, `♥ ~` when the band is
+  off-wrist, `♥ —` when disconnected. It tries the realtime stream and falls
+  back to the confirmed `113` series.
+- **Walk-away lock (opt-in).** If the band disconnects and does not return
+  within a grace period, noiserep can lock the Mac locally.
+- **Rest/sleep analytics.** Overnight RRI becomes a rest window with average and
+  5–95% heart rate, RMSSD/SDNN/pNN50, beat coverage, a minute-level timeline and
+  plain-language observations. It is labelled **from RRI**, never as scored sleep.
+- **Workouts, when the band sends them.** Sport/workout files are detected and
+  listed; today this band has sent none, and the UI says so.
+- **Own your data.** SQLite storage with idempotent upserts, CSV/JSON export,
+  and offline `.pklg` decoding with no hardware.
+
+## Quick start
 
 ```sh
 python -m venv venv && . venv/bin/activate
-pip install -e '.[ble,gui]'          # live sync + desktop app
+pip install -e '.[ble,gui]'        # live sync + desktop + menu bar
 ```
 
-The headless core has no third-party dependencies. Install only what you need:
+Then, with the band awake and nearby and **the phone's Bluetooth off** (the band
+accepts one central):
 
 ```sh
-pip install -e '.[dev]'              # pytest
-pip install -e '.[ble]'              # CLI live sync (bleak)
-pip install -e '.[gui]'              # desktop app (PySide6, pyqtgraph, qasync)
+noiserep sync                      # fetch the whole device timeline
+noiserep gui                       # desktop app
+noiserep menubar [--lock-on-away]  # live HR in the menu bar
+noiserep sleep [--json out.json]   # headless rest summary + insights
+noiserep workouts                  # list sport files, or explain that none arrived
 ```
 
-Python 3.10+.
-
-## Usage
-
-Decode a capture offline:
+Offline, with no band:
 
 ```sh
-noiserep decode path/to/capture.pklg            # human-readable summary
+noiserep decode path/to/capture.pklg
 noiserep decode path/to/capture.pklg --json out.json
 ```
 
-Example output (device identifiers redacted):
+Install only what you need: `.[dev]` (pytest), `.[ble]` (bleak), `.[gui]`
+(PySide6, pyqtgraph, qasync). The headless core has no third-party runtime
+dependencies. Python 3.10+.
 
-```
-device: fw 1.4.0  model R1...  mac aa:bb:cc:dd:ee:ff  serial <redacted>
-index: 16 records across ['2002-03-01']
-series: 2002-03-01  metric 2 (heart_rate): 2880 samples @ 30s
-series: 2002-03-01  metric 14 (metric_14): 240 raw bytes (structure TBD)
-file: 2002-03-01-0000_RRI_Data.bin.txt  7200 bytes  flag 1
-```
+## How it works
 
-Sync a live band (band nearby or on its charger, phone Bluetooth **off**):
+<p align="center">
+  <img src="docs/images/architecture.svg" alt="Architecture: band to chunked transport, protocol decoders, sync, SQLite, analytics, GUI, menu bar, CLI and export" width="1000">
+</p>
 
-```sh
-noiserep sync                               # auto-detect a single Noise_REP_* band
-noiserep sync --since 2026-10-01            # only the recent window
-noiserep sync --name Noise_REP_ABCD         # pick a band when several are nearby
-noiserep sync --no-files                    # skip the pushed RRI files
-noiserep sync --db ~/my-noiserep.db         # override the database path
-```
+Layers, from the wire up:
 
-Without `--since`, sync asks for the whole device timeline (the band's clock may
-read 2002 until the vendor app sets it).
+- **`wire.py`** — a small protobuf field reader/writer. Decoding walks raw fields
+  because this band overloads Xiaomi's message shapes.
+- **`protocol/`** — byte-exact command builders, payload decoders, metric
+  evidence, RRI/sleep file decoders, experimental realtime builders and the
+  isolated haptics module.
+- **`ble/`** — chunking and start/end acks, scan/connect with lazy `bleak`.
+- **`sync.py`** — the confirmed choreography; transport- and UI-agnostic.
+- **`store/`** — SQLite: samples, activity files, sleep sessions/stages, RRI.
+- **`analytics.py`** — rest windows, HR/HRV/coverage, non-medical insights.
+- **`gui/`** — PySide6 desktop app and the `QSystemTrayIcon` menu bar.
+- **`cli.py`** — `decode`, `sync`, `export`, `gui`, `menubar`, `sleep`,
+  `workouts`, `buzz`.
 
-`sync` writes raw frames plus `decoded.json` under `data/<timestamp>/` and
-ingests the decoded samples into the local SQLite database. Re-syncing the same
-day updates rows instead of duplicating them.
+See [`docs/PROTOCOL.md`](docs/PROTOCOL.md) for the wire format and
+[`docs/FILES.md`](docs/FILES.md) for RRI/sleep layouts.
 
-Export the stored history:
+## Honest about the data
 
-```sh
-noiserep export --format csv --out all.csv
-noiserep export --metric heart_rate --since 2000-03-01 --until 2000-03-31 --out hr.csv
-noiserep export --format json --out all.json
-```
+- **Heart rate is verified.** Daily activity, SpO2, HRV, stress and RRI are
+  marked **likely** and shown with a `(likely)` suffix. Unknown ids stay
+  `Channel N` forever; the neutral fallback is a feature.
+- **Sleep stages need a staged sleep file.** Your band has sent only RRI, so
+  light/deep/REM are not present. The app says *Not available* rather than
+  inventing stages. A stage timeline renders automatically if the band sends a
+  staged file.
+- **No workouts have arrived.** The sync has only pushed RRI files. Record a
+  workout on the band and sync again; sport files will appear if the band sends
+  them.
+- **The RRI millisecond unit is inferred**, validated against a vendor capture
+  but not against the band's own readout.
+- **The clock may be unset (~2002)** on a freshly-unpaired band. Sync defaults to
+  the whole device timeline, and timestamps are device-relative.
 
-Launch the desktop app:
+This is an alpha, not a medical device. Values are raw sensor readings.
 
-```sh
-noiserep gui
-```
+## Privacy & safety
 
-The app reads the same database, shows a Today overview plus per-metric charts,
-and exports the selected range.
-
-Live heart rate in the menu bar (experimental; band awake, phone Bluetooth off):
-
-```sh
-noiserep menubar --poll 30
-```
-
-The desktop app also has a **♥ Live** button in its top bar that opens this
-menu-bar app and tells you if it is already running. It is separate because the
-band accepts one BLE central at a time.
-
-Vibrate the band (experimental **write**, opt-in, never used by sync/GUI):
-
-```sh
-noiserep buzz --pattern short --yes
-noiserep buzz --pattern find-band --duration 3 --yes
-```
-
-See [`docs/VIBRATION.md`](docs/VIBRATION.md) for the evidence and safety rails.
-
-Headless sleep and workout views:
-
-```sh
-noiserep sleep                  # last night's rest summary + insights
-noiserep sleep --json out.json
-noiserep workouts               # lists sport files, or explains that none arrived
-```
-
-## Privacy
-
-- No network access, no account, no telemetry. Your data stays on this machine.
-- The SQLite database lives in the per-OS user-data directory
+- No network access, no account, no telemetry. Everything stays on your machine.
+- The database lives in the per-OS user-data directory
   (`~/Library/Application Support/noiserep/` on macOS,
-  `~/.local/share/noiserep/` on Linux). `--db` overrides it.
-- `data/`, exports, `.pklg` captures and the database contain **health data**;
-  captures also contain the band **MAC and serial**. Never commit or share them.
-- CLI output includes the MAC and serial. Redact them (and `-v` frame dumps)
-  before posting logs or issues.
-- See [`SECURITY.md`](SECURITY.md) for the vulnerability-reporting process.
+  `~/.local/share/noiserep/` on Linux); `--db` overrides it.
+- `data/`, exports, `.pklg` captures and the DB contain **health data**; captures
+  also contain the band **MAC and serial**. Never commit or share them.
+- `noiserep buzz` is the only write path. It requires `--yes`, is isolated from
+  sync/GUI, and is hardware-unverified.
 
-## How to capture a `.pklg` (optional, for contributors)
+## Status & roadmap
 
-On macOS, install Apple's *Bluetooth* logging profile and use **PacketLogger**
-(part of the Additional Tools for Xcode) to record a sync, then export the trace.
-A capture contains your device's MAC and your own health data — treat it as
-private and never commit it.
+Phases 0–3 are implemented: offline decoders, live historical sync, store/export
+and the desktop app. CI, a PyInstaller build script, issue forms and a security
+policy are in place; signed binaries and a public release are not.
 
-Point the tests at your own capture with `NOISEREP_TEST_PKLG=/path/to/capture.pklg`;
-without it, capture-dependent tests skip.
-
-## Roadmap
-
-| Phase | Scope | State |
-|------:|-------|-------|
-| 0 | Offline decoders + tests | **done** |
-| 1 | Live BLE historical fetch | **confirmed live 2026-10-28**; RRI layout decoded offline |
-| 2 | SQLite store + CSV/JSON export + `sync`/`export` CLI | **implemented**, unit-tested |
-| 3 | PySide6 desktop GUI | **implemented**, offscreen smoke-tested; hardware run pending |
-| 4 | CI, PyInstaller bundles, issue forms, first release | **in progress** (CI/build script landed; binaries pending) |
-| 5+ | Metric validation, sleep/HRV analytics, settings, auto-sync, menu bar, alerts | see [`docs/ROADMAP.md`](docs/ROADMAP.md) |
-
-Metric identity validation did **not** happen in Phase 1 as originally planned.
-It moved to the top of the roadmap because showing a neutral channel is better
-than guessing a health metric. The review of the original spec and plans is in
-[`docs/SPEC-REVIEW.md`](docs/SPEC-REVIEW.md).
+Hardware validation is still open for realtime HR, haptics, staged sleep, workout
+files and the packaged app. See [`docs/ROADMAP.md`](docs/ROADMAP.md) and the
+[`docs/SPEC-REVIEW.md`](docs/SPEC-REVIEW.md) for the gap analysis.
 
 ## Contributing
 
-Protocol findings, decoders for the unmapped metrics, and the live client are all
-welcome. See [`CONTRIBUTING.md`](CONTRIBUTING.md). Never include a real MAC,
-serial or health value in an issue or test.
+Protocol findings, decoders and UX work are welcome. See
+[`CONTRIBUTING.md`](CONTRIBUTING.md). Run the no-hardware checks with:
+
+```sh
+./venv/bin/python -m pytest -q
+./venv/bin/python tools/check.py      # or: make check
+```
+
+Never include a real MAC, serial or health value in an issue, test or screenshot.
 
 ## License
 

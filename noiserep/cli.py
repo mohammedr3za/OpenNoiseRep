@@ -339,6 +339,12 @@ def main(argv: list[str] | None = None) -> int:
                    help="SQLite DB path; default per-OS user-data dir")
     m.add_argument("--poll", dest="poll", type=float, default=30.0,
                    help="seconds between heart-rate polls (default 30)")
+    m.add_argument("--lock-on-away", dest="lock_on_away", action="store_true",
+                   help="lock the Mac if the band disconnects and does not "
+                        "come back within --away-seconds")
+    m.add_argument("--away-seconds", dest="away_seconds", type=float,
+                   default=15.0,
+                   help="grace period before the away-lock (default 15)")
     b = sub.add_parser(
         "buzz", help="EXPERIMENTAL: vibrate the band (write; requires --yes)")
     from .protocol import vibration
@@ -375,9 +381,14 @@ def main(argv: list[str] | None = None) -> int:
         if args.poll <= 0:
             print("invalid --poll: must be greater than 0", file=sys.stderr)
             return 2
+        if args.away_seconds < 0:
+            print("invalid --away-seconds: must not be negative", file=sys.stderr)
+            return 2
         from .gui.menubar import main as menubar_main
         return menubar_main(band_name=args.name, db_path=args.db,
-                            poll_seconds=args.poll)
+                            poll_seconds=args.poll,
+                            lock_on_away=args.lock_on_away,
+                            away_seconds=args.away_seconds)
     if args.cmd == "buzz":
         if not args.yes:
             print("refusing to vibrate the band without --yes "
