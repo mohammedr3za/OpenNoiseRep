@@ -19,8 +19,8 @@ from PySide6 import QtCore, QtGui, QtWidgets  # noqa: E402
 
 from noiserep.gui import theme  # noqa: E402
 from noiserep.gui.app import (  # noqa: E402
-    MainWindow, _columns_for_width, _downsample, _segments, display_name,
-    display_unit,
+    RANGE_MODES, MainWindow, _columns_for_width, _downsample, _segments,
+    display_name, display_unit,
 )
 from noiserep.protocol.decode import DeviceInfo, MetricSeries  # noqa: E402
 from noiserep.store import Store  # noqa: E402
@@ -72,6 +72,41 @@ def test_light_palette_tokens_kept():
     assert theme.ACCENT == "#CC785C"
     assert theme.ERROR == "#BF4D43"
     assert theme.SERIES[0] == "#CC785C"
+
+
+def test_macos_stylesheet_leaves_native_controls_unstyled():
+    mac = theme.build_qss(macos=True)
+    other = theme.build_qss(macos=False)
+    native_selectors = (
+        "QComboBox",
+        "QComboBox::drop-down",
+        "QComboBox QAbstractItemView",
+        "QMenu",
+        "QToolButton#ghost",
+    )
+    for selector in native_selectors:
+        assert selector not in mac, selector
+        assert selector in other, selector
+    # Any bare QWidget rule matches QComboBox/QToolButton and switches them
+    # to Qt's stylesheet renderer, so macOS must not emit one at all.  Anchor
+    # to the line start so QWidget#root and QScrollArea descendants do not
+    # match.
+    assert "\nQWidget {" not in mac
+    assert "\nQWidget {" in other
+    # Base text properties move to concrete non-native widget types instead.
+    assert "QLabel { background: transparent; color: #191919; font-size: 13px; }" in mac
+    assert "QMainWindow, QWidget#root { background: #FAFAF7; }" in mac
+    # Shared styling still applies on both platforms.
+    for qss in (mac, other):
+        assert "QDateEdit" in qss
+        assert "QPushButton#primary" in qss
+        assert "QScrollArea" in qss
+
+
+def test_is_macos_helper_and_host_stylesheet():
+    assert theme.is_macos("darwin")
+    assert not theme.is_macos("linux")
+    assert theme.QSS == theme.build_qss()
 
 
 # -- overview / detail ------------------------------------------------------
@@ -179,6 +214,56 @@ def test_sync_controls_and_shortcuts_are_accessible():
     assert any(k.endswith("R") for k in keys)   # sync
     assert any(k.endswith("E") for k in keys)   # export
     assert w.error_banner.isHidden()
+    w.close()
+
+
+def test_range_combo_keeps_items_and_sizing():
+    w = _window()
+    assert [w.range_combo.itemText(i)
+            for i in range(w.range_combo.count())] == [
+        text for _, text in RANGE_MODES]
+    assert w.range_combo.minimumHeight() >= 32
+    assert w.range_combo.accessibleName() == "Date range"
+    w.close()
+
+
+def test_export_control_keeps_menu_actions_and_accessible_name():
+    w = _window()
+    menu = w.export_menu_btn.menu()
+    assert menu is not None
+    assert [action.text() for action in menu.actions()] == [
+        "Export CSV…", "Export JSON…"]
+    assert w.export_menu_btn.accessibleName() == "Export data"
+    assert w.export_menu_btn.minimumHeight() >= 36
+    # The Ctrl+E shortcut is still installed on the window.
+    assert any(s.key().toString().endswith("E") for s in w._shortcuts)
+    w.close()
+
+
+def test_icon_guide_button_opens_page_and_names_all_states():
+    w = _window()
+    assert w.stack.currentIndex() == 0
+    assert w.guide_btn.accessibleName() == "Menu-bar icon guide"
+
+    w.guide_btn.click()
+    assert w.stack.currentWidget() is w.guide_page
+    text = " ".join(
+        label.text() for label in w.guide_page.findChildren(QtWidgets.QLabel))
+    # All three menu-bar states are named and shown.
+    assert "♥ 72" in text
+    assert "♡ ~" in text
+    assert "♡ —" in text
+    assert "Connected — heart rate live" in text
+    assert "Connected — no heart rate" in text
+    assert "Not connected" in text
+    # The behavioural notes.
+    assert "bpm" in text
+    assert "realtime" in text and "113" in text
+    assert "60 seconds" in text
+    assert "--lock-on-away" in text
+
+    w.guide_back_btn.click()
+    assert w.stack.currentIndex() == 0
     w.close()
 
 

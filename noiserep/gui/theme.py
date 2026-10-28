@@ -12,6 +12,8 @@ keyboard focus rings so focus is never conveyed by colour alone.
 """
 from __future__ import annotations
 
+import sys
+
 BG = "#FAFAF7"            # Ivory Light
 PANEL = "#FFFFFF"         # White
 PANEL_HOVER = "#F0F0EB"   # Ivory Medium
@@ -50,13 +52,45 @@ PALETTE = {
 FONT_FAMILY = ('"SF Pro Text", "Helvetica Neue", "Segoe UI", '
                'system-ui, sans-serif')
 
-QSS = f"""
+
+def is_macos(platform: str | None = None) -> bool:
+    """True when the app runs on macOS and AppKit should draw the controls.
+
+    ``platform`` is injectable so tests can exercise both branches without
+    leaving the host platform.
+    """
+    return (sys.platform if platform is None else platform) == "darwin"
+
+
+def build_qss(macos: bool | None = None) -> str:
+    """Return the window stylesheet for the host (or the requested) platform.
+
+    On macOS the date-range combo, its popup, menus and the Export control are
+    left entirely to AppKit: the only rules that mention them are omitted.
+    Other platforms keep the custom rounded look.  ``QSS`` below is the final
+    string for the host platform.
+    """
+    native = is_macos() if macos is None else macos
+
+    # Any bare QWidget rule also matches QComboBox/QToolButton and switches
+    # them to Qt's stylesheet renderer, losing AppKit's chrome.  On macOS it
+    # is omitted; the same text properties are still set on the concrete
+    # non-native widget types below.  Elsewhere the bare rule is what gives
+    # every page a transparent background.
+    widget_rule = (
+        "" if native else
+        f"QWidget {{ background: transparent; color: {FG}; "
+        f"font-size: 13px; }}"
+    )
+    root_rule = f"QMainWindow, QWidget#root {{ background: {BG}; }}"
+
+    qss = f"""
 * {{ font-family: {FONT_FAMILY}; }}
 
-QWidget {{ background: transparent; color: {FG}; font-size: 13px; }}
-QMainWindow, QWidget#root {{ background: {BG}; }}
+{widget_rule}
+{root_rule}
 
-QLabel {{ background: transparent; }}
+QLabel {{ background: transparent; color: {FG}; font-size: 13px; }}
 QLabel#muted {{ color: {FG_MUTED}; font-size: 12px; }}
 QLabel#hint {{ color: {FG_MUTED}; font-size: 12px; }}
 QLabel#status {{ color: {FG_MUTED}; font-size: 12px; }}
@@ -91,6 +125,8 @@ QLabel#statNumAccent {{ font-size: 26px; font-weight: 700; color: {ACCENT_DEEP};
 QLabel#statLabel {{ color: {FG_MUTED}; font-size: 10px; letter-spacing: 1.2px; }}
 QLabel#chipValue {{ font-size: 16px; font-weight: 600; color: {FG}; }}
 QLabel#chevron {{ font-size: 20px; color: {FG_MUTED}; }}
+QLabel#guideGlyph {{ font-size: 30px; color: {ACCENT}; }}
+QLabel#guideGlyphMuted {{ font-size: 30px; color: {FG_MUTED}; }}
 
 /* cards */
 QFrame#card {{ background: {PANEL}; border: 1px solid {BORDER};
@@ -132,8 +168,8 @@ QPushButton#errorDismiss:hover {{ background: {PANEL_HOVER}; }}
 QPushButton#errorDismiss:focus {{ border: 1px solid {FOCUS}; }}
 
 /* buttons */
-QPushButton {{ background: {PANEL}; color: {FG}; border: 1px solid {BORDER};
-    border-radius: 10px; padding: 8px 14px; }}
+QPushButton {{ background: {PANEL}; color: {FG}; font-size: 13px;
+    border: 1px solid {BORDER}; border-radius: 10px; padding: 8px 14px; }}
 QPushButton:hover {{ background: {PANEL_HOVER}; }}
 QPushButton:pressed {{ background: {BORDER}; }}
 QPushButton:disabled {{ color: {FG_MUTED}; background: {BG}; }}
@@ -149,12 +185,6 @@ QPushButton#primary:disabled {{ background: {PANEL_HOVER};
     border-color: {BORDER}; color: {FG_MUTED}; }}
 QPushButton#primary:focus {{ border: 2px solid {FOCUS}; }}
 
-QToolButton#ghost {{ background: transparent; color: {FG}; border: 1px solid {BORDER};
-    border-radius: 10px; padding: 7px 13px; }}
-QToolButton#ghost:hover {{ background: {PANEL_HOVER}; }}
-QToolButton#ghost:focus {{ border: 2px solid {FOCUS}; }}
-QToolButton#ghost::menu-indicator {{ image: none; width: 0; }}
-
 QPushButton#backBtn {{ background: transparent; border: 1px solid transparent;
     color: {FG}; padding: 6px 12px; text-align: left; border-radius: 9px;
     font-size: 14px; }}
@@ -166,17 +196,17 @@ QPushButton#linkBtn {{ background: transparent; border: 1px solid transparent;
 QPushButton#linkBtn:hover {{ color: {ACCENT_DEEP_HOVER}; }}
 QPushButton#linkBtn:focus {{ border: 1px solid {FOCUS}; }}
 
-/* inputs */
+"""
+
+    if not native:
+        qss += f"""
+/* menus and dropdowns: AppKit draws these on macOS */
 QMenu {{ background: {PANEL}; border: 1px solid {BORDER}; padding: 5px;
     border-radius: 10px; }}
 QMenu::item {{ padding: 7px 24px 7px 14px; border-radius: 7px; color: {FG}; }}
 QMenu::item:selected {{ background: {PANEL_HOVER}; }}
 QMenu::separator {{ height: 1px; background: {BORDER}; margin: 4px 8px; }}
 
-QDateEdit {{ background: {PANEL}; color: {FG}; border: 1px solid {BORDER};
-    border-radius: 9px; padding: 6px 9px; }}
-QDateEdit:focus {{ border: 2px solid {FOCUS}; }}
-QDateEdit::drop-down {{ border: none; width: 20px; }}
 QComboBox {{ background: {PANEL}; color: {FG}; border: 1px solid {BORDER};
     border-radius: 10px; padding: 6px 9px; min-height: 20px; }}
 QComboBox:focus {{ border: 2px solid {FOCUS}; }}
@@ -184,6 +214,21 @@ QComboBox::drop-down {{ border: none; width: 22px; }}
 QComboBox QAbstractItemView {{ background: {PANEL}; color: {FG};
     selection-background-color: {PANEL_HOVER}; border: 1px solid {BORDER};
     outline: 0; padding: 3px; }}
+
+/* the Export menu button gets a custom frame only off macOS */
+QToolButton#ghost {{ background: transparent; color: {FG};
+    border: 1px solid {BORDER}; border-radius: 10px; padding: 7px 13px; }}
+QToolButton#ghost:hover {{ background: {PANEL_HOVER}; }}
+QToolButton#ghost:focus {{ border: 2px solid {FOCUS}; }}
+QToolButton#ghost::menu-indicator {{ image: none; width: 0; }}
+"""
+
+    # The From/To date row keeps its custom look on every platform.
+    qss += f"""
+QDateEdit {{ background: {PANEL}; color: {FG}; font-size: 13px;
+    border: 1px solid {BORDER}; border-radius: 9px; padding: 6px 9px; }}
+QDateEdit:focus {{ border: 2px solid {FOCUS}; }}
+QDateEdit::drop-down {{ border: none; width: 20px; }}
 
 /* scrolling */
 QScrollArea {{ border: none; background: transparent; }}
@@ -197,11 +242,16 @@ QScrollBar:horizontal {{ background: transparent; height: 9px; margin: 0; }}
 QScrollBar::handle:horizontal {{ background: {BORDER}; border-radius: 4px;
     min-width: 24px; }}
 QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{ width: 0; }}
-QToolTip {{ background: {PANEL}; color: {FG}; border: 1px solid {BORDER};
-    padding: 5px 7px; }}
+QToolTip {{ background: {PANEL}; color: {FG}; font-size: 13px;
+    border: 1px solid {BORDER}; padding: 5px 7px; }}
 
 /* progress */
 QProgressBar {{ background: {PANEL_HOVER}; border: none; border-radius: 2px;
     min-height: 4px; max-height: 4px; }}
 QProgressBar::chunk {{ background: {ACCENT}; border-radius: 2px; }}
 """
+    return qss
+
+
+#: Final stylesheet for the host platform.
+QSS = build_qss()

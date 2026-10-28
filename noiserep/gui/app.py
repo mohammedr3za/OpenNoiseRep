@@ -501,6 +501,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.stack.addWidget(self._build_overview())      # index 0
         self.stack.addWidget(self._build_detail())        # index 1
         self.stack.addWidget(self._build_sleep_detail())  # index 2
+        self.guide_page = self._build_guide()
+        self.stack.addWidget(self.guide_page)             # index 3
         outer.addWidget(self.stack, 1)
 
         self._install_shortcuts()
@@ -551,17 +553,26 @@ class MainWindow(QtWidgets.QMainWindow):
         h.addWidget(pill)
         h.addStretch(1)
 
+        # QComboBox is native AppKit on macOS (theme.QSS omits its styling
+        # there); the explicit height keeps it aligned with the app bar.
         self.range_combo = QtWidgets.QComboBox()
         for _, text in RANGE_MODES:
             self.range_combo.addItem(text)
         self.range_combo.setAccessibleName("Date range")
         self.range_combo.setToolTip("Choose the period shown")
+        self.range_combo.setMinimumHeight(32)
         self.range_combo.currentIndexChanged.connect(self._on_range_mode_changed)
         h.addWidget(self.range_combo)
 
+        # A QToolButton whose "ghost" frame exists only off macOS.  QPushButton
+        # would inherit the app's custom rounded QPushButton rule, so on macOS
+        # this stays a style-free tool button and AppKit draws it natively.
         self.export_menu_btn = QtWidgets.QToolButton()
         self.export_menu_btn.setObjectName("ghost")
-        self.export_menu_btn.setText("Export ▾")
+        self.export_menu_btn.setToolButtonStyle(
+            QtCore.Qt.ToolButtonStyle.ToolButtonTextOnly)
+        self.export_menu_btn.setText(
+            "Export" if theme.is_macos() else "Export ▾")
         self.export_menu_btn.setToolTip(
             f"Export CSV ({_shortcut_label('Ctrl+E')})")
         self.export_menu_btn.setAccessibleName("Export data")
@@ -585,6 +596,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.live_btn.setAccessibleName("Open live heart rate in the menu bar")
         self.live_btn.clicked.connect(self._launch_menubar)
         h.addWidget(self.live_btn)
+
+        self.guide_btn = QtWidgets.QPushButton("? Icon guide")
+        self.guide_btn.setObjectName("ghost")
+        self.guide_btn.setMinimumHeight(36)
+        self.guide_btn.setToolTip("How to read the menu-bar heart icon")
+        self.guide_btn.setAccessibleName("Menu-bar icon guide")
+        self.guide_btn.clicked.connect(self._show_guide)
+        h.addWidget(self.guide_btn)
 
         self.sync_btn = QtWidgets.QPushButton("Sync band")
         self.sync_btn.setObjectName("primary")
@@ -1496,6 +1515,117 @@ class MainWindow(QtWidgets.QMainWindow):
         lay.addStretch(1)
         return scroll
 
+    # -- menu-bar icon guide ---------------------------------------------
+    def _build_guide(self) -> QtWidgets.QWidget:
+        scroll, _inner, lay = self._make_page()
+
+        header = QtWidgets.QWidget()
+        h = QtWidgets.QHBoxLayout(header)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(8)
+        self.guide_back_btn = QtWidgets.QPushButton("‹  Back")
+        self.guide_back_btn.setObjectName("backBtn")
+        self.guide_back_btn.setCursor(QtCore.Qt.PointingHandCursor)
+        self.guide_back_btn.setFixedWidth(110)
+        self.guide_back_btn.setMinimumHeight(36)
+        self.guide_back_btn.setAccessibleName("Back to overview")
+        self.guide_back_btn.clicked.connect(self._show_overview)
+        h.addWidget(self.guide_back_btn, 0, QtCore.Qt.AlignLeft)
+        h.addStretch(1)
+        center = QtWidgets.QVBoxLayout()
+        center.setSpacing(1)
+        title = QtWidgets.QLabel("Menu-bar icon guide")
+        title.setObjectName("metricTitle")
+        title.setAlignment(QtCore.Qt.AlignCenter)
+        sub = QtWidgets.QLabel(
+            "The Live HR app sits in the macOS menu bar and shows the band's "
+            "state as a heart and a value.")
+        sub.setObjectName("rangeLabel")
+        sub.setAlignment(QtCore.Qt.AlignCenter)
+        sub.setWordWrap(True)
+        sub.setMinimumWidth(420)
+        center.addWidget(title)
+        center.addWidget(sub)
+        h.addLayout(center)
+        h.addStretch(1)
+        spacer = QtWidgets.QWidget()
+        spacer.setFixedWidth(110)
+        h.addWidget(spacer)
+        lay.addWidget(header)
+
+        states = [
+            ("♥ 72", "guideGlyph",
+             "Connected — heart rate live",
+             "The band is connected and a heart rate is being read (worn). "
+             "The number is the current beats per minute."),
+            ("♡ ~", "guideGlyphMuted",
+             "Connected — no heart rate",
+             "The band is connected but no heart rate is available: it may be "
+             "off the wrist, removed, or the sensor has no reading yet."),
+            ("♡ —", "guideGlyphMuted",
+             "Not connected",
+             "The band is not connected: asleep or off its charger, out of "
+             "range, or the phone is holding the BLE link."),
+        ]
+        for glyph, glyph_obj, state, detail in states:
+            lay.addWidget(
+                self._guide_state_card(glyph, glyph_obj, state, detail))
+
+        notes_label = QtWidgets.QLabel("NOTES")
+        notes_label.setObjectName("sectionLabel")
+        lay.addWidget(notes_label)
+        notes = QtWidgets.QFrame()
+        notes.setObjectName("card")
+        nv = QtWidgets.QVBoxLayout(notes)
+        nv.setContentsMargins(20, 14, 20, 14)
+        nv.setSpacing(7)
+        for line in (
+            "The number is bpm — beats per minute.",
+            "The app tries the realtime stream first; when that is unavailable "
+            "or goes silent, it polls the confirmed 113 heart-rate series.",
+            "A failed connection retries every 60 seconds.",
+            "Run the menu-bar app with --lock-on-away to lock the Mac after "
+            "the band disconnects.",
+        ):
+            label = QtWidgets.QLabel(line)
+            label.setObjectName("muted")
+            label.setWordWrap(True)
+            nv.addWidget(label)
+        lay.addWidget(notes)
+        lay.addStretch(1)
+        return scroll
+
+    def _guide_state_card(self, glyph: str, glyph_obj: str, state: str,
+                          detail: str) -> QtWidgets.QWidget:
+        card = QtWidgets.QFrame()
+        card.setObjectName("card")
+        card.setAccessibleName(f"{state}: {glyph}")
+        h = QtWidgets.QHBoxLayout(card)
+        h.setContentsMargins(20, 14, 20, 14)
+        h.setSpacing(16)
+        preview = QtWidgets.QLabel(glyph)
+        preview.setObjectName(glyph_obj)
+        preview.setFixedWidth(92)
+        preview.setMinimumHeight(46)
+        preview.setAlignment(QtCore.Qt.AlignCenter)
+        h.addWidget(preview)
+        v = QtWidgets.QVBoxLayout()
+        v.setSpacing(3)
+        state_label = QtWidgets.QLabel(state)
+        state_label.setObjectName("chipValue")
+        body = QtWidgets.QLabel(detail)
+        body.setObjectName("muted")
+        body.setWordWrap(True)
+        v.addWidget(state_label)
+        v.addWidget(body)
+        h.addLayout(v, 1)
+        _add_shadow(card)
+        return card
+
+    def _show_guide(self) -> None:
+        self.stack.setCurrentWidget(self.guide_page)
+        self.guide_back_btn.setFocus(QtCore.Qt.OtherFocusReason)
+
     def _open_sleep_detail(self, session: dict) -> None:
         bedtime = session.get("bedtime")
         wake = session.get("wake")
@@ -1923,7 +2053,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._shortcuts.append(shortcut)
 
     def _on_escape(self) -> None:
-        if self.stack.currentIndex() == 1:
+        if self.stack.currentIndex() != 0:
             self._show_overview()
 
     # ------------------------------------------------------------------
