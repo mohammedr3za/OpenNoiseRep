@@ -162,6 +162,10 @@ Live heart rate in the menu bar (experimental; band awake, phone Bluetooth off):
 noiserep menubar --poll 30
 ```
 
+The desktop app also has a **♥ Live** button in its top bar that opens this
+menu-bar app and tells you if it is already running. It is separate because the
+band accepts one BLE central at a time.
+
 Vibrate the band (experimental **write**, opt-in, never used by sync/GUI):
 
 ```sh

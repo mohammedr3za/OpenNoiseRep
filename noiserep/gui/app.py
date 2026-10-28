@@ -17,6 +17,7 @@ import datetime
 import inspect
 import math
 import os
+import subprocess
 import sys
 
 import pyqtgraph as pg
@@ -574,6 +575,16 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QToolButton.ToolButtonPopupMode.InstantPopup)
         self.export_menu_btn.setMinimumHeight(36)
         h.addWidget(self.export_menu_btn)
+
+        self.live_btn = QtWidgets.QPushButton("♥ Live")
+        self.live_btn.setObjectName("ghost")
+        self.live_btn.setMinimumHeight(36)
+        self.live_btn.setToolTip(
+            "Open live heart rate in the macOS menu bar (separate app; the "
+            "band accepts one central)")
+        self.live_btn.setAccessibleName("Open live heart rate in the menu bar")
+        self.live_btn.clicked.connect(self._launch_menubar)
+        h.addWidget(self.live_btn)
 
         self.sync_btn = QtWidgets.QPushButton("Sync band")
         self.sync_btn.setObjectName("primary")
@@ -1853,6 +1864,32 @@ class MainWindow(QtWidgets.QMainWindow):
     # ------------------------------------------------------------------
     # banner helpers
     # ------------------------------------------------------------------
+    def _launch_menubar(self) -> None:
+        """Open the separate menu-bar HR app, or say it is already running."""
+        if self._menubar_running():
+            self._set_status("Live HR is already in the menu bar (♥ icon).")
+            return
+        try:
+            subprocess.Popen(
+                [sys.executable, "-m", "noiserep.cli", "menubar"],
+                start_new_session=True)
+        except OSError as exc:
+            self._show_error(f"Could not open the menu-bar app: {exc}")
+            return
+        self._set_status(
+            "Live HR opened in the menu bar. It runs separately because the "
+            "band accepts one BLE central.")
+
+    @staticmethod
+    def _menubar_running() -> bool:
+        try:
+            proc = subprocess.run(
+                ["pgrep", "-f", "noiserep.cli menubar"],
+                capture_output=True)
+            return proc.returncode == 0
+        except OSError:
+            return False
+
     def _set_status(self, text: str) -> None:
         self.status.setText(text)
         self.info_banner.show()
