@@ -54,23 +54,7 @@ def format_title(bpm: int | None, connected: bool,
     return f"♥ {int(bpm)}"
 
 
-def make_icon(connected: bool, bpm: int | None = None,
-              removed: bool = False, size: int = 22) -> QtGui.QIcon:
-    """A monochrome heart + number template, drawn with QPainter.
-
-    macOS shows only the tray *icon*, not ``setTitle`` text, so the number is
-    painted beside the heart. The heart is filled only while a real BPM is
-    known; when the band is off-wrist it is outlined and the label is ``~``.
-    ``setIsMask`` makes macOS treat it as a template image that adapts to the
-    menu bar's light/dark appearance.
-    """
-    ratio = 2
-    width = size + 44
-    pix = QtGui.QPixmap(width * ratio, size * ratio)
-    pix.setDevicePixelRatio(ratio)
-    pix.fill(QtCore.Qt.transparent)
-    painter = QtGui.QPainter(pix)
-    painter.setRenderHint(QtGui.QPainter.Antialiasing)
+def _heart_path(size: float) -> QtGui.QPainterPath:
     s = float(size)
     path = QtGui.QPainterPath()
     path.moveTo(s * 0.50, s * 0.88)
@@ -79,6 +63,46 @@ def make_icon(connected: bool, bpm: int | None = None,
     path.cubicTo(s * 0.52, s * 0.23, s * 0.62, s * 0.16, s * 0.75, s * 0.24)
     path.cubicTo(s * 0.92, s * 0.34, s * 0.90, s * 0.58, s * 0.50, s * 0.88)
     path.closeSubpath()
+    return path
+
+
+def make_heart_pixmap(filled: bool, size: int = 22,
+                      ratio: int = 1) -> QtGui.QPixmap:
+    """A square heart pixmap for the native macOS status item.
+
+    Keeping this square is important: a wide image is scaled down by Qt's tray
+    icon sizing and the heart ends up tiny.
+    """
+    pix = QtGui.QPixmap(size * ratio, size * ratio)
+    pix.setDevicePixelRatio(ratio)
+    pix.fill(QtCore.Qt.transparent)
+    painter = QtGui.QPainter(pix)
+    painter.setRenderHint(QtGui.QPainter.Antialiasing)
+    if filled:
+        painter.setPen(QtCore.Qt.NoPen)
+        painter.setBrush(QtGui.QColor(0, 0, 0))
+    else:
+        painter.setBrush(QtCore.Qt.NoBrush)
+        painter.setPen(QtGui.QPen(QtGui.QColor(0, 0, 0, 170), 1.6))
+    painter.drawPath(_heart_path(size))
+    painter.end()
+    return pix
+
+
+def make_icon(connected: bool, bpm: int | None = None,
+              removed: bool = False, size: int = 22) -> QtGui.QIcon:
+    """A wide heart+number icon for non-macOS trays and tests.
+
+    macOS uses a native status item (image + title) instead, because Qt scales
+    a wide tray pixmap down and shrinks the heart.
+    """
+    ratio = 2
+    width = size + 44
+    pix = QtGui.QPixmap(width * ratio, size * ratio)
+    pix.setDevicePixelRatio(ratio)
+    pix.fill(QtCore.Qt.transparent)
+    painter = QtGui.QPainter(pix)
+    painter.setRenderHint(QtGui.QPainter.Antialiasing)
 
     filled = connected and bpm is not None
     if filled:
@@ -87,7 +111,7 @@ def make_icon(connected: bool, bpm: int | None = None,
     else:
         painter.setBrush(QtCore.Qt.NoBrush)
         painter.setPen(QtGui.QPen(QtGui.QColor(0, 0, 0, 170), 1.6))
-    painter.drawPath(path)
+    painter.drawPath(_heart_path(size))
 
     label = (str(int(bpm)) if filled else
              ("~" if removed else "—"))
@@ -97,13 +121,13 @@ def make_icon(connected: bool, bpm: int | None = None,
     painter.setFont(font)
     painter.setPen(QtGui.QColor(0, 0, 0))
     painter.drawText(
-        QtCore.QRectF(s + 3, 0, width - s - 3, s),
+        QtCore.QRectF(size + 3, 0, width - size - 3, size),
         QtCore.Qt.AlignVCenter | QtCore.Qt.AlignLeft, label)
     painter.end()
 
     icon = QtGui.QIcon(pix)
     if hasattr(icon, "setIsMask"):
-        icon.setIsMask(True)          # macOS template rendering
+        icon.setIsMask(True)          # template rendering
     return icon
 
 
@@ -162,11 +186,95 @@ class MenubarApp(QtCore.QObject):
 
         self._build_menu()
         self.tray: QtWidgets.QSystemTrayIcon | None = None
-        if with_tray and QtWidgets.QSystemTrayIcon.isSystemTrayAvailable():
-            self.tray = QtWidgets.QSystemTrayIcon(make_icon(False), self)
+        self._status_item = None
+        self._status_button = None
+        self._status_target = None
+        self._native_images: dict[bool, object] = {}
+        if with_tray:
+            self._create_tray()
+        self._render(force=True)
+
+    def _create_tray(self) -> None:
+        """Prefer a native macOS status item so the heart keeps its size.
+
+        Qt scales a wide QSystemTrayIcon pixmap down; a native item uses a
+        square 22 px image plus a separate text title, exactly like a normal
+        macOS menu-bar app.
+        """
+        if sys.platform == "darwin":
+            try:
+                self._create_native_status_item()
+                return
+            except Exception:            # no AppKit / no GUI session
+                pass
+        if QtWidgets.QSystemTrayIcon.isSystemTrayAvailable():
+            self.tray = QtWidgets.QSystemTrayIcon(
+                make_icon(False), self)
             self.tray.setContextMenu(self.menu)
             self.tray.activated.connect(self._on_tray_activated)
-        self._render(force=True)
+
+    def _create_native_status_item(self) -> None:
+        import objc
+        from AppKit import (
+            NSFont, NSImage, NSImageLeft, NSObject, NSStatusBar,
+            NSVariableStatusItemLength,
+        )
+
+        class _Target(NSObject):
+            def initWithApp_(self, app):
+                self = objc.super(_Target, self).init()
+                if self is None:
+                    return None
+                self._app = app
+                return self
+
+            def showMenu_(self, sender):
+                QtCore.QTimer.singleShot(0, self._app._popup_menu)
+
+        item = NSStatusBar.systemStatusBar().statusItemWithLength_(
+            NSVariableStatusItemLength)
+        button = item.button()
+        button.setImagePosition_(NSImageLeft)
+        button.setFont_(NSFont.menuBarFontOfSize_(0))
+        button.setToolTip_("NoiseREP")
+        self._status_target = _Target.alloc().initWithApp_(self)
+        button.setTarget_(self._status_target)
+        button.setAction_("showMenu:")
+        self._status_item = item
+        self._status_button = button
+        item.setVisible_(True)
+
+    def _popup_menu(self) -> None:
+        self.menu.popup(QtGui.QCursor.pos())
+
+    def _native_image(self, filled: bool):
+        key = bool(filled)
+        if key in self._native_images:
+            return self._native_images[key]
+        from AppKit import NSImage
+        from Foundation import NSData
+
+        pix = make_heart_pixmap(filled, 22, 1)
+        buffer = QtCore.QBuffer()
+        buffer.open(QtCore.QIODevice.WriteOnly)
+        pix.save(buffer, "PNG")
+        data = bytes(buffer.data())
+        nsdata = NSData.dataWithBytes_length_(data, len(data))
+        image = NSImage.alloc().initWithData_(nsdata)
+        image.setSize_((22.0, 22.0))
+        image.setTemplate_(True)
+        self._native_images[key] = image
+        return image
+
+    def _update_native_status(self) -> None:
+        if self._status_item is None or self._status_button is None:
+            return
+        filled = self._connected and self._hr is not None
+        label = (str(self._hr) if filled else
+                 ("~" if self._connected and self._removed else "—"))
+        self._status_button.setTitle_(label)
+        self._status_button.setImage_(self._native_image(filled))
+        self._status_button.setToolTip_(self._tooltip())
 
     # -- menu ------------------------------------------------------------
     def _build_menu(self) -> None:
@@ -258,6 +366,8 @@ class MenubarApp(QtCore.QObject):
         self.sync_action.setEnabled(self._connected and not self._syncing)
         self.quit_action.setEnabled(not self._quitting)
 
+        if self._status_item is not None:
+            self._update_native_status()
         if self.tray is not None:
             self.tray.setIcon(
                 make_icon(self._connected, self._hr, self._removed))
@@ -353,7 +463,9 @@ class MenubarApp(QtCore.QObject):
 
     # -- lifecycle -------------------------------------------------------
     def start(self) -> None:
-        if self.tray is not None:
+        if self._status_item is not None:
+            self._status_item.setVisible_(True)
+        elif self.tray is not None:
             self.tray.show()
         self._render(force=True)
         self.connect()
@@ -646,6 +758,8 @@ class MenubarApp(QtCore.QObject):
             self.store.close()
         except Exception:
             pass
+        if self._status_item is not None:
+            self._status_item.setVisible_(False)
         if self.tray is not None:
             self.tray.hide()
         self.app.quit()
@@ -667,7 +781,7 @@ def main(argv: list[str] | None = None, band_name: str | None = None,
                          poll_seconds=poll_seconds,
                          lock_on_away=lock_on_away,
                          away_seconds=away_seconds)
-    if menubar.tray is None:
+    if menubar.tray is None and menubar._status_item is None:
         print("menubar: no system tray available on this desktop", file=sys.stderr)
         return 1
     menubar.start()
