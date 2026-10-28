@@ -24,6 +24,7 @@ import qasync
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from . import theme
+from .. import analytics
 from ..export import export_csv, export_json
 from ..store import Store, default_db_path
 
@@ -810,6 +811,9 @@ class MainWindow(QtWidgets.QMainWindow):
         sleep = self._maybe_sleep_card(start, end)
         if sleep is not None:
             self.ov_body.addWidget(sleep)
+        workouts = self._workouts_section()
+        if workouts is not None:
+            self.ov_body.addWidget(workouts)
 
         others = [m for m in metrics if m != hero]
         if others:
@@ -935,12 +939,11 @@ class MainWindow(QtWidgets.QMainWindow):
         return self._stat_cards_row(specs)
 
     def _maybe_sleep_card(self, start, end):
-        """Render a sleep summary only if the store exposes a usable API.
+        """Last night's rest, from RRI or a real sleep file.
 
-        The sleep store is being added by a separate workstream; its exact
-        return shape is not fixed yet, so this stays strictly optional and
-        tolerates dicts, dataclasses and missing/extra arguments.  Anything
-        unparseable is ignored rather than guessed.
+        A session is shown only when the store has one.  The sub-label and
+        insight text distinguish an RRI-derived rest span from a staged sleep
+        file, so the numbers are never presented as more than they are.
         """
         self.sleep_card = None
         self.sleep_summary = None
@@ -949,100 +952,150 @@ class MainWindow(QtWidgets.QMainWindow):
             return None
         try:
             sessions = fn(start, end)
-        except TypeError:
-            try:
-                sessions = fn()
-            except Exception:  # noqa: BLE001
-                return None
         except Exception:  # noqa: BLE001
             return None
-        if inspect.isawaitable(sessions):
-            close = getattr(sessions, "close", None)
-            if close:
-                close()
-            return None
-        if isinstance(sessions, dict):
-            for key in ("sessions", "items", "data", "records"):
-                value = sessions.get(key)
-                if isinstance(value, (list, tuple)):
-                    sessions = value
-                    break
-            else:
-                sessions = [sessions]
+        sessions = [s for s in (sessions or []) if isinstance(s, dict)]
         if not sessions:
             return None
+        session = max(
+            sessions, key=lambda s: s.get("wake") or datetime.datetime.min)
+        bedtime = session.get("bedtime")
+        wake = session.get("wake")
+        total_min = session.get("total_min")
+        if not (bedtime and wake and total_min):
+            return None
 
-        total_min = 0.0
-        count = 0
+        summary = None
         try:
-            iterator = list(sessions)
-        except TypeError:
-            return None
-        for session in iterator:
-            if isinstance(session, dict):
-                data = session
-            else:
-                # Dataclasses/objects (including slotted ones) are read by
-                # attribute rather than requiring a __dict__.
-                data = {key: getattr(session, key)
-                        for key in ("duration_min", "duration_minutes",
-                                    "minutes", "duration", "start",
-                                    "start_time", "started", "end",
-                                    "end_time", "ended")
-                        if hasattr(session, key)}
-            if not isinstance(data, dict):
-                continue
-            minutes = None
-            for key in ("duration_min", "duration_minutes", "minutes",
-                        "duration"):
-                value = data.get(key)
-                if isinstance(value, (int, float)):
-                    minutes = float(value)
-                    break
-            if minutes is None:
-                a = (data.get("start") or data.get("start_time")
-                     or data.get("started"))
-                b = (data.get("end") or data.get("end_time")
-                     or data.get("ended"))
-                if (isinstance(a, datetime.datetime)
-                        and isinstance(b, datetime.datetime)):
-                    minutes = (b - a).total_seconds() / 60
-            if minutes and minutes > 0:
-                total_min += minutes
-                count += 1
-        if total_min <= 0:
-            return None
+            summary = self.store.rest_summary(bedtime, wake)
+        except Exception:  # noqa: BLE001
+            pass
 
-        card = QtWidgets.QFrame()
-        card.setObjectName("statCard")
-        h = QtWidgets.QHBoxLayout(card)
-        h.setContentsMargins(22, 16, 22, 16)
-        h.setSpacing(14)
-        glyph = QtWidgets.QLabel("☾")
-        glyph.setAlignment(QtCore.Qt.AlignCenter)
-        glyph.setFixedWidth(30)
-        glyph.setStyleSheet(
-            f"font-size: 22px; color: {theme.ACCENT}; background: transparent;")
-        h.addWidget(glyph, 0, QtCore.Qt.AlignVCenter)
-        v = QtWidgets.QVBoxLayout()
-        v.setSpacing(2)
-        cap = QtWidgets.QLabel("SLEEP")
-        cap.setObjectName("statLabel")
+        frame = QtWidgets.QFrame()
+        frame.setObjectName("card")
+        v = QtWidgets.QVBoxLayout(frame)
+        v.setContentsMargins(22, 16, 22, 16)
+        v.setSpacing(8)
+
+        head = QtWidgets.QHBoxLayout()
+        cap = QtWidgets.QLabel("LAST NIGHT")
+        cap.setObjectName("sectionLabel")
+        head.addWidget(cap)
+        head.addStretch(1)
+        source = session.get("source") or ""
+        badge = QtWidgets.QLabel(
+            "from RRI" if source == "rri" else
+            ("sleep file" if source else ""))
+        badge.setObjectName("muted")
+        head.addWidget(badge)
+        v.addLayout(head)
+
+        row = QtWidgets.QHBoxLayout()
+        row.setSpacing(16)
         value = QtWidgets.QLabel(_fmt_span(total_min * 60))
         value.setObjectName("statNum")
         self.sleep_summary = value
-        sub = QtWidgets.QLabel(
-            f"{count} session{'' if count == 1 else 's'} recorded in this period")
+        row.addWidget(value, 0, QtCore.Qt.AlignBottom)
+        sub = QtWidgets.QLabel(f"{bedtime:%H:%M} – {wake:%H:%M}")
         sub.setObjectName("muted")
-        v.addWidget(cap)
-        v.addWidget(value)
-        v.addWidget(sub)
-        h.addLayout(v, 1)
+        row.addWidget(sub, 0, QtCore.Qt.AlignBottom)
+        row.addStretch(1)
+        v.addLayout(row)
+
+        if summary is not None:
+            chips = QtWidgets.QHBoxLayout()
+            chips.setSpacing(26)
+            for label, val in (
+                ("AVG", f"{summary.avg_hr:.0f} bpm" if summary.avg_hr else "—"),
+                ("HRV", f"{summary.rmssd_ms:.0f} ms" if summary.rmssd_ms else "—"),
+                ("COVERAGE", f"{summary.coverage_pct:.0f}%"
+                 if summary.coverage_pct is not None else "—"),
+            ):
+                cell = QtWidgets.QVBoxLayout()
+                cell.setSpacing(1)
+                num = QtWidgets.QLabel(val)
+                num.setObjectName("chipValue")
+                lab = QtWidgets.QLabel(label)
+                lab.setObjectName("statLabel")
+                cell.addWidget(num)
+                cell.addWidget(lab)
+                chips.addLayout(cell)
+            chips.addStretch(1)
+            v.addLayout(chips)
+            notes = analytics.insights(summary)
+            for line in notes[1:3]:
+                note = QtWidgets.QLabel(line)
+                note.setObjectName("muted")
+                note.setWordWrap(True)
+                v.addWidget(note)
+            if len(notes) > 3:
+                caveat = QtWidgets.QLabel(notes[3])
+                caveat.setObjectName("muted")
+                caveat.setWordWrap(True)
+                v.addWidget(caveat)
+        else:
+            hint = QtWidgets.QLabel("No RRI beats recorded in this window.")
+            hint.setObjectName("muted")
+            v.addWidget(hint)
+
+        _add_shadow(frame)
+        self.sleep_card = frame
+        frame.setAccessibleName(
+            f"Last night: {_fmt_span(total_min * 60)} from {bedtime:%H:%M} "
+            f"to {wake:%H:%M}")
+        return frame
+
+    def _workouts_section(self):
+        """Where workouts will appear; says so plainly when none arrived."""
+        fn = getattr(self.store, "workouts", None)
+        if fn is None:
+            return None
+        try:
+            workouts = fn()
+        except Exception:  # noqa: BLE001
+            return None
+
+        wrap = QtWidgets.QWidget()
+        outer = QtWidgets.QVBoxLayout(wrap)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(8)
+        label = QtWidgets.QLabel("WORKOUTS")
+        label.setObjectName("sectionLabel")
+        outer.addWidget(label)
+
+        card = QtWidgets.QFrame()
+        card.setObjectName("card")
+        v = QtWidgets.QVBoxLayout(card)
+        v.setContentsMargins(20, 14, 20, 14)
+        v.setSpacing(4)
+        if workouts:
+            for workout in workouts[:6]:
+                when = workout.get("time")
+                row = QtWidgets.QHBoxLayout()
+                name = QtWidgets.QLabel(workout.get("id") or "Workout")
+                name.setObjectName("chipValue")
+                row.addWidget(name)
+                row.addStretch(1)
+                meta = QtWidgets.QLabel(
+                    f"{when:%d %b, %H:%M} · {workout.get('size', 0):,} bytes"
+                    if when else f"{workout.get('size', 0):,} bytes")
+                meta.setObjectName("muted")
+                row.addWidget(meta)
+                v.addLayout(row)
+        else:
+            title = QtWidgets.QLabel("No workouts received")
+            title.setObjectName("chipValue")
+            v.addWidget(title)
+            hint = QtWidgets.QLabel(
+                "This band's sync has only pushed RRI files so far. Record a "
+                "workout on the band and sync again; sport files will appear "
+                "here when the band sends them.")
+            hint.setObjectName("muted")
+            hint.setWordWrap(True)
+            v.addWidget(hint)
         _add_shadow(card)
-        self.sleep_card = card
-        self.sleep_card.setAccessibleName(
-            f"Sleep: {_fmt_span(total_min * 60)}, {count} sessions")
-        return card
+        outer.addWidget(card)
+        return wrap
 
     def _stat_cards_row(self, specs) -> QtWidgets.QWidget:
         row = QtWidgets.QWidget()

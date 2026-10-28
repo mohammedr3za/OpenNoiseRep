@@ -111,6 +111,28 @@ new capture.
 With no `start` the decoder still returns intervals; only their absolute
 timestamps are `None`. The store skips timestamp-less RRI samples.
 
+## Rest summary from RRI
+
+`noiserep/analytics.py` turns RRI samples into a rest summary without inventing
+sleep stages:
+
+- Beats are grouped into windows; a silence longer than **30 minutes** splits a
+  window, and windows shorter than **30 minutes** are ignored.
+- `RestSummary` reports the span (`start`, `end`, `duration_min`), beat count,
+  average heart rate, 5th/95th-percentile heart rate, RMSSD, SDNN, pNN50, and
+  beat coverage (sum of RR intervals ÷ span).
+- Heart-rate/HRV statistics drop intervals outside 300–2000 ms and successive
+  differences above 200 ms, so one artifact cannot dominate.
+- The store derives one `sleep_sessions` row with `source='rri'` from the
+  longest window and refreshes it on ingest/open. A real sleep-file session is
+  never overwritten.
+- Interpretations are descriptive ("HRV is most useful against your own
+  baseline"), not medical.
+
+The GUI shows this as **Last Night … from RRI**, with the duration, bedtime/wake,
+average HR, HRV and coverage. Workouts have a separate section and stay empty
+until the band pushes a sport/workout file.
+
 ## Sleep files
 
 `decode_sleep()` recognises the two layouts implemented by Gadgetbridge for

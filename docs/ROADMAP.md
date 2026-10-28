@@ -139,6 +139,14 @@ test it on a spare band, and never delete after reading.
 HRV is computed and tested; sleep is either evidenced in `PROTOCOL.md` or
 explicitly out of scope.
 
+**Status (2026-10-28).** RRI is decoded (`protocol/files.py`, validated against
+the vendor capture), HRV is computed (`analytics.py`), and the app shows an
+RRI-derived **Last Night** rest span with HR, HRV and coverage. No staged sleep
+file has arrived; no workout/sport file has arrived either. The GUI has an
+explicit empty Workouts section and will list sport files if the band sends
+them. Remaining: a real sleep/staged file, workout-file evidence, and a
+vendor-app cross-check of the inferred millisecond unit.
+
 ---
 
 ## P1 — Ship it and make it a habit

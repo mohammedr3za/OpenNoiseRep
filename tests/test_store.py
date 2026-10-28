@@ -39,6 +39,36 @@ def test_reingest_is_idempotent():
     assert s.last_sync() is not None               # but each sync is logged
 
 
+def test_ingest_stores_one_assembled_file_not_the_last_chunk():
+    name = "2026-10-28-0108_RRI_Data.bin.txt"
+    r = SyncResult()
+    r.files = [DeviceFile(name, b"AAA", 0),
+               DeviceFile(name, b"BBB", 1),
+               DeviceFile(name, b"CC", 2)]
+    s = Store(":memory:")
+    counts = s.ingest(r)
+    assert counts["files"] == 1
+    row = s._conn.execute(
+        "SELECT raw FROM activity_files WHERE id=?", (name,)).fetchone()
+    assert row[0] == b"AAABBBCC"
+    s.close()
+
+
+def test_ingest_derives_a_rest_session_from_rri():
+    base = datetime.datetime(2026, 10, 28, 2, 0, 0)
+    samples = [RriSample(i, 800, base + datetime.timedelta(seconds=i))
+               for i in range(2400)]          # 40 minutes, above the 30-min floor
+    r = SyncResult()
+    r.rri = [RriFile(start=base, samples=samples, total_slots=2400)]
+    s = Store(":memory:")
+    s.ingest(r)
+    sessions = s.sleep_sessions()
+    assert len(sessions) == 1
+    assert sessions[0]["source"] == "rri"
+    assert sessions[0]["total_min"] >= 39
+    s.close()
+
+
 def test_legacy_metric_keys_are_migrated(tmp_path):
     path = str(tmp_path / "legacy.db")
     s = Store(path)

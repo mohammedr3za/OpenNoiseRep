@@ -35,6 +35,7 @@ import sqlite3
 import sys
 import time
 
+from ..protocol.files import assemble_activity_files
 from ..protocol.metrics import metric_name
 
 _UTC = _dt.timezone.utc
@@ -65,6 +66,12 @@ def _file_kind(name: str) -> str:
     low = name.lower()
     if "rri" in low:
         return "RRI"
+    if "sleep" in low or "slp" in low:
+        return "sleep"
+    if any(word in low for word in (
+            "workout", "sport", "training", "exercise",
+            "run", "walk", "cycle", "swim")):
+        return "workout"
     if "hrv" in low:
         return "HRV"
     if "luna" in low or ".log" in low:
@@ -163,6 +170,32 @@ _MIGRATIONS = {
 }
 
 
+def _derive_rest_sessions(conn: sqlite3.Connection) -> int:
+    """Derive one RRI-based rest session, replacing the previous derived one.
+
+    This is not a staged sleep file: it is the span of the longest RRI window,
+    with only ``total_min`` known.  ``source='rri'`` keeps that distinction
+    visible in the UI, and a real sleep-file session is never touched.
+    """
+    from .. import analytics
+
+    rows = conn.execute("SELECT ts, rr_ms FROM rri_samples ORDER BY ts").fetchall()
+    if len(rows) < 10:
+        return 0
+    summary = analytics.overnight_rest(
+        ((_from_ts(ts), rr) for ts, rr in rows))
+    if summary is None:
+        return 0
+    conn.execute("DELETE FROM sleep_sessions WHERE source='rri'")
+    conn.execute(
+        "INSERT INTO sleep_sessions(bedtime, wake, total_min, source) "
+        "VALUES(?,?,?,?) ON CONFLICT(bedtime, wake) DO UPDATE SET "
+        "total_min=excluded.total_min, source=excluded.source",
+        (_to_ts(summary.start), _to_ts(summary.end), summary.duration_min, "rri"),
+    )
+    return 1
+
+
 def _migrate_metric_names(conn: sqlite3.Connection) -> None:
     """Rename samples stored under the old neutral ``metric_N`` keys.
 
@@ -210,6 +243,7 @@ class Store:
         self._conn.executescript(_SCHEMA)
         _migrate(self._conn)
         _migrate_metric_names(self._conn)
+        _derive_rest_sessions(self._conn)
         self._conn.commit()
 
     # -- context manager -------------------------------------------------
@@ -266,7 +300,11 @@ class Store:
                 )
                 counts["samples"] += len(rows)
 
-        for f in getattr(result, "files", []):
+        # Store one row per logical file, not one per 7200-byte chunk.  Keeping
+        # the last chunk under the shared name loses the rest of the file.
+        logical_files = assemble_activity_files(
+            getattr(result, "files", []) or [], include_incomplete=True)
+        for f in logical_files:
             cur.execute(
                 "INSERT INTO activity_files(id, kind, ts, raw, decoded_json) "
                 "VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET "
@@ -283,6 +321,10 @@ class Store:
 
         for samples in _as_sequence(getattr(result, "rri", None)):
             counts["rri"] += self._write_rri(cur, samples)
+        # RRI is the only overnight signal this band sends; derive a rest
+        # session from it unless a real sleep file already supplied one.
+        if not _as_sequence(getattr(result, "sleep", None)):
+            counts["sleep"] += _derive_rest_sessions(self._conn)
 
         cur.execute(
             "INSERT INTO sync_log(ts, n_records, note) VALUES(?,?,?)",
@@ -478,6 +520,15 @@ class Store:
         q += " ORDER BY ts"
         return [(_from_ts(ts), rr_ms)
                 for ts, rr_ms in self._conn.execute(q, args)]
+
+    def rest_summary(self, start=None, end=None):
+        """Longest RRI window in the range, or ``None``."""
+        from .. import analytics
+        return analytics.overnight_rest(self.rri(start, end))
+
+    def workouts(self) -> list[dict]:
+        """Stored workout/sport activity files (empty on this band so far)."""
+        return [f for f in self.activity_files() if f["kind"] == "workout"]
 
     def last_sync(self) -> dict | None:
         row = self._conn.execute(

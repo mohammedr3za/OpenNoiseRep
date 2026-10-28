@@ -41,6 +41,14 @@ the full reverse-engineering notes.
   the capture's manual measurement. Sleep layouts from the Xiaomi reference are
   implemented; no live sleep file has been captured yet. See
   [`docs/FILES.md`](docs/FILES.md).
+- **Last-night rest analytics.** When the band sends overnight RRI (as it did
+  on 2026-10-28), the app derives a rest span with average/5–95% heart rate,
+  HRV (RMSSD, SDNN, pNN50), beat coverage and plain-language observations. This
+  is labelled **from RRI**, not a staged sleep file.
+- **Workouts are visible when they exist.** The GUI always shows a Workouts
+  section; today it says none have been received because this band's sync has
+  only pushed RRI files. Sport/workout file names are detected and will be
+  listed automatically if the band sends them.
 - **Release tooling (Phase 4, in progress).** GitHub Actions CI, a PyInstaller
   build script, issue forms and a security policy. No signed or published
   binaries yet.
@@ -56,6 +64,12 @@ the full reverse-engineering notes.
   is validated against a real vendor file, and the store/GUI consume it, but the
   unit was not confirmed against the band's own readout. Sleep decoders are
   implemented from the Xiaomi reference and are untested on a real sleep file.
+- **“Last night” is an RRI rest span, not scored sleep.** It reports the recorded
+  span and HRV, not sleep stages or a sleep score. The band records RRI in
+  bursts, so coverage is shown alongside the span. Interpretations are
+  descriptive, not medical.
+- **No workout data has been received.** The band's sync pushes RRI files only;
+  the GUI makes that empty state explicit rather than hiding it.
 - **A freshly-unpaired band's clock is unset**, so timestamps can read around
   2002. The read-only client does not send a time-sync; timestamps are
   device-relative. `sync` now defaults to the whole device timeline rather than

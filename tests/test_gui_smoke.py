@@ -260,11 +260,18 @@ def test_tiles_reflow_on_resize():
 # -- optional sleep store ---------------------------------------------------
 def test_sleep_card_appears_when_store_supports_it():
     store = _seeded()
-    store.sleep_sessions = lambda start=None, end=None: [
-        {"duration_min": 420}, {"duration_min": 380}]
+    store.sleep_sessions = lambda start=None, end=None: [{
+        "bedtime": datetime.datetime.combine(
+            datetime.date.today(), datetime.time(2, 0)),
+        "wake": datetime.datetime.combine(
+            datetime.date.today(), datetime.time(8, 0)),
+        "total_min": 360,
+        "source": "rri",
+    }]
+    store.rest_summary = lambda start=None, end=None: None
     w = _window(store)
     assert w.sleep_card is not None
-    assert w.sleep_summary.text() == "13h 20m"
+    assert w.sleep_summary.text().startswith("6h")
     w.close()
 
 
