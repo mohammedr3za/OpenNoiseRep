@@ -12,7 +12,8 @@ from dataclasses import dataclass, field
 from .errors import TransportError
 from .protocol import commands
 from .protocol.decode import (
-    decode_payload, DeviceInfo, DataIndex, MetricSeries, DeviceFile,
+    decode_payload, DeviceInfo, DataIndex, IndexRecord, MetricSeries,
+    DeviceFile, SportIds, Workout,
 )
 from .protocol.files import (
     RriFile, SleepSession, assemble_activity_files, decode_activity_file,
@@ -29,6 +30,8 @@ class SyncResult:
     raw: list = field(default_factory=list)      # list[tuple[label, bytes]]
     rri: list = field(default_factory=list)      # list[RriFile]
     sleep: list = field(default_factory=list)    # list[SleepSession]
+    workouts: list = field(default_factory=list)  # list[Workout]
+    sport_ids: "SportIds | None" = None
 
 
 def _decode_pushed_files(result: SyncResult) -> None:
@@ -44,27 +47,50 @@ def _decode_pushed_files(result: SyncResult) -> None:
 
 
 def _sort(rec, result: SyncResult) -> None:
-    if isinstance(rec, DeviceInfo):
+    if isinstance(rec, list):
+        for item in rec:
+            _sort(item, result)
+    elif isinstance(rec, DeviceInfo):
         result.device = rec
     elif isinstance(rec, DataIndex):
         result.index = rec
     elif isinstance(rec, MetricSeries):
         result.series.append(rec)
+    elif isinstance(rec, SleepSession):
+        result.sleep.append(rec)
+    elif isinstance(rec, Workout):
+        result.workouts.append(rec)
+    elif isinstance(rec, SportIds):
+        result.sport_ids = rec
     elif isinstance(rec, DeviceFile):
         result.files.append(rec)
 
 
-async def _ask(band, payload: bytes, label: str, result: SyncResult, timeout: float):
+async def _ask(band, payload: bytes, label: str, result: SyncResult,
+               timeout: float) -> bool:
+    """Send one command; True when its reply arrived and decoded."""
     try:
         await band.send(payload)
         reply = await band.recv(timeout=timeout)
     except (asyncio.TimeoutError, TransportError):
-        return
+        return False
     result.raw.append((label, reply))
     try:
         _sort(decode_payload(reply), result)
     except Exception:
-        pass            # keep raw; a single odd frame must not abort the sync
+        return False    # keep raw; a single odd frame must not abort the sync
+    return True
+
+
+def _records_to_fetch(result: SyncResult, since: datetime.datetime) -> list:
+    """Every (date, metric) record the band listed, or the legacy fixed list.
+
+    The band keeps one record per day per metric until it is confirmed, so a
+    single fetch-since date would skip all but one day of each metric.
+    """
+    if result.index is not None and result.index.records:
+        return list(result.index.records)
+    return [IndexRecord(since, m) for m in commands.METRIC_IDS]
 
 
 async def run_sync(band, since: datetime.datetime, want_files: bool = True,
@@ -99,21 +125,22 @@ async def run_sync(band, since: datetime.datetime, want_files: bool = True,
     await _ask(band, commands.data_index(), "index", result, reply_timeout)
     done += 1
     report("index")
-    # A 2000 "fetch everything" date is rejected by a paired band (empty
-    # status reply), so use the earliest date the band actually indexed.
-    series_since = since
-    if since.year <= 2001 and result.index is not None:
-        dates = [r.date for r in result.index.records]
-        if dates:
-            series_since = min(dates)
-    for metric_id in commands.METRIC_IDS:
+    records = [r for r in _records_to_fetch(result, since) if r.date >= since]
+    total = 2 + len(records) * 2 + 2
+    for rec in records:
         if time.monotonic() - start > overall_timeout:
             break
-        for cmd_type in (113, 115):
-            await _ask(band, commands.series(cmd_type, series_since, metric_id),
-                       f"series-{cmd_type}-{metric_id}", result, reply_timeout)
-            done += 1
-            report("series")
+        tag = f"{rec.metric_id}-{rec.date:%Y%m%d}"
+        got = await _ask(band, commands.series(113, rec.date, rec.metric_id),
+                         f"series-113-{tag}", result, reply_timeout)
+        done += 1
+        # 115 tells the band the record was delivered and may be dropped, so
+        # only confirm what actually arrived and decoded.
+        if got:
+            await _ask(band, commands.series(115, rec.date, rec.metric_id),
+                       f"series-115-{tag}", result, reply_timeout)
+        done += 1
+        report("series")
     await _ask(band, commands.control_123(), "ctl123", result, reply_timeout)
     done += 1
     report("control")
@@ -174,6 +201,12 @@ def write_result(result: SyncResult, out_dir: str) -> str:
              "awake_min": s.awake_min, "quality": s.quality,
              "source": s.source} for s in result.sleep
         ],
+        "workouts": [
+            {"start": w.start.isoformat(), "kind": w.kind,
+             "duration_s": w.duration_s, "level": w.level, "steps": w.steps,
+             "kcal": w.kcal, "source": w.source} for w in result.workouts
+        ],
+        "sport_ids": None if result.sport_ids is None else result.sport_ids.raw.hex(),
     }
     with open(os.path.join(out_dir, "decoded.json"), "w") as fh:
         json.dump(doc, fh, indent=1)

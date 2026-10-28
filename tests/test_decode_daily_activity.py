@@ -51,7 +51,7 @@ def test_capture_metric_zero_has_four_hourly_channels(capture_payloads):
     _raw, series = _capture_metric_zero(capture_payloads)
 
     assert set(series.channels) == {
-        "steps", "distance_m", "calories", "active_minutes"}
+        "steps", "distance_m", "calories", "active_calories"}
     assert all(len(values) == 24 for values in series.channels.values())
 
     # Big-endian decoding is visible: hourly steps exceed one byte.
@@ -60,11 +60,11 @@ def test_capture_metric_zero_has_four_hourly_channels(capture_payloads):
     # Scalars f9/f10/f13 are the vendor totals; distance is array-summed.
     assert series.totals["steps"] == 2644
     assert series.totals["distance_m"] == 1887
-    assert series.totals["active_minutes"] == 194
+    assert series.totals["active_calories"] == 194
     assert series.totals["calories"] in (1511, 1512)  # 113/115 differ by 1
     assert sum(series.channels["calories"]) == series.totals["calories"]
     assert sum(series.channels["steps"]) == series.totals["steps"]
-    assert sum(series.channels["active_minutes"]) == series.totals["active_minutes"]
+    assert sum(series.channels["active_calories"]) == series.totals["active_calories"]
 
 
 def test_capture_samples_stay_backwards_compatible(capture_payloads):
@@ -97,7 +97,7 @@ def test_synthetic_big_endian_and_scalar_totals():
         "steps": 999,              # vendor scalar wins over array sum (259)
         "distance_m": 60,          # no scalar: sum of the array
         "calories": 6,
-        "active_minutes": 1,
+        "active_calories": 1,
     }
 
 
@@ -107,7 +107,7 @@ def test_synthetic_totals_fall_back_to_array_sums():
                 15: _be16([0, 3])},
     ))
     assert series.totals == {
-        "steps": 9, "calories": 3, "active_minutes": 3}
+        "steps": 9, "calories": 3, "active_calories": 3}
 
 
 def test_short_odd_and_overlong_arrays_are_robust():
@@ -124,7 +124,7 @@ def test_short_odd_and_overlong_arrays_are_robust():
     assert series.channels["distance_m"][0] == 1
     assert series.channels["distance_m"][-1] == 24
     assert "calories" not in series.channels
-    assert "active_minutes" not in series.channels
+    assert "active_calories" not in series.channels
     assert series.totals["steps"] == 3
     assert series.totals["distance_m"] == 300
     assert "calories" not in series.totals

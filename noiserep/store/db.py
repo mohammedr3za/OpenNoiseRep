@@ -151,6 +151,10 @@ CREATE TABLE IF NOT EXISTS sleep_stages(
 CREATE TABLE IF NOT EXISTS rri_samples(
     ts INTEGER PRIMARY KEY,
     rr_ms INTEGER);
+CREATE TABLE IF NOT EXISTS workouts(
+    start INTEGER, kind TEXT, duration_s INTEGER, level TEXT,
+    steps INTEGER, kcal INTEGER, source TEXT,
+    PRIMARY KEY(start, kind));
 CREATE INDEX IF NOT EXISTS idx_samples_metric_ts ON samples(metric, ts);
 CREATE INDEX IF NOT EXISTS idx_sleep_sessions_bedtime ON sleep_sessions(bedtime);
 CREATE INDEX IF NOT EXISTS idx_sleep_stages_session ON sleep_stages(session_id, ts);
@@ -166,6 +170,8 @@ _MIGRATIONS = {
         ("total_min", "INTEGER"), ("deep_min", "INTEGER"),
         ("light_min", "INTEGER"), ("rem_min", "INTEGER"),
         ("awake_min", "INTEGER"), ("quality", "INTEGER"), ("source", "TEXT"),
+        ("latency_min", "INTEGER"), ("efficiency", "INTEGER"),
+        ("time_in_bed_min", "INTEGER"),
     ),
     "sleep_stages": (("session_id", "INTEGER"), ("ts", "INTEGER"),
                      ("stage", "INTEGER")),
@@ -190,6 +196,10 @@ def _derive_rest_sessions(conn: sqlite3.Connection) -> int:
     if summary is None:
         return 0
     conn.execute("DELETE FROM sleep_sessions WHERE source='rri'")
+    if conn.execute(
+            "SELECT 1 FROM sleep_sessions WHERE wake>=? AND bedtime<=?",
+            (_to_ts(summary.start), _to_ts(summary.end))).fetchone():
+        return 0                 # the band's own session covers this night
     conn.execute(
         "INSERT INTO sleep_sessions(bedtime, wake, total_min, source) "
         "VALUES(?,?,?,?) ON CONFLICT(bedtime, wake) DO UPDATE SET "
@@ -219,6 +229,29 @@ def _migrate_metric_names(conn: sqlite3.Connection) -> None:
         conn.execute("UPDATE samples SET metric=? WHERE metric=?", (new, old))
 
 
+#: Before v1 only these series had correct timestamps: heart rate's cadence
+#: field is seconds and metric 0's channels used a fixed hour.  Every other
+#: metric was spaced by a cadence field that is really minutes, so its rows
+#: sit at wrong times (re-sync or re-ingest a dump to restore them).
+_V1_KEEP = ("heart_rate", "metric_2", "steps", "distance_m", "calories",
+            "active_minutes")
+
+
+def _fix_v1(conn: sqlite3.Connection) -> None:
+    """One-time cleanup of pre-schema rows; ``user_version`` makes it run once.
+
+    Drops the mis-timed series and renames daily ``f15`` rows, stored as
+    ``active_minutes``, to what they are: ``active_calories``.
+    """
+    if conn.execute("PRAGMA user_version").fetchone()[0] >= 1:
+        return
+    marks = ",".join("?" * len(_V1_KEEP))
+    conn.execute(f"DELETE FROM samples WHERE metric NOT IN ({marks})", _V1_KEEP)
+    conn.execute(
+        "UPDATE samples SET metric='active_calories' WHERE metric='active_minutes'")
+    conn.execute("PRAGMA user_version=1")
+
+
 def _migrate(conn: sqlite3.Connection) -> None:
     """Bring an existing database up to the current schema, in place."""
     cur = conn.cursor()
@@ -245,6 +278,7 @@ class Store:
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SCHEMA)
         _migrate(self._conn)
+        _fix_v1(self._conn)
         _migrate_metric_names(self._conn)
         _derive_rest_sessions(self._conn)
         self._conn.commit()
@@ -279,7 +313,7 @@ class Store:
         now = int(time.time())
         cur = self._conn.cursor()
         counts = {"samples": 0, "files": 0, "sleep": 0, "sleep_stages": 0,
-                  "rri": 0}
+                  "rri": 0, "workouts": 0}
 
         dev = getattr(result, "device", None)
         if dev is not None and getattr(dev, "mac", ""):
@@ -314,7 +348,8 @@ class Store:
                         rows,
                     )
                     counts["samples"] += len(rows)
-                continue
+                if s.metric_id == 0:
+                    continue          # its samples are packed bytes, not a series
             if not s.samples or not s.interval_s:
                 continue
             metric = metric_name(s.metric_id)
@@ -351,6 +386,16 @@ class Store:
                 counts["sleep"] += 1
                 counts["sleep_stages"] += written[1]
 
+        for w in getattr(result, "workouts", None) or []:
+            cur.execute(
+                "INSERT INTO workouts(start, kind, duration_s, level, steps, "
+                "kcal, source) VALUES(?,?,?,?,?,?,?) ON CONFLICT(start, kind) "
+                "DO UPDATE SET duration_s=excluded.duration_s, "
+                "level=excluded.level, steps=excluded.steps, kcal=excluded.kcal",
+                (_to_ts(w.start), w.kind, w.duration_s, w.level, w.steps,
+                 w.kcal, w.source))
+            counts["workouts"] += 1
+
         for samples in _as_sequence(getattr(result, "rri", None)):
             counts["rri"] += self._write_rri(cur, samples)
         # RRI is the only overnight signal this band sends; derive a rest
@@ -375,17 +420,22 @@ class Store:
         src = source or _attr(session, "source") or "file"
         cur.execute(
             "INSERT INTO sleep_sessions(bedtime, wake, total_min, deep_min, "
-            "light_min, rem_min, awake_min, quality, source) "
-            "VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(bedtime, wake) DO UPDATE SET "
+            "light_min, rem_min, awake_min, quality, source, latency_min, "
+            "efficiency, time_in_bed_min) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(bedtime, wake) DO UPDATE SET "
             "total_min=excluded.total_min, deep_min=excluded.deep_min, "
             "light_min=excluded.light_min, rem_min=excluded.rem_min, "
             "awake_min=excluded.awake_min, quality=excluded.quality, "
-            "source=excluded.source",
+            "source=excluded.source, latency_min=excluded.latency_min, "
+            "efficiency=excluded.efficiency, "
+            "time_in_bed_min=excluded.time_in_bed_min",
             (
                 bedtime, wake,
                 _attr(session, "total_min"), _attr(session, "deep_min"),
                 _attr(session, "light_min"), _attr(session, "rem_min"),
                 _attr(session, "awake_min"), _attr(session, "quality"), src,
+                _attr(session, "latency_min"), _attr(session, "efficiency"),
+                _attr(session, "time_in_bed_min"),
             ),
         )
         session_id = cur.execute(
@@ -503,7 +553,8 @@ class Store:
         """Sessions overlapping ``[start, end]`` (a session overlaps when its
         wake is at/after ``start`` and its bedtime is at/before ``end``)."""
         q = ("SELECT id, bedtime, wake, total_min, deep_min, light_min, "
-             "rem_min, awake_min, quality, source FROM sleep_sessions")
+             "rem_min, awake_min, quality, source, latency_min, efficiency, "
+             "time_in_bed_min FROM sleep_sessions")
         conds, args = [], []
         if start is not None:
             conds.append("wake>=?")
@@ -526,6 +577,9 @@ class Store:
                 "awake_min": r["awake_min"],
                 "quality": r["quality"],
                 "source": r["source"],
+                "latency_min": r["latency_min"],
+                "efficiency": r["efficiency"],
+                "time_in_bed_min": r["time_in_bed_min"],
             }
             for r in self._conn.execute(q, args)
         ]
@@ -559,8 +613,17 @@ class Store:
         return analytics.overnight_rest(self.rri(start, end))
 
     def workouts(self) -> list[dict]:
-        """Stored workout/sport activity files (empty on this band so far)."""
-        return [f for f in self.activity_files() if f["kind"] == "workout"]
+        """Band-detected sessions (newest first), then workout files."""
+        rows = self._conn.execute(
+            "SELECT start, kind, duration_s, level, steps, kcal, source "
+            "FROM workouts ORDER BY start DESC").fetchall()
+        sessions = [{"id": f"{r['kind']} {_from_ts(r['start']):%Y-%m-%d %H:%M}",
+                     "kind": r["kind"], "time": _from_ts(r["start"]),
+                     "duration_s": r["duration_s"], "level": r["level"],
+                     "steps": r["steps"], "kcal": r["kcal"],
+                     "source": r["source"], "size": None} for r in rows]
+        files = [f for f in self.activity_files() if f["kind"] == "workout"]
+        return sessions + files
 
     def last_sync(self) -> dict | None:
         row = self._conn.execute(

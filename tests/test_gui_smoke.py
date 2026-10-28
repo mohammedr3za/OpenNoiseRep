@@ -42,7 +42,7 @@ def _seeded(day: datetime.datetime | None = None, others: bool = True) -> Store:
     r.device = DeviceInfo("1.4.0", "SN-TEST", "aa:bb:cc:dd:ee:ff", "R1")
     r.series = [MetricSeries(day, 2, 30, [0, 93, 95, 104], b"")]
     if others:
-        r.series.append(MetricSeries(day, 21, 60, [0, 10, 12, 14], b""))
+        r.series.append(MetricSeries(day, 27, 60, [0, 10, 12, 14], b""))
     s = Store(":memory:")
     s.ingest(r)
     return s
@@ -68,20 +68,21 @@ def _seeded_with_other() -> Store:
 
 
 def _seeded_vitals() -> Store:
-    """Heart rate plus all five vitals and the four daily-activity channels."""
+    """Heart rate plus all six vitals and the four daily-activity channels."""
     day = _today_at_six()
     r = SyncResult()
     r.device = DeviceInfo("1.4.0", "SN-TEST", "aa:bb:cc:dd:ee:ff", "R1")
     r.series = [
         MetricSeries(day, 2, 30, [0, 72, 74, 76], b""),       # HR
-        MetricSeries(day, 21, 900, [0, 58, 60], b""),         # HRV
+        MetricSeries(day, 27, 900, [0, 58, 60], b""),         # HRV
         MetricSeries(day, 22, 300, [0, 35, 40], b""),         # stress
         MetricSeries(day, 4, 300, [0, 98], b""),              # SpO2
-        MetricSeries(day, 23, 3600, [0, 27], b""),            # temp candidate
+        MetricSeries(day, 8, 3600, [0, 32.5], b""),           # skin temp
+        MetricSeries(day, 19, 300, [0, 15], b""),             # resp rate
         MetricSeries(day, 0, 3600, [], b"", channels={
             "steps": [0, 1200, 1800],
             "distance_m": [0, 850, 1300],
-            "calories": [0, 90, 130],
+            "active_calories": [0, 90, 130],
             "active_minutes": [0, 12, 20],
         }),
     ]
@@ -182,15 +183,15 @@ def test_vitals_render_values_and_units():
     w = _window(_seeded_vitals())
     texts = {key: _label_texts(card)
              for key, card in w.vital_cards.items()}
-    assert set(texts) == {"hrv", "resting_hr", "spo2", "temperature", "stress"}
+    assert set(texts) == {"hrv", "resting_hr", "spo2", "resp_rate",
+                          "temperature", "stress"}
     assert "60" in texts["hrv"] and "ms" in texts["hrv"]
     assert "72" in texts["resting_hr"] and "bpm" in texts["resting_hr"]
     assert "estimate" not in texts["resting_hr"].lower()
     assert "98" in texts["spo2"] and "%" in texts["spo2"]
-    # Temperature has no verified unit; show the value without inventing one.
-    assert "27" in texts["temperature"]
+    assert "32.5" in texts["temperature"] and "°C" in texts["temperature"]
     assert "candidate" not in texts["temperature"].lower()
-    assert "°" not in texts["temperature"]
+    assert "15" in texts["resp_rate"] and "brpm" in texts["resp_rate"]
     assert "40" in texts["stress"]
     w.close()
 
@@ -233,19 +234,19 @@ def test_movement_totals_progress_and_default_goal_note():
     assert w.goal_progress["active_minutes"].value() == 30   # capped at goal
     assert w.goal_progress["distance_m"].maximum() == 4000
     assert w.goal_progress["distance_m"].value() == 2150
-    assert w.goal_progress["calories"].maximum() == 200
-    assert w.goal_progress["calories"].value() == 200        # 220 capped
+    assert w.goal_progress["active_calories"].maximum() == 500
+    assert w.goal_progress["active_calories"].value() == 220
     steps = _label_texts(w.goal_cards["steps"])
     assert "3,000" in steps and "5,000" in steps
     assert "km" in _label_texts(w.goal_cards["distance_m"])
-    assert "kcal" in _label_texts(w.goal_cards["calories"])
+    assert "kcal" in _label_texts(w.goal_cards["active_calories"])
     assert "min" in _label_texts(w.goal_cards["active_minutes"])
     assert "defaults" in w.goals_note.text().lower()
     w.close()
 
 
 def test_responsive_card_breakpoints():
-    assert [_vitals_columns(w) for w in (1000, 700, 400)] == [5, 3, 2]
+    assert [_vitals_columns(w) for w in (1000, 700, 400)] == [6, 3, 2]
     assert [_movement_columns(w) for w in (1000, 600, 300)] == [4, 2, 1]
 
 
@@ -255,7 +256,7 @@ def test_vitals_grid_reflows_on_resize():
     w.show()
     _app().processEvents()
     w._relayout_tiles()
-    assert w._vitals_cols == 5
+    assert w._vitals_cols == 6
     w.resize(900, 700)
     _app().processEvents()
     w._relayout_tiles()

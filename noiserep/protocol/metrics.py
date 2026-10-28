@@ -1,27 +1,18 @@
 """Metric id -> meaning, unit, and evidence-backed confidence.
 
 Metric ids appear in the type-112 data index and in the ``f1`` entry of every
-type-113/115 series body. Identity is inferred from two sources:
+type-113/115 series body. They are the vendor's ``SEFitnessFunctionType``
+enum, recovered with the rest of the protobuf schema from the NoiseFit APK
+(see docs/PROTOCOL.md). Identities are checked against live band data.
 
-* ``noisefit.pklg`` -- a full vendor-app sync (24 h of data, band worn, one
-  manual health measurement around 15:15).
-* the live captures under ``data/`` (a briefly-worn day and two unpaired,
-  clock-unset syncs).
+``confidence``:
 
-``confidence`` is deliberately conservative:
+* ``verified`` -- vendor schema name, and live values fit it.
+* ``likely``   -- vendor schema name, but the unit or scale is inferred.
+* ids not in :data:`METRICS` keep the neutral ``metric_N`` / ``Channel N``.
 
-* ``verified`` -- the value range and cadence are unambiguous (heart rate).
-* ``likely``   -- range, cadence and cross-metric behaviour agree, but the
-  vendor app's own labels have not been read side by side.
-* ids with no satisfactory evidence are **not** in :data:`METRICS`; they keep
-  the neutral ``metric_N`` name / ``Channel N`` display and unit ``None``.
-
-Cadence note: the series body's ``f2`` field is a cadence *number* whose unit
-is not consistent across metrics. Metric 2's ``f2=30`` is seconds (2880
-values/day); metric 4/22's ``f2=5``, metric 21's ``f2=15`` and metric
-11/12/23's ``f2=60`` are minutes (288 / 96 / 24 values per day). The decoder
-currently exposes the raw ``f2`` as ``MetricSeries.interval_s``; do not assume
-seconds for every metric.
+Cadence is ``86400 / sample count`` (2880 -> 30 s, 288 -> 5 min, 96 -> 15 min,
+24 -> 1 h); the body's frequency field uses mixed units and is not trusted.
 """
 from __future__ import annotations
 
@@ -56,38 +47,41 @@ class ChannelInfo:
     source: str
 
 
-#: Channels decoded from metric 0.  The vendor capture establishes the sums
-#: (steps = f9, calories = f10, active minutes = f13) and the ~0.71 m/step
-#: ratio; the display units are conventional, not read from the app.
+#: Named channels derived from composite records (stored hourly or daily).
+#: ``name`` is the key the store writes samples under.
 CHANNELS: dict[str, ChannelInfo] = {
     "steps": ChannelInfo(
         name="steps",
         unit="steps",
         display_name="Steps",
-        confidence="likely",
-        source=(
-            "vendor capture: hourly u16-BE array (f3) sums to f9; ~0.71 m/step "
-            "against the distance array"
-        ),
+        confidence="verified",
+        source="SEDailyData.steps_data (f3), hourly u16-BE; total f9",
     ),
     "distance_m": ChannelInfo(
         name="distance_m",
         unit="m",
         display_name="Distance",
-        confidence="likely",
-        source=(
-            "vendor capture: hourly u16-BE array (f5) in metres; sums to 1887 m "
-            "for 2644 steps (~0.71 m/step)"
-        ),
+        confidence="verified",
+        source="SEDailyData.distance_data (f5), hourly u16-BE metres",
     ),
     "calories": ChannelInfo(
         name="calories",
         unit="kcal",
+        display_name="Total Calories",
+        confidence="likely",
+        source=(
+            "SEDailyData.calorie_data (f7), hourly u16-BE; total f10. ~85 "
+            "kcal/h asleep, so this includes resting energy"
+        ),
+    ),
+    "active_calories": ChannelInfo(
+        name="active_calories",
+        unit="kcal",
         display_name="Active Calories",
         confidence="likely",
         source=(
-            "vendor capture: hourly u16-BE array (f7) sums to f10; f14 is the "
-            "cumulative form of the same values"
+            "SEDailyData.today_sport_calorie_hourly_data (f15), hourly "
+            "u16-BE; total today_sport_calorie_data (f13)"
         ),
     ),
     "active_minutes": ChannelInfo(
@@ -96,83 +90,83 @@ CHANNELS: dict[str, ChannelInfo] = {
         display_name="Active Minutes",
         confidence="likely",
         source=(
-            "vendor capture: hourly u16-BE array (f15) sums to f13, the "
-            "vendor's active-minutes total"
+            "NoiseFit's rule: 5 min x count(movement level 1-3) per hour, "
+            "from metric 14"
         ),
     ),
-}
-
-
-METRICS: dict[int, MetricInfo] = {
-    0: MetricInfo(
-        id=0,
-        name="daily_activity",
-        unit=None,  # composite: first channel is steps, plus distance/calories
-        display_name="Daily Activity",
-        confidence="likely",
-        source=(
-            "vendor capture: 24 hourly u16-BE values per channel; f3 sums to "
-            "f9 (total steps), f7 to f10 (total calories), f15 to f13 (active "
-            "minutes)"
-        ),
-    ),
-    2: MetricInfo(
-        id=2,
-        name="heart_rate",
+    "resting_hr": ChannelInfo(
+        name="resting_hr",
         unit="bpm",
-        display_name="Heart Rate",
+        display_name="Resting HR (band)",
         confidence="verified",
-        source=(
-            "live + vendor capture: 2880 values/day (f2=30 s), range ~60-160, "
-            "matches wrist heart rate"
-        ),
+        source="SEContinuousHeartRateData.resting_heart_rate_value (f6)",
     ),
-    4: MetricInfo(
-        id=4,
-        name="blood_oxygen",
-        unit="%",
-        display_name="Blood Oxygen (SpO2)",
-        confidence="likely",
-        source=(
-            "vendor capture: single 100 at a manual-measurement moment, zero "
-            "elsewhere; 0-100 range"
-        ),
+    "health_score": ChannelInfo(
+        name="health_score",
+        unit=None,
+        display_name="Health Score",
+        confidence="verified",
+        source="SERingHealthScoreData.healthscore (GoMore, metric 17)",
     ),
-    21: MetricInfo(
-        id=21,
-        name="heart_rate_variability",
-        unit="ms",
-        display_name="Heart Rate Variability",
+    "sedentary_min": ChannelInfo(
+        name="sedentary_min",
+        unit="min",
+        display_name="Sedentary Time",
         confidence="likely",
-        source=(
-            "vendor capture: 96 values/day (15 min); inverse to simultaneous "
-            "HR (hourly r=-0.81), ~74-77 in sleep vs ~51-53 active"
-        ),
-    ),
-    22: MetricInfo(
-        id=22,
-        name="stress",
-        unit=None,  # 0-100 score
-        display_name="Stress",
-        confidence="likely",
-        source=(
-            "vendor capture: 288 values/day (5 min), tracks HR (hourly "
-            "r=+0.91), low in sleep and higher while awake"
-        ),
-    ),
-    27: MetricInfo(
-        id=27,
-        name="rr_interval",
-        unit="10 ms",
-        display_name="R-R Interval",
-        confidence="likely",
-        source=(
-            "vendor capture: 16 values 49-86 during a measurement are "
-            "consistent with 60000/HR/10 (mean error ~5.5 units); vendor "
-            "RRI_Data files"
-        ),
+        source="SERingHealthScoreData.Sedentary_duration (seconds) / 60",
     ),
 }
+
+
+def _m(mid: int, name: str, unit, display: str, confidence: str,
+       source: str) -> MetricInfo:
+    return MetricInfo(mid, name, unit, display, confidence, source)
+
+
+METRICS: dict[int, MetricInfo] = {m.id: m for m in (
+    _m(0, "daily_activity", None, "Daily Activity", "verified",
+       "DAILY_DATA -> SEDailyData: hourly steps/distance/calories"),
+    _m(2, "heart_rate", "bpm", "Heart Rate", "verified",
+       "CONTINUOUS_HEART_RATE_DATA: 2880/day (30 s), live range 49-152"),
+    _m(4, "blood_oxygen", "%", "Blood Oxygen (SpO2)", "verified",
+       "CONTINUOUS_BLOOD_OXYGEN_DATA: 288/day (5 min), live range 75-100"),
+    _m(8, "temperature", "°C", "Skin Temperature", "likely",
+       "CONTINUOUS_TEMPERATURE_DATA: 288 u16-BE/day; raw/100 gives "
+       "30.9-33.8 worn (scale inferred)"),
+    _m(11, "standing", None, "Standing Hours", "verified",
+       "EFFECTIVE_STANDING_DATA: 24 hourly 0/1 flags"),
+    _m(12, "activity_duration", "min", "Activity Duration", "likely",
+       "ACTIVITY_DURATION_DATA: 24 hourly minutes; NoiseFit ignores it "
+       "for REP"),
+    _m(14, "movement_level", None, "Movement Level", "verified",
+       "GoMore SEOverallDayMovementData: 288/day level codes; NoiseFit "
+       "counts levels 1-3 as active"),
+    _m(15, "sleep_result", None, "Sleep", "verified",
+       "GoMore SERingSleepResultData: on-band sleep window, stages, score"),
+    _m(16, "sleep_nap", None, "Naps", "verified",
+       "GoMore SERingSleepNapData"),
+    _m(17, "health_score_record", None, "Health Score", "verified",
+       "GoMore SERingHealthScoreData: healthscore + sedentary seconds"),
+    _m(18, "activity_indicator", None, "Activity Indicator", "likely",
+       "GoMore SETodayActiveTypeData: 288/day codes, meaning not decoded"),
+    _m(19, "respiratory_rate", "brpm", "Respiratory Rate", "verified",
+       "GoMore SETodayRespiratoryRateData: 288/day, live range 6-22"),
+    _m(20, "auto_workout", None, "Auto-detected Workouts", "verified",
+       "GoMore SEAutoActiveSportData: walk/run sessions"),
+    _m(21, "body_battery", None, "Body Battery", "verified",
+       "GoMore SEBodyBatteryData: 96/day (15 min), rises 69->97 overnight"),
+    _m(22, "stress", None, "Stress", "verified",
+       "GoMore SEStressDetectionData: 288/day (5 min), 0-100"),
+    _m(23, "band_battery", "%", "Band Battery", "verified",
+       "RING_BATTERY_DATA: hourly; matches device-info battery"),
+    _m(25, "post_workout_hr", "bpm", "Post-workout HR", "likely",
+       "CONTINUOUS_HEART_RATE_SPORT_FIVEMIN_AFTER_DATA (raw kept)"),
+    _m(26, "sleep_rri", "ms", "Sleep R-R Intervals", "likely",
+       "Sleep_RRI_DATA (raw kept; NoiseFit drops it)"),
+    _m(27, "sleep_hrv", "ms", "Sleep HRV", "likely",
+       "Sleep_HRV_DATA: 2880/day (30 s), 1 B/sample; NoiseFit's only HRV "
+       "source for REP. RMSSD vs vendor index unknown"),
+)}
 
 
 def _resolve(metric):

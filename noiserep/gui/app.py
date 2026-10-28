@@ -186,9 +186,9 @@ def _columns_for_width(width: int) -> int:
 
 
 def _vitals_columns(width: int) -> int:
-    """Five compact vitals at wide widths, reflowing to three then two."""
+    """Six compact vitals at wide widths, reflowing to three then two."""
     if width >= 860:
-        return 5
+        return 6
     if width >= 540:
         return 3
     return 2
@@ -206,16 +206,17 @@ def _movement_columns(width: int) -> int:
 #: Metrics already given a dedicated overview section; they are not repeated
 #: in the generic "Other channels" tile grid.
 _FEATURED_METRICS = frozenset({
-    "heart_rate",
-    "steps", "distance_m", "calories", "active_minutes",
-    "heart_rate_variability", "stress", "blood_oxygen", "metric_23",
+    "heart_rate", "resting_hr",
+    "steps", "distance_m", "active_calories", "active_minutes",
+    "sleep_hrv", "stress", "blood_oxygen", "temperature", "respiratory_rate",
 })
 
-#: Short caption for each of the five vital cards, in display order.
+#: Short caption for each of the six vital cards, in display order.
 _VITAL_CARDS = (
     ("hrv", "HRV"),
     ("resting_hr", "Resting HR"),
     ("spo2", "SpO2"),
+    ("resp_rate", "Resp. Rate"),
     ("temperature", "Temp"),
     ("stress", "Stress"),
 )
@@ -224,14 +225,23 @@ _VITAL_CARDS = (
 VITAL_GUIDE = {
     "hrv": {
         "title": "Heart Rate Variability",
-        "metric": "heart_rate_variability",
+        "metric": "sleep_hrv",
         "meaning": (
-            "HRV is the variation in time between heartbeats. It reflects "
-            "autonomic balance and recovery; a higher value often suggests "
-            "more recovery, but normal varies widely with age and fitness."),
+            "HRV is the variation in time between heartbeats. The band "
+            "records it during sleep, every 30 seconds. It reflects autonomic "
+            "balance and recovery; higher often suggests more recovery, but "
+            "normal varies widely with age and fitness."),
         "typical": (
             "Resting RMSSD is often roughly 20–80 ms in adults. Compare with "
             "your own trend rather than a single reading."),
+    },
+    "resp_rate": {
+        "title": "Respiratory Rate",
+        "metric": "respiratory_rate",
+        "meaning": (
+            "Breaths per minute, estimated by the band from heart-rate "
+            "patterns every 5 minutes. Overnight values are the most stable."),
+        "typical": "About 12–20 breaths per minute at rest in adults.",
     },
     "resting_hr": {
         "title": "Resting Heart Rate",
@@ -253,12 +263,13 @@ VITAL_GUIDE = {
             "warrant medical advice."),
     },
     "temperature": {
-        "title": "Temperature",
-        "metric": "metric_23",
+        "title": "Skin Temperature",
+        "metric": "temperature",
         "meaning": (
-            "The band's temperature channel. Its scale is not established, "
-            "so only plausible values are shown."),
-        "typical": "No established range for this band.",
+            "Wrist skin temperature every 5 minutes. It runs several degrees "
+            "below core body temperature and follows the room and strap fit; "
+            "the overnight trend is the useful part."),
+        "typical": "Roughly 30–35 °C at the wrist.",
     },
     "stress": {
         "title": "Stress",
@@ -276,8 +287,47 @@ _MOVEMENT_GOALS = (
     ("steps", "Steps", "steps", 5000, "5,000 steps"),
     ("active_minutes", "Active Minutes", "min", 30, "30 min"),
     ("distance_m", "Distance", "km", 4000, "4.0 km"),
-    ("calories", "Calories", "kcal", 200, "200 kcal"),
+    ("active_calories", "Active Calories", "kcal", 500, "500 kcal"),
 )
+
+
+def _fmt_min(minutes) -> str:
+    return _fmt_span(minutes * 60) if minutes is not None else "—"
+
+
+def _chip_row(items) -> QtWidgets.QHBoxLayout:
+    """A row of value-over-label chips."""
+    chips = QtWidgets.QHBoxLayout()
+    chips.setSpacing(26)
+    for label, val in items:
+        cell = QtWidgets.QVBoxLayout()
+        cell.setSpacing(1)
+        num = QtWidgets.QLabel(val)
+        num.setObjectName("chipValue")
+        lab = QtWidgets.QLabel(label)
+        lab.setObjectName("statLabel")
+        cell.addWidget(num)
+        cell.addWidget(lab)
+        chips.addLayout(cell)
+    chips.addStretch(1)
+    return chips
+
+
+def _workout_meta(workout: dict) -> str:
+    """One-line summary: time, then duration/steps/kcal or file size."""
+    parts = []
+    when = workout.get("time")
+    if when:
+        parts.append(f"{when:%d %b, %H:%M}")
+    if workout.get("duration_s"):
+        parts.append(_fmt_span(workout["duration_s"]))
+    if workout.get("steps"):
+        parts.append(f"{workout['steps']:,} steps")
+    if workout.get("kcal"):
+        parts.append(f"{workout['kcal']} kcal")
+    if workout.get("size"):
+        parts.append(f"{workout['size']:,} bytes")
+    return " · ".join(parts)
 
 
 def _shortcut_label(seq: str) -> str:
@@ -1458,27 +1508,24 @@ class MainWindow(QtWidgets.QMainWindow):
         row.addStretch(1)
         v.addLayout(row)
 
+        if session.get("quality") is not None:
+            v.addLayout(_chip_row((
+                ("SCORE", f"{session['quality']}"),
+                ("DEEP", _fmt_min(session.get("deep_min"))),
+                ("LIGHT", _fmt_min(session.get("light_min"))),
+                ("REM", _fmt_min(session.get("rem_min"))),
+                ("AWAKE", _fmt_min(session.get("awake_min"))),
+                ("EFFICIENCY", f"{session['efficiency']}%"
+                 if session.get("efficiency") is not None else "—"),
+            )))
         if summary is not None:
-            chips = QtWidgets.QHBoxLayout()
-            chips.setSpacing(26)
-            for label, val in (
+            v.addLayout(_chip_row((
                 ("AVG", f"{summary.avg_hr:.0f} bpm" if summary.avg_hr else "—"),
                 ("HRV", f"{summary.rmssd_ms:.0f} ms" if summary.rmssd_ms else "—"),
                 ("COVERAGE", f"{summary.coverage_pct:.0f}%"
                  if summary.coverage_pct is not None else "—"),
-            ):
-                cell = QtWidgets.QVBoxLayout()
-                cell.setSpacing(1)
-                num = QtWidgets.QLabel(val)
-                num.setObjectName("chipValue")
-                lab = QtWidgets.QLabel(label)
-                lab.setObjectName("statLabel")
-                cell.addWidget(num)
-                cell.addWidget(lab)
-                chips.addLayout(cell)
-            chips.addStretch(1)
-            v.addLayout(chips)
-        else:
+            )))
+        elif session.get("quality") is None:
             hint = QtWidgets.QLabel("No RRI beats recorded in this window.")
             hint.setObjectName("muted")
             v.addWidget(hint)
@@ -1521,9 +1568,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 name.setObjectName("chipValue")
                 row.addWidget(name)
                 row.addStretch(1)
-                meta = QtWidgets.QLabel(
-                    f"{when:%d %b, %H:%M} · {workout.get('size', 0):,} bytes"
-                    if when else f"{workout.get('size', 0):,} bytes")
+                meta = QtWidgets.QLabel(_workout_meta(workout))
                 meta.setObjectName("muted")
                 row.addWidget(meta)
                 v.addLayout(row)
@@ -1532,9 +1577,9 @@ class MainWindow(QtWidgets.QMainWindow):
             title.setObjectName("chipValue")
             v.addWidget(title)
             hint = QtWidgets.QLabel(
-                "This band's sync has only pushed RRI files so far. Record a "
-                "workout on the band and sync again; sport files will appear "
-                "here when the band sends them.")
+                "The band holds a workout only until one app syncs it. Keep "
+                "the phone's Bluetooth off after a walk, run or recorded "
+                "workout, then sync here.")
             hint.setObjectName("muted")
             hint.setWordWrap(True)
             v.addWidget(hint)

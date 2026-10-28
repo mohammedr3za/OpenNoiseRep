@@ -7,18 +7,32 @@ from noiserep.protocol.metrics import (
     metric_unit,
 )
 
-# Ids that the protocol work has identified; every other id must stay neutral.
+# Ids named by the vendor SEFitnessFunctionType enum; every other id stays
+# neutral.
 KNOWN = {
     0: ("daily_activity", None, "Daily Activity"),
     2: ("heart_rate", "bpm", "Heart Rate"),
     4: ("blood_oxygen", "%", "Blood Oxygen (SpO2)"),
-    21: ("heart_rate_variability", "ms", "Heart Rate Variability"),
+    8: ("temperature", "°C", "Skin Temperature"),
+    11: ("standing", None, "Standing Hours"),
+    12: ("activity_duration", "min", "Activity Duration"),
+    14: ("movement_level", None, "Movement Level"),
+    15: ("sleep_result", None, "Sleep"),
+    16: ("sleep_nap", None, "Naps"),
+    17: ("health_score_record", None, "Health Score"),
+    18: ("activity_indicator", None, "Activity Indicator"),
+    19: ("respiratory_rate", "brpm", "Respiratory Rate"),
+    20: ("auto_workout", None, "Auto-detected Workouts"),
+    21: ("body_battery", None, "Body Battery"),
     22: ("stress", None, "Stress"),
-    27: ("rr_interval", "10 ms", "R-R Interval"),
+    23: ("band_battery", "%", "Band Battery"),
+    25: ("post_workout_hr", "bpm", "Post-workout HR"),
+    26: ("sleep_rri", "ms", "Sleep R-R Intervals"),
+    27: ("sleep_hrv", "ms", "Sleep HRV"),
 }
 
-# One representative for every still-unidentified id from the capture.
-UNKNOWN_IDS = (1, 3, 8, 11, 12, 14, 17, 18, 19, 23, 25, 26, 99)
+# Ids the band has not been seen to send.
+UNKNOWN_IDS = (1, 3, 5, 9, 24, 99)
 
 
 def test_known_metric_mapping():

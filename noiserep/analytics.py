@@ -222,7 +222,7 @@ def insights(summary: RestSummary) -> list[str]:
 # ---------------------------------------------------------------------------
 
 #: Keys always present in :func:`vitals`'s result, in display order.
-VITAL_KEYS = ("resting_hr", "hrv", "stress", "spo2", "temperature")
+VITAL_KEYS = ("resting_hr", "hrv", "stress", "spo2", "resp_rate", "temperature")
 
 
 @dataclass(frozen=True)
@@ -295,40 +295,17 @@ def vitals(store, start=None, end=None) -> dict[str, Vital]:
 
     The result always has every key in :data:`VITAL_KEYS`; a missing metric
     yields ``Vital.value is None`` rather than an invented number.  ``hrv``,
-    ``stress`` and ``spo2`` are the latest stored samples of metrics 21, 22 and
-    4; ``temperature`` is metric 23, labelled a *candidate* because its unit is
-    not established (the vendor capture suggests ~27-31 but a live unworn
-    reading was 213).
+    ``stress``, ``spo2``, ``resp_rate`` and ``temperature`` are the latest
+    stored samples of metrics 27, 22, 4, 19 and 8.  Resting HR is the band's
+    own daily value when it sent one, else a low-decile estimate.
     """
-    hr_rows = store.samples("heart_rate", start, end)
-    resting = resting_hr_estimate(hr_rows)
-    if hr_rows:
-        resting_source = (
-            "computed from heart_rate: median of the lowest 10% of "
-            f"{len(hr_rows):,} readings"
-        )
-    else:
-        resting_source = (
-            "computed from heart_rate: median of the lowest 10% of readings; "
-            "none stored"
-        )
-
-    out: dict[str, Vital] = {
-        "resting_hr": Vital(
-            key="resting_hr",
-            label="Resting HR estimate",
-            value=round(resting, 1) if resting is not None else None,
-            unit="bpm",
-            source=resting_source,
-            confidence="estimate",
-            note="Not the vendor's resting-HR figure; a low-decile estimate.",
-        ),
-    }
-
+    out: dict[str, Vital] = {"resting_hr": _resting_vital(store, start, end)}
     specs = (
-        ("hrv", "Heart Rate Variability", "heart_rate_variability", "ms"),
+        ("hrv", "Heart Rate Variability", "sleep_hrv", "ms"),
         ("stress", "Stress", "stress", None),
         ("spo2", "Blood Oxygen (SpO2)", "blood_oxygen", "%"),
+        ("resp_rate", "Respiratory Rate", "respiratory_rate", "brpm"),
+        ("temperature", "Skin Temperature", "temperature", "°C"),
     )
     for key, label, metric, unit in specs:
         row = _latest(store, metric, start, end)
@@ -341,25 +318,29 @@ def vitals(store, start=None, end=None) -> dict[str, Vital]:
             confidence=metric_confidence(metric) or "candidate",
             at=row[0] if row is not None else None,
         )
-
-    # Metric 23 is an hourly 0-255 array whose meaning is not established.  A
-    # vendor day reads 27-31 (consistent with degrees Celsius) while an unworn
-    # live day reads 0 and 213, so expose it as a candidate without a unit.
-    temp = _latest(store, "metric_23", start, end)
-    # 27-31 appears on a worn vendor day and reads as °C; 213 appears off-wrist
-    # and is most likely a raw sensor/ADC value.  Only show a plausible value.
-    plausible = (temp is not None and 20.0 <= float(temp[1]) <= 45.0)
-    out["temperature"] = Vital(
-        key="temperature",
-        label="Temperature",
-        value=float(temp[1]) if plausible else None,
-        unit=None,
-        source="latest temperature sample",
-        confidence="candidate",
-        at=temp[0] if temp is not None else None,
-        note="Raw values outside 20-45 are treated as sensor/ADC readings.",
-    )
     return out
+
+
+def _resting_vital(store, start, end) -> Vital:
+    """The band's daily resting HR when sent, else a low-decile estimate."""
+    band = _latest(store, "resting_hr", start, end)
+    if band is not None:
+        return Vital(key="resting_hr", label="Resting HR",
+                     value=float(band[1]), unit="bpm",
+                     source="band's daily resting_heart_rate_value",
+                     confidence="verified", at=band[0])
+    hr_rows = store.samples("heart_rate", start, end)
+    resting = resting_hr_estimate(hr_rows)
+    count = f"{len(hr_rows):,} readings" if hr_rows else "readings; none stored"
+    return Vital(
+        key="resting_hr",
+        label="Resting HR estimate",
+        value=round(resting, 1) if resting is not None else None,
+        unit="bpm",
+        source=f"computed from heart_rate: median of the lowest 10% of {count}",
+        confidence="estimate",
+        note="Not the vendor's resting-HR figure; a low-decile estimate.",
+    )
 
 
 __all__ = [

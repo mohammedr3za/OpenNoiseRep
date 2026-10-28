@@ -415,6 +415,9 @@ class SleepSession:
     source: str = ""
     version: int | None = None
     derived: bool = False
+    latency_min: int | None = None
+    efficiency: int | None = None
+    time_in_bed_min: int | None = None
 
 
 def _plausible_epoch(ts: int) -> bool:
