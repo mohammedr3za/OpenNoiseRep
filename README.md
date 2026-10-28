@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/images/menubar.png" alt="OpenNoiseRep live heart rate in the macOS menu bar" width="820">
+  <img src="docs/images/overview.png" alt="OpenNoiseRep home page with heart rate, vitals, highlights and movement goals" width="900">
 </p>
 
 <h1 align="center">OpenNoiseRep</h1>
@@ -13,17 +13,18 @@
 
 OpenNoiseRep connects to the band over BLE, syncs its history, stores it in
 SQLite, and shows it in a desktop app, a menu-bar heart rate, and a CLI. The
-Python package and command are still named `noiserep`.
+Python package and command are still named `noiserep`. Screenshots use synthetic
+demo data.
 
 ## Screenshots
 
-| Today | Sleep |
+| Sleep | Day navigation |
 |---|---|
-| ![Overview with vitals, highlights, heart/stress and movement goals](docs/images/overview.png) | ![Sleep timeline, HRV stats and stage panel](docs/images/sleep.png) |
+| ![Sleep timeline, HRV stats and stage panel](docs/images/sleep.png) | ![Day mode with calendar and previous/next day](docs/images/day.png) |
 
-| Day navigation | Menu bar |
+| Menu bar | All channels |
 |---|---|
-| ![Day mode with calendar and previous/next day](docs/images/day.png) | ![Menu-bar heart states: 72, tilde, dash](docs/images/menubar.png) |
+| ![Menu-bar heart states: 72, tilde, dash](docs/images/menubar.png) | ![All channels with daily activity, HRV and stress](docs/images/channels.png) |
 
 ## Demo
 
