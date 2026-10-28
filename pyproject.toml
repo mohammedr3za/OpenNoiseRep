@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "noiserep"
 dynamic = ["version"]
-description = "Read raw heart-rate and activity data off the Noise REP band, without the vendor app."
+description = "Open-source desktop app and menu-bar tool for Noise REP heart rate, steps, HRV, sleep/rest and RRI data."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"

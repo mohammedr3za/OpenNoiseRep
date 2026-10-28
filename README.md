@@ -11,10 +11,11 @@
   <img alt="macOS and Linux" src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-CC785C">
 </p>
 
-OpenNoiseRep connects to the band over BLE, syncs its history, stores it in
-SQLite, and shows it in a desktop app, a menu-bar heart rate, and a CLI. The
-Python package and command are still named `noiserep`. Screenshots use synthetic
-demo data.
+OpenNoiseRep is an open-source desktop app and menu-bar tool that reads heart
+rate, steps, HRV, sleep/rest and RRI data from the Noise REP band over BLE. It
+stores everything locally, needs no NoiseFit account, and exports CSV/JSON —
+with a live heart rate in the Mac menu bar. The Python package and command are
+still named `noiserep`. Screenshots use synthetic demo data.
 
 ## Screenshots
 
@@ -84,6 +85,11 @@ and turn the phone's Bluetooth off while syncing.
 - [RRI and sleep file formats](docs/FILES.md)
 - [Roadmap](docs/ROADMAP.md)
 - [Release notes and data caveats](docs/RELEASE-NOTES.md)
+
+## Contributing
+
+Open to contributions from open-source developers. Protocol work, decoders,
+UI and docs are all welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
