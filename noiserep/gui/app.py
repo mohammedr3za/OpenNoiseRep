@@ -1359,11 +1359,11 @@ class MainWindow(AppWindow):
         v.setContentsMargins(15, 12, 15, 12)
         v.setSpacing(2)
 
-        label = QtWidgets.QLabel(caption.upper())
+        label = QtWidgets.QLabel((caption + (" ESTIMATE" if vital.confidence == "estimate" else "")).upper())
         label.setObjectName("vitalLabel")
         v.addWidget(label)
 
-        value_text = _fmt(vital.value) if vital.available else "—"
+        value_text = (f"{vital.value:.1f}" if key == "temperature" else _fmt(vital.value)) if vital.available else "—"
         row = QtWidgets.QHBoxLayout()
         row.setSpacing(4)
         value = QtWidgets.QLabel(value_text)
@@ -1376,6 +1376,10 @@ class MainWindow(AppWindow):
         row.addStretch(1)
         v.addLayout(row)
 
+        if vital.at:
+            recorded = QtWidgets.QLabel(f"Recorded {vital.at:%d %b %H:%M}")
+            recorded.setObjectName("muted")
+            v.addWidget(recorded)
         v.addStretch(1)
 
         card.setToolTip(self._vital_tooltip(vital))
@@ -2677,15 +2681,18 @@ class MainWindow(AppWindow):
             vital = analytics.vitals(self.store, start, end).get(key)
         except Exception:  # noqa: BLE001
             vital = None
-        rows = self.store.samples(guide["metric"], start, end)
+        rows = analytics.vital_series(self.store, key, start, end)
 
-        self.vital_detail_title.setText(guide["title"])
+        self.vital_detail_title.setText(vital.label if vital else guide["title"])
         self.vital_detail_sub.setText(self._range_caption())
         self.vital_detail_value.setText(
             _fmt(vital.value) if vital is not None and vital.available else "—")
         self.vital_detail_unit.setText(
             (vital.unit or "") if vital is not None and vital.available else "")
-        self.vital_meaning.setText(guide["meaning"])
+        provenance = (f"Source: {vital.source}. {vital.note or ''}" if vital else "")
+        self.vital_meaning.setText(provenance + "\n\n" + guide["meaning"])
+        if vital and vital.at:
+            self.vital_detail_sub.setText(self._range_caption() + f" · Recorded {vital.at:%d %b %H:%M}")
         self.vital_typical.setText(guide["typical"])
 
         self._clear_layout(self.vital_stat_row)
@@ -2704,6 +2711,9 @@ class MainWindow(AppWindow):
         self.vital_stat_row.addStretch(1)
 
         self.vital_chart.set_data(rows, vital.unit if vital else None)
+        self.vital_chart.getPlotItem().setTitle(
+            "5-minute RMSSD estimates · not official nightly HRV" if key == "hrv" and vital and vital.confidence == "estimate"
+            else "No samples synced for this period" if not rows else None)
         self.stack.setCurrentIndex(4)
 
     # -- stat row helpers ------------------------------------------------

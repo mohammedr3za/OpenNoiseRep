@@ -73,13 +73,7 @@ def today_data(store, day: dt.date, age: int | None = None) -> dict:
     if s.sleep and s.sleep.get("id"):
         stages = [(r["ts"], r["stage"]) for r in store.sleep_stages(s.sleep["id"])]
     window = s.sleep_window or (start, end)
-    vitals = analytics.vitals(store, *window)
-    day_vitals = analytics.vitals(store, start, end)
-    for key in ("spo2", "stress", "temperature", "resp_rate"):
-        if not vitals[key].available:
-            vitals[key] = day_vitals[key]
-    if s.hrv_ms is not None:
-        vitals["hrv"] = analytics.Vital("hrv", "HRV", s.hrv_ms, "ms", "nightly", "verified")
+    vitals = analytics.vitals(store, start, end)
 
     def series(metric):
         return [(t, v) for t, v in store.samples(metric, start, end) if v]
@@ -472,6 +466,7 @@ class StatRow(QtWidgets.QWidget):
         h.setSpacing(8)
         h.addWidget(style(QtWidgets.QLabel("●"), 9, color=color))
         label = style(QtWidgets.QLabel(name), 13)
+        self.label = label
         label.setWordWrap(True)
         h.addWidget(label, 1)
         h.addStretch(1)
@@ -892,10 +887,17 @@ class TodayPage(QtWidgets.QScrollArea):
 
         v = d["vitals"]
         self.vital_rows["hrv"].set(v["hrv"].value, "ms")
-        self.vital_rows["resting_hr"].set(s.rhr_bpm or v["resting_hr"].value, "bpm")
+        self.vital_rows["resting_hr"].set(v["resting_hr"].value, "bpm")
         self.vital_rows["resp_rate"].set(v["resp_rate"].value, "brpm")
         self.vital_rows["spo2"].set(v["spo2"].value, "%")
         self.vital_rows["temperature"].set(v["temperature"].value, "°C", "{:.1f}")
+        for key, row in self.vital_rows.items():
+            vital = v[key]
+            if key in ("hrv", "resting_hr"):
+                row.label.setText(vital.label)
+            recorded = f" · {vital.at:%d %b %H:%M}" if vital.at else ""
+            row.setToolTip(f"{vital.source}{recorded}. {vital.note or ''}")
+
 
         window = s.sleep_window
         self.hypnogram.set(d["stages"], *(window or (None, None)))

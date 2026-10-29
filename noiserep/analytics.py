@@ -384,3 +384,38 @@ __all__ = [
     "summarize",
     "vitals",
 ]
+
+
+def vital_series(store, key, start=None, end=None):
+    """Series with the same provenance as the displayed vital."""
+    metrics = {"hrv": "sleep_hrv", "resting_hr": "resting_hr",
+               "temperature": "temperature", "spo2": "blood_oxygen",
+               "resp_rate": "respiratory_rate", "stress": "stress"}
+    rows = store.samples(metrics[key], start, end)
+    if rows:
+        return rows
+    if key == "hrv":
+        from .scores import nightly_hrv
+        fn = getattr(store, "rest_summary", None)
+        summary = fn(start, end) if fn else None
+        if summary is None:
+            return []
+        buckets = {}
+        for ts, rr in store.rri(summary.start, summary.end):
+            index = int((ts - summary.start).total_seconds()) // 300
+            buckets.setdefault(index, []).append((ts, rr))
+        out = []
+        for index, pairs in sorted(buckets.items()):
+            lo = summary.start + dt.timedelta(seconds=index * 300)
+            value = nightly_hrv(pairs, lo, lo + dt.timedelta(seconds=299))
+            if value is not None:
+                out.append((lo, value))
+        return out
+    if key == "resting_hr":
+        days = {}
+        for ts, value in store.samples("heart_rate", start, end):
+            days.setdefault(ts.date(), []).append((ts, value))
+        return [(dt.datetime.combine(day, dt.time()), estimate)
+                for day, pairs in sorted(days.items())
+                if (estimate := resting_hr_estimate(pairs)) is not None]
+    return []

@@ -3,9 +3,10 @@ characteristics, and hand back a Band. bleak is imported lazily so the rest of
 noiserep works without it."""
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
 
-from ..errors import BandNotFound
+from ..errors import BandNotFound, TransportError
 from .transport import Band
 
 READ_UUID = "16186f01-0000-1000-8000-00807f9b34fb"
@@ -79,15 +80,22 @@ async def connect(name: str | None = None, scan_timeout: float = 20.0,
     BleakScanner, BleakClient = _import_bleak()
     device = await find_band(BleakScanner, name, scan_timeout)
     client = BleakClient(device, timeout=25.0)
-    await client.__aenter__()
+    stage = "opening the band's GATT services"
     try:
+        await asyncio.wait_for(client.__aenter__(), timeout=35.0)
+        stage = "subscribing to band notifications"
         band = Band(client, WRITE_UUID, debug=debug)
         band.name = getattr(device, "name", None)
         for uuid in (READ_UUID, WRITE_UUID, ACT_UUID):
-            await client.start_notify(
+            await asyncio.wait_for(client.start_notify(
                 uuid,
                 (lambda u: (lambda _, d: band.on_notify(u, bytes(d))))(uuid),
-            )
+            ), timeout=10.0)
         yield band
+    except asyncio.TimeoutError as exc:
+        raise TransportError(f"Timed out while {stage}; disconnecting before retry") from exc
     finally:
-        await client.__aexit__(None, None, None)
+        try:
+            await asyncio.wait_for(client.__aexit__(None, None, None), timeout=5.0)
+        except (OSError, asyncio.TimeoutError):
+            pass  # a failed Windows link may already have disappeared
