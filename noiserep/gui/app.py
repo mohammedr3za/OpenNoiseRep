@@ -19,6 +19,7 @@ import math
 import os
 import subprocess
 import sys
+import tempfile
 
 import pyqtgraph as pg
 import qasync
@@ -344,6 +345,40 @@ def _end_tree(proc) -> None:
         subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
                        capture_output=True, check=False)
     proc.terminate()
+
+
+GUI_LOCK = os.path.join(tempfile.gettempdir(), "noiserep-gui.lock")
+
+
+def _end_pid_tree(pid: int) -> None:
+    if os.name == "nt":
+        import subprocess
+        subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
+                       capture_output=True, check=False)
+    else:
+        import signal
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+
+
+def _take_single_instance() -> QtCore.QLockFile:
+    """Own the app lock, ending an older window first.
+
+    Two windows would fight over the band's single BLE connection, with one
+    stuck on "Waiting for band" for good, so the newest launch wins.
+    """
+    lock = QtCore.QLockFile(GUI_LOCK)
+    lock.setStaleLockTime(0)
+    if not lock.tryLock(0):
+        info = lock.getLockInfo()
+        pid = info[1] if isinstance(info, tuple) and info[0] else 0
+        if pid and pid != os.getpid():
+            _end_pid_tree(pid)
+        lock.removeStaleLockFile()
+        lock.tryLock(3000)
+    return lock
 
 
 def _end_stray_menubar() -> None:
@@ -3400,9 +3435,11 @@ def main(argv: list[str] | None = None) -> int:
     app.setStyleSheet(theme.QSS)
     loop = qasync.QEventLoop(app)
     asyncio.set_event_loop(loop)
+    lock = _take_single_instance()
     store = Store(default_db_path())
     app.aboutToQuit.connect(store.close)
     win = MainWindow(store)
+    win._instance_lock = lock
     reloader = None
     if "--reload" in (argv or []):
         from .dev_reload import DevReloader

@@ -71,8 +71,10 @@ async def connect(name: str | None = None, scan_timeout: float = 20.0,
                   debug: bool = False):
     """Connect to a band by advertised name, or discover the only Noise_REP_*.
 
-    ``name=None`` means auto-detect. A scan that finds no band still raises
-    ``BandNotFound`` immediately (the band sleeps off-charger; do not retry).
+    ``name=None`` means auto-detect.  Windows' cached services are used: an
+    uncached read fails on this band ("Catastrophic failure").  If repeated
+    interrupted links leave the cache with only generic services, turning
+    the PC's Bluetooth off and on rebuilds it.
     """
     BleakScanner, BleakClient = _import_bleak()
     device = await find_band(BleakScanner, name, scan_timeout)
