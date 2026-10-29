@@ -332,79 +332,48 @@ class AnimatedNumber(QtWidgets.QLabel):
         self._anim.start()
 
 
-def _end_tree(proc) -> None:
-    """Stop a child and everything it started.
-
-    On Windows a venv's python.exe is a launcher that spawns the real
-    interpreter, so terminate() alone leaves the child alive holding the
-    band's only BLE connection.
-    """
-    pid = getattr(proc, "pid", None)
-    if os.name == "nt" and pid:
-        import subprocess
-        subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
-                       capture_output=True, check=False)
-    proc.terminate()
-
-
 GUI_LOCK = os.path.join(tempfile.gettempdir(), "noiserep-gui.lock")
 
 
-def _end_pid_tree(pid: int) -> None:
-    if os.name == "nt":
-        import subprocess
-        subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
-                       capture_output=True, check=False)
-    else:
-        import signal
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except OSError:
-            pass
+def _focus_existing_window(pid: int) -> None:
+    if os.name != "nt" or pid <= 0:
+        return
+    import ctypes
+    from ctypes import wintypes
+    user32 = ctypes.windll.user32
+    callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    @callback_type
+    def visit(hwnd, _):
+        owner = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
+        if owner.value == pid and user32.IsWindowVisible(hwnd):
+            user32.ShowWindow(hwnd, 9)
+            user32.SetForegroundWindow(hwnd)
+            return False
+        return True
+
+    user32.EnumWindows(visit, 0)
 
 
 def _take_single_instance() -> QtCore.QLockFile:
-    """Own the app lock, ending an older window first.
-
-    Two windows would fight over the band's single BLE connection, with one
-    stuck on "Waiting for band" for good, so the newest launch wins.
-    """
+    """Never terminate an existing BLE owner on a duplicate app launch."""
     lock = QtCore.QLockFile(GUI_LOCK)
     lock.setStaleLockTime(0)
     if not lock.tryLock(0):
         info = lock.getLockInfo()
-        pid = info[1] if isinstance(info, tuple) and info[0] else 0
-        if pid and pid != os.getpid():
-            _end_pid_tree(pid)
-        lock.removeStaleLockFile()
-        lock.tryLock(3000)
+        if isinstance(info, tuple) and info[0]:
+            _focus_existing_window(info[1])
+        print("NoiseRep is already running, or its instance lock is unavailable.", flush=True)
+        raise SystemExit(0)
     return lock
 
 
-def _end_stray_menubar() -> None:
-    """Stop a Live helper this window did not start (or lost track of).
-
-    The helper holds ``MENUBAR_LOCK``; its owner PID says which process to
-    end, so a forgotten copy can never keep the band to itself.
-    """
-    from .menubar import MENUBAR_LOCK
-
-    lock = QtCore.QLockFile(MENUBAR_LOCK)
-    info = lock.getLockInfo()
-    ok, pid = (info[0], info[1]) if isinstance(info, tuple) else (False, 0)
-    if not ok or not pid or pid == os.getpid():
-        return
-    if os.name == "nt":
-        import subprocess
-        subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
-                       capture_output=True, check=False)
-    else:
-        import signal
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except OSError:
-            pass
-    lock.removeStaleLockFile()
+def _restart_gui(lock) -> None:
+    """Called only after the window's asynchronous BLE shutdown has finished."""
+    lock.unlock()
+    subprocess.Popen([sys.executable, "-m", "noiserep.cli", "gui", "--reload"],
+                     start_new_session=True)
 
 
 def _profile_age() -> int | None:
@@ -825,6 +794,9 @@ class MainWindow(AppWindow):
         self._menubar_proc = None
         self._menubar_stopping = False
         self._last_live = None
+        self._closing = False
+        self._history_busy = False
+        self._cleanup_blocked = False
         self._menubar_poll = QtCore.QTimer(self)
         self._menubar_poll.setInterval(1000)
         self._menubar_poll.timeout.connect(self._poll_menubar)
@@ -3107,27 +3079,47 @@ class MainWindow(AppWindow):
     def _release_link(self, then) -> None:
         """Cancel the in-app band link, then call ``then`` once it let go."""
         task = self._link_task
+        if task is not None and task.done():
+            self._link_finished(task)
+        if self._cleanup_blocked:
+            self.live_btn.setEnabled(True)
+            self._set_live_btn(False)
+            self._show_error("Restart the app before opening another band connection; cleanup was incomplete.")
+            return
         if task is None or task.done():
             self._link_task = None
             return then()
         self._set_band_state("idle", "Releasing the band…")
         fired = []
 
-        def go(*_):
-            if not fired:
+        def go(completed=None):
+            if not fired and not self._closing:
                 fired.append(1)
                 self._link_task = None
+                if completed is not None and not getattr(completed, "cancelled", lambda: False)():
+                    error = getattr(completed, "exception", lambda: None)()
+                    if error is not None:
+                        self.live_btn.setEnabled(True)
+                        self._set_live_btn(False)
+                        self._show_error(f"Could not release the old band connection: {error}")
+                        return
                 then()
 
         task.add_done_callback(go)
-        QtCore.QTimer.singleShot(5000, go)
+        # A timer must never create a second owner while teardown is pending.
+        def still_releasing():
+            if self._link_task is task and not task.done():
+                self._set_status("Still releasing the band; Live will start after cleanup.")
+        QtCore.QTimer.singleShot(5000, still_releasing)
         task.cancel()
 
     def _start_menubar(self) -> None:
         self.live_btn.setEnabled(True)
         try:
             self._menubar_proc = subprocess.Popen(
-                [sys.executable, "-m", "noiserep.cli", "menubar", "--db", self.store.path],
+                [sys.executable, "-m", "noiserep.cli", "menubar", "--db", self.store.path,
+                 "--parent-control"], stdin=subprocess.PIPE, text=True,
+                env={**os.environ, "NOISEREP_PARENT_GUI_PID": str(os.getpid())},
                 start_new_session=True)
         except OSError as exc:
             self._set_live_btn(False)
@@ -3141,18 +3133,32 @@ class MainWindow(AppWindow):
                          "link is paused until you click Live again.")
         self._menubar_poll.start()
 
-    def _free_band(self) -> None:
-        """Make sure nothing else in this app holds the band."""
+    def _free_band(self) -> bool:
+        """Request a graceful helper release; callers wait for process exit."""
         if self._menubar_active():
             self._stop_menubar()
-        _end_stray_menubar()
+            return False
+        if self._menubar_running():
+            self._set_status("Live HR is running separately. Quit it from its tray menu before syncing.")
+            return False
+        return True
 
     def _stop_menubar(self) -> None:
+        if self._menubar_stopping:
+            return
         proc = self._menubar_proc
         self._menubar_stopping = True
         self.live_btn.setEnabled(False)
         self._set_live_btn(True, "Stopping…")
-        _end_tree(proc)
+        try:
+            if proc is None or proc.stdin is None:
+                raise OSError("helper has no parent control channel")
+            proc.stdin.write("quit\n")
+            proc.stdin.flush()
+        except OSError as exc:
+            self._menubar_stopping = False
+            self.live_btn.setEnabled(True)
+            self._show_error(f"Could not request Live HR shutdown: {exc}. Quit it from the tray menu.")
 
     def _poll_menubar(self) -> None:
         proc = self._menubar_proc
@@ -3170,11 +3176,19 @@ class MainWindow(AppWindow):
                     self.today.live_card.setToolTip("Waiting for a fresh reading from the band…")
             return
         self._menubar_poll.stop()
+        if getattr(proc, "stdin", None) is not None:
+            try:
+                proc.stdin.close()
+            except (OSError, ValueError):
+                pass  # an exited helper can leave buffered writes on the pipe
         self._menubar_proc = None
         if not getattr(self, "_menubar_stopping", False):
             self._check_menubar_started(proc)
         self.live_btn.setEnabled(True)
         self._set_live_btn(False)
+        if self._closing:
+            self.close()
+            return
         self._set_status("Live HR stopped; resuming the band link.")
         self.start_link()
 
@@ -3187,13 +3201,16 @@ class MainWindow(AppWindow):
 
     @staticmethod
     def _menubar_running() -> bool:
-        try:
-            proc = subprocess.run(
-                ["pgrep", "-f", "noiserep.cli menubar"],
-                capture_output=True)
-            return proc.returncode == 0
-        except OSError:
+        from .menubar import MENUBAR_LOCK
+        lock = QtCore.QLockFile(MENUBAR_LOCK)
+        lock.setStaleLockTime(0)
+        info = lock.getLockInfo()
+        if isinstance(info, tuple) and info[0] and info[1] == os.getpid():
+            return False  # a standalone helper can host its own main window
+        if lock.tryLock(0):
+            lock.unlock()
             return False
+        return True
 
     def _flash_info(self, ms: int = 4500) -> None:
         """Show the info banner briefly; status is never left on screen."""
@@ -3279,7 +3296,16 @@ class MainWindow(AppWindow):
         import asyncio
         from ..live import keep_linked
 
+        if self._link_task is not None and self._link_task.done():
+            self._link_finished(self._link_task)
+            self._link_task = None
+        if self._cleanup_blocked:
+            self._show_error("Restart the app before retrying; the previous Bluetooth cleanup was incomplete.")
+            return
         if self._link_task is not None:
+            return
+        if self._menubar_running():
+            self._set_band_state("idle", "Live HR app owns the band")
             return
         self._sync_now = asyncio.Event()
         self._set_band_state("searching", "Searching for band…")
@@ -3287,19 +3313,51 @@ class MainWindow(AppWindow):
             self.store, self.band_name, on_sample=self._on_live,
             on_status=self._on_link_status, sync_now=self._sync_now,
             on_history=self._after_history, on_progress=self._sync_progress))
+        self._link_task.add_done_callback(self._link_finished)
+
+    def _link_finished(self, task) -> None:
+        from ..errors import ConnectionCleanupError
+
+        if task.cancelled():
+            return
+        error = task.exception()
+        if isinstance(error, ConnectionCleanupError):
+            self._cleanup_blocked = True
+        if error is not None and not self._closing:
+            self._on_link_status(f"disconnected ({error}); band link stopped")
+            self._set_band_state("idle", "Band link stopped")
+            self._show_error(f"Band connection stopped: {error}")
 
     def _on_link_status(self, text: str) -> None:
         print(f"{datetime.datetime.now():%H:%M:%S} [band link] {text}", flush=True)
         if text == "connected":
             self._linked = True
             self._set_band_state("live", "Connected")
+        elif text in ("connecting remembered band", "opening band services"):
+            self._set_band_state("searching", "Connecting to band…")
+        elif text.startswith("scanning") or text.startswith("direct reconnect failed"):
+            self._set_band_state("searching", "Looking for band…")
+            self.band_state.setToolTip(text)
         elif text == "syncing history":
+            self._history_busy = True
             self._set_band_state("live", "Syncing history…")
             self._set_status("Syncing history from the band…")
         elif text.startswith("disconnected"):
+            self._history_busy = False
             self.sync_bar.finish(ok=False)
-            self._set_band_state("searching", "Waiting for band…")
+            self._set_band_state("searching", "Band unavailable · retrying")
+            self.band_state.setToolTip(text)
+            self._set_status(text)
             self._linked = False
+            self._last_live = None
+            self.today.live_hr.set(None)
+            self.today.live_spo2.set(None)
+            self.today.live_stress.set(None)
+            self.today.live_card.setToolTip(text)
+        elif text == "live":
+            self._history_busy = False
+        elif text.startswith("retrying in"):
+            self._set_status(text.capitalize())
 
     def _on_live(self, sample) -> None:
         self._last_live = sample
@@ -3317,19 +3375,24 @@ class MainWindow(AppWindow):
         refuse the next connection until its supervision timeout passes.
         """
         if self._menubar_active():
-            _end_tree(self._menubar_proc)
+            event.ignore()
+            self._closing = True
+            self._stop_menubar()
+            return
         task = self._link_task
         if task is None or task.done():
             return super().closeEvent(event)
         event.ignore()
+        if self._closing:
+            return
+        self._closing = True
         self._set_band_state("idle", "Disconnecting…")
         task.add_done_callback(lambda _: self.close())
-        QtCore.QTimer.singleShot(5000, lambda: task.done() or self._force_close())
+        QtCore.QTimer.singleShot(15000, lambda: task.done() or self._shutdown_slow())
         task.cancel()
 
-    def _force_close(self) -> None:
-        self._link_task = None
-        self.close()
+    def _shutdown_slow(self) -> None:
+        self._set_status("Waiting for Windows to release Bluetooth before closing…")
 
     def _after_history(self) -> None:
         self._refresh_device()
@@ -3367,13 +3430,15 @@ class MainWindow(AppWindow):
     async def _on_sync(self) -> None:
         if self._syncing:
             return
-        self._free_band()
+        if not self._free_band():
+            return
         if self._sync_now is not None:
             # The link owns the band's one connection: (re)start it and
             # have it sync right away.
             if self._link_task is None or self._link_task.done():
-                self._link_task = None
                 self.start_link()
+                if self._cleanup_blocked:
+                    return
             self._sync_now.set()
             if getattr(self, "_linked", False):
                 self._set_status("Syncing…")
@@ -3464,8 +3529,7 @@ def main(argv: list[str] | None = None) -> int:
     with loop:
         loop.run_forever()
     if reloader is not None and reloader.requested:
-        subprocess.Popen([sys.executable, "-m", "noiserep.cli", "gui", "--reload"],
-                         start_new_session=True)
+        _restart_gui(lock)
     return 0
 
 

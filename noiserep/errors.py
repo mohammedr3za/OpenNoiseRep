@@ -11,5 +11,9 @@ class TransportError(Exception):
     """Chunk framing / ack failure, or the band NACKed a frame."""
 
 
+class ConnectionCleanupError(TransportError):
+    """The previous BLE owner could not confirm its resources were released."""
+
+
 class SyncTimeout(Exception):
     """Expected data did not arrive within the allotted time."""

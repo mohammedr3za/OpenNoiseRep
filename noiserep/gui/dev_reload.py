@@ -44,6 +44,8 @@ class DevReloader(QtCore.QObject):
         except (SyntaxError, OSError) as exc:
             self.window._set_status(f"Auto-reload waiting: {exc}")
             return
+        if getattr(self.window, '_history_busy', False):
+            return  # finish saving fetched history before restarting the process
         self.timer.stop()
         settings = QtCore.QSettings('NoiseREP', 'Development')
         settings.setValue('geometry', self.window.saveGeometry())

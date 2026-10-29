@@ -21,6 +21,8 @@ BASIC_DATA_REPORT = 164
 REPORT_BASIC_DATA = 165
 GET_RING_WEAR_STATUS = 420
 SCAN_WINDOW_S = 60.0
+MAX_SILENT_POLLS = 3
+MAX_RETRY_S = 30.0
 MICRO_FUNCTION_FIELD = 12
 WEARING_FIELD = 12          # SEMicroFunction.inquiry_wearing_status
 
@@ -108,12 +110,20 @@ def parse_basic(payload: bytes, now: dt.datetime | None = None) -> LiveSample | 
         return None
 
 
-async def _drain(band) -> None:
-    while True:
+async def _drain(band, max_messages: int = 32) -> None:
+    """Wait for a quiet stream; never feed stale live packets into sync."""
+    from .errors import TransportError
+
+    deadline = time.monotonic() + 2.0
+    for _ in range(max_messages):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
         try:
-            await band.recv(timeout=0.5)
+            await band.recv(timeout=min(remaining, 0.5))
         except asyncio.TimeoutError:
             return
+    raise TransportError("Live stream did not become quiet before history sync")
 
 
 async def _history(band, store, on_progress=None) -> None:
@@ -125,15 +135,16 @@ async def _history(band, store, on_progress=None) -> None:
     store.ingest(result, note="live link history sync")
 
 
-async def _poll(band, store, interval: float, on_sample, wake=None) -> None:
+async def _poll(band, store, interval: float, on_sample, wake=None) -> bool:
     """One poll: wear status, then live reports until ``interval`` or ``wake``."""
     await band.send(wear_query())
     await band.send(basic_data(True))
     deadline = time.monotonic() + interval
     last, worn = None, None
+    received = False
     while (left := deadline - time.monotonic()) > 0:
         if wake is not None and wake.is_set():
-            return
+            return received
         try:
             msg = await band.recv(timeout=min(left, 1.0))
         except asyncio.TimeoutError:
@@ -150,10 +161,12 @@ async def _poll(band, store, interval: float, on_sample, wake=None) -> None:
             sample = dataclasses.replace(sample, worn=worn)
             store.write_live(sample)
             on_sample(sample)
+            received = True
+    return received
 
 
 async def keep_linked(store, name: str | None = None, interval: float = 10.0,
-                      history_every: float = 1800.0, retry_s: float = 1.0,
+                      history_every: float = 1800.0, retry_s: float = 3.0,
                       on_sample=lambda s: None, on_status=lambda s: None,
                       sync_now: asyncio.Event | None = None,
                       on_history=lambda: None, on_progress=None) -> None:
@@ -164,20 +177,30 @@ async def keep_linked(store, name: str | None = None, interval: float = 10.0,
     """
     from bleak.exc import BleakError
 
-    from .ble.connection import connect
-    from .errors import BandNotFound, TransportError
+    from .ble.connection import connect, remembered_address
+    from .errors import BandNotFound, ConnectionCleanupError, TransportError
 
+    if interval <= 0 or history_every <= 0 or retry_s < 0:
+        raise ValueError("Live/history intervals must be positive; retry delay cannot be negative")
+    address = remembered_address(store, name)
+    failures = 0
     while True:
         try:
-            # Worn, the band advertises only every ~30 s or more, so scan in
-            # long windows with almost no gap or the rare adverts are missed.
-            async with connect(name, scan_timeout=SCAN_WINDOW_S) as band:
+            async with connect(name, scan_timeout=15.0 if address else SCAN_WINDOW_S,
+                               address=address, on_status=on_status) as band:
+                address = getattr(band, "address", None) or address
                 name = name or getattr(band, "name", None)
                 on_status("connected")
+                # Deliver a current report before the potentially long history sync.
+                initial_report = await _poll(band, store, min(interval, 3.0), on_sample)
+                silent = 0 if initial_report else 1
+                if initial_report:
+                    failures = 0
+                    on_status("live")
                 last_history = float("-inf")
                 while band.c.is_connected:
                     forced = sync_now is not None and sync_now.is_set()
-                    if forced or time.monotonic() - last_history >= history_every:
+                    if forced or (silent == 0 and time.monotonic() - last_history >= history_every):
                         if sync_now is not None:
                             sync_now.clear()
                         on_status("syncing history")
@@ -185,8 +208,23 @@ async def keep_linked(store, name: str | None = None, interval: float = 10.0,
                         last_history = time.monotonic()
                         on_history()
                         on_status("live")
-                    await _poll(band, store, interval, on_sample, sync_now)
+                    report = await _poll(band, store, interval, on_sample, sync_now)
+                    if report:
+                        if silent:
+                            on_status("live")
+                        silent = 0
+                        failures = 0
+                    elif sync_now is None or not sync_now.is_set():
+                        silent += 1
+                        if silent >= MAX_SILENT_POLLS:
+                            raise TransportError("Band link stopped delivering live reports")
+        except ConnectionCleanupError as exc:
+            on_status(f"disconnected ({exc}); close and reopen the app before retrying")
+            raise  # the owner must know release failed; a handoff is unsafe
         except (BandNotFound, TransportError, BleakError, OSError,
                 asyncio.TimeoutError) as exc:
             on_status(f"disconnected ({str(exc) or type(exc).__name__}); retrying")
-        await asyncio.sleep(retry_s)
+        failures = min(failures + 1, 6)
+        delay = min(MAX_RETRY_S, retry_s * 2 ** (failures - 1))
+        on_status(f"retrying in {delay:g} seconds")
+        await asyncio.sleep(delay)

@@ -367,6 +367,7 @@ def main(argv: list[str] | None = None) -> int:
                    help="advertised band name; default auto-detect Noise_REP_*")
     m.add_argument("--db", dest="db", default=None,
                    help="SQLite DB path; default per-OS user-data dir")
+    m.add_argument("--parent-control", action="store_true", help=argparse.SUPPRESS)
     m.add_argument("--poll", dest="poll", type=float, default=30.0,
                    help="seconds between heart-rate polls (default 30)")
     m.add_argument("--lock-on-away", dest="lock_on_away", action="store_true",
@@ -429,7 +430,8 @@ def main(argv: list[str] | None = None) -> int:
                             poll_seconds=args.poll,
                             lock_on_away=args.lock_on_away,
                             away_seconds=args.away_seconds,
-                            retry_seconds=args.retry_seconds)
+                            retry_seconds=args.retry_seconds,
+                            parent_control=args.parent_control)
     if args.cmd == "buzz":
         if not args.yes:
             print("refusing to vibrate the band without --yes "

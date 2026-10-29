@@ -24,11 +24,38 @@ class Band:
         self._streams: dict[object, dict] = {}
         self.msgs: asyncio.Queue = asyncio.Queue()
         self._tasks: set = set()
+        self._closing = False
 
     def on_notify(self, src, data: bytes) -> None:
+        if self._closing:
+            return
         t = asyncio.create_task(self._handle(src, bytes(data)))
         self._tasks.add(t)
-        t.add_done_callback(self._tasks.discard)
+        t.add_done_callback(self._notify_done)
+
+    def _notify_done(self, task) -> None:
+        self._tasks.discard(task)
+        if not task.cancelled() and (error := task.exception()) is not None and not self._closing:
+            self.msgs.put_nowait(TransportError(f"BLE notification failed: {error}"))
+
+    async def aclose(self) -> None:
+        """Stop notification ACK writers before disposing the GATT client."""
+        self._closing = True
+        tasks = list(self._tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._tasks.clear()
+        self._streams.clear()
+
+    async def _write(self, uuid, data, timeout=6.0) -> None:
+        if self._closing:
+            raise TransportError("BLE transport is closing")
+        try:
+            await asyncio.wait_for(self.c.write_gatt_char(uuid, data, response=False), timeout)
+        except asyncio.TimeoutError as exc:
+            raise TransportError("BLE write timed out") from exc
 
     async def _handle(self, src, data: bytes) -> None:
         if self.debug:
@@ -41,8 +68,10 @@ class Band:
             if kind == 0:                                   # band starts a transfer
                 n = struct.unpack_from("<H", data, 4)[0] if len(data) >= 6 else 0
                 self._streams[src] = {"n": n, "parts": {}}
-                await self.c.write_gatt_char(src, ACK_START, response=False)
+                await self._write(src, ACK_START)
             elif kind == 1:                                 # ack for our transfer
+                if len(data) < 4:
+                    return
                 st = data[3]
                 if st == 1:
                     self.ack_start.set()
@@ -59,7 +88,7 @@ class Band:
         if stream["n"] and len(stream["parts"]) >= stream["n"]:
             full = b"".join(stream["parts"][i] for i in sorted(stream["parts"]))
             self._streams.pop(src, None)
-            await self.c.write_gatt_char(src, ACK_END, response=False)
+            await self._write(src, ACK_END)
             await self.msgs.put(full)
 
     async def send(self, payload: bytes, size: int = 242, timeout: float = 6.0) -> None:
@@ -67,7 +96,7 @@ class Band:
         self.ack_start.clear()
         self.ack_end.clear()
         self._nack = False
-        await self.c.write_gatt_char(self.write_uuid, struct.pack("<HBBH", 0, 0, 0, n), response=False)
+        await self._write(self.write_uuid, struct.pack("<HBBH", 0, 0, 0, n), timeout)
         try:
             await asyncio.wait_for(self.ack_start.wait(), timeout=timeout)
         except asyncio.TimeoutError as exc:
@@ -76,7 +105,10 @@ class Band:
             raise TransportError("band NACKed the transfer")
         for i in range(n):
             chunk = struct.pack("<H", i + 1) + payload[i * size:(i + 1) * size]
-            await self.c.write_gatt_char(self.write_uuid, chunk, response=False)
+            await self._write(self.write_uuid, chunk, timeout)
 
     async def recv(self, timeout: float = 10.0) -> bytes:
-        return await asyncio.wait_for(self.msgs.get(), timeout=timeout)
+        message = await asyncio.wait_for(self.msgs.get(), timeout=timeout)
+        if isinstance(message, TransportError):
+            raise message
+        return message
