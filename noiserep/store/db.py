@@ -29,6 +29,7 @@ local timezone; `_from_ts` recovers the original naive datetime.
 from __future__ import annotations
 
 import datetime as _dt
+import json
 import os
 import pathlib
 import sqlite3
@@ -151,6 +152,12 @@ CREATE TABLE IF NOT EXISTS sleep_stages(
 CREATE TABLE IF NOT EXISTS rri_samples(
     ts INTEGER PRIMARY KEY,
     rr_ms INTEGER);
+CREATE TABLE IF NOT EXISTS live(
+    id INTEGER PRIMARY KEY CHECK(id=1), ts INTEGER, json TEXT);
+CREATE TABLE IF NOT EXISTS workouts(
+    start INTEGER, kind TEXT, duration_s INTEGER, level TEXT,
+    steps INTEGER, kcal INTEGER, source TEXT,
+    PRIMARY KEY(start, kind));
 CREATE INDEX IF NOT EXISTS idx_samples_metric_ts ON samples(metric, ts);
 CREATE INDEX IF NOT EXISTS idx_sleep_sessions_bedtime ON sleep_sessions(bedtime);
 CREATE INDEX IF NOT EXISTS idx_sleep_stages_session ON sleep_stages(session_id, ts);
@@ -166,6 +173,8 @@ _MIGRATIONS = {
         ("total_min", "INTEGER"), ("deep_min", "INTEGER"),
         ("light_min", "INTEGER"), ("rem_min", "INTEGER"),
         ("awake_min", "INTEGER"), ("quality", "INTEGER"), ("source", "TEXT"),
+        ("latency_min", "INTEGER"), ("efficiency", "INTEGER"),
+        ("time_in_bed_min", "INTEGER"),
     ),
     "sleep_stages": (("session_id", "INTEGER"), ("ts", "INTEGER"),
                      ("stage", "INTEGER")),
@@ -189,14 +198,63 @@ def _derive_rest_sessions(conn: sqlite3.Connection) -> int:
         ((_from_ts(ts), rr) for ts, rr in rows))
     if summary is None:
         return 0
-    conn.execute("DELETE FROM sleep_sessions WHERE source='rri'")
+    lo, hi = _to_ts(summary.start), _to_ts(summary.end)
+    # A derived session is ours to refresh; a band session is never touched.
+    _drop_sessions(conn, "source IN ('rri','derived') AND wake>=? AND bedtime<=?",
+                   (lo, hi))
+    if conn.execute(
+            "SELECT 1 FROM sleep_sessions WHERE wake>=? AND bedtime<=?",
+            (lo, hi)).fetchone():
+        return 0                 # the band's own session covers this night
     conn.execute(
         "INSERT INTO sleep_sessions(bedtime, wake, total_min, source) "
-        "VALUES(?,?,?,?) ON CONFLICT(bedtime, wake) DO UPDATE SET "
-        "total_min=excluded.total_min, source=excluded.source",
-        (_to_ts(summary.start), _to_ts(summary.end), summary.duration_min, "rri"),
-    )
+        "VALUES(?,?,?,?)", (lo, hi, summary.duration_min, "rri"))
+    _stage_rest_session(conn, summary.start, summary.end)
     return 1
+
+
+def _drop_sessions(conn: sqlite3.Connection, where: str, args: tuple) -> None:
+    ids = [r[0] for r in conn.execute(
+        f"SELECT id FROM sleep_sessions WHERE {where}", args)]
+    for i in ids:
+        conn.execute("DELETE FROM sleep_stages WHERE session_id=?", (i,))
+        conn.execute("DELETE FROM sleep_sessions WHERE id=?", (i,))
+
+
+def _stage_rest_session(conn: sqlite3.Connection, start, end) -> bool:
+    """Upgrade the stage-less 'rri' session to an estimated 'derived' one."""
+    from .. import sleepstage
+
+    def series(metric, lo, hi):
+        return [(_from_ts(t), v) for t, v in conn.execute(
+            "SELECT ts, value FROM samples WHERE metric=? AND ts BETWEEN ? AND ? "
+            "ORDER BY ts", (metric, _to_ts(lo), _to_ts(hi)))]
+
+    # Zero movement is not stored; an empty night only means "still" when the
+    # series was synced for that day at all.
+    synced = conn.execute(
+        "SELECT 1 FROM samples WHERE metric='movement_level' AND ts BETWEEN ? AND ?",
+        (_to_ts(start), _to_ts(end + _dt.timedelta(hours=12)))).fetchone()
+    rri = [(_from_ts(t), r) for t, r in conn.execute(
+        "SELECT ts, rr_ms FROM rri_samples WHERE ts BETWEEN ? AND ? ORDER BY ts",
+        (_to_ts(start), _to_ts(end)))]
+    night = sleepstage.stage_night(
+        start, end, series("heart_rate", start, end),
+        series("movement_level", start, end) if synced else None, rri)
+    if night is None:
+        return False
+    conn.execute(
+        "UPDATE sleep_sessions SET total_min=?, deep_min=?, light_min=?, rem_min=?, "
+        "awake_min=?, latency_min=?, efficiency=?, time_in_bed_min=?, "
+        "source='derived' WHERE bedtime=? AND wake=?",
+        (night.total_min, night.deep_min, night.light_min, night.rem_min,
+         night.awake_min, night.latency_min, night.efficiency,
+         night.time_in_bed_min, _to_ts(start), _to_ts(end)))
+    sid = conn.execute("SELECT id FROM sleep_sessions WHERE bedtime=? AND wake=?",
+                       (_to_ts(start), _to_ts(end))).fetchone()[0]
+    conn.executemany("INSERT INTO sleep_stages(session_id, ts, stage) VALUES(?,?,?)",
+                     [(sid, _to_ts(t), int(st)) for t, st in night.stages])
+    return True
 
 
 def _migrate_metric_names(conn: sqlite3.Connection) -> None:
@@ -217,6 +275,29 @@ def _migrate_metric_names(conn: sqlite3.Connection) -> None:
             "DELETE FROM samples WHERE metric=? AND ts IN "
             "(SELECT ts FROM samples WHERE metric=?)", (old, new))
         conn.execute("UPDATE samples SET metric=? WHERE metric=?", (new, old))
+
+
+#: Before v1 only these series had correct timestamps: heart rate's cadence
+#: field is seconds and metric 0's channels used a fixed hour.  Every other
+#: metric was spaced by a cadence field that is really minutes, so its rows
+#: sit at wrong times (re-sync or re-ingest a dump to restore them).
+_V1_KEEP = ("heart_rate", "metric_2", "steps", "distance_m", "calories",
+            "active_minutes")
+
+
+def _fix_v1(conn: sqlite3.Connection) -> None:
+    """One-time cleanup of pre-schema rows; ``user_version`` makes it run once.
+
+    Drops the mis-timed series and renames daily ``f15`` rows, stored as
+    ``active_minutes``, to what they are: ``active_calories``.
+    """
+    if conn.execute("PRAGMA user_version").fetchone()[0] >= 1:
+        return
+    marks = ",".join("?" * len(_V1_KEEP))
+    conn.execute(f"DELETE FROM samples WHERE metric NOT IN ({marks})", _V1_KEEP)
+    conn.execute(
+        "UPDATE samples SET metric='active_calories' WHERE metric='active_minutes'")
+    conn.execute("PRAGMA user_version=1")
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
@@ -245,6 +326,7 @@ class Store:
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SCHEMA)
         _migrate(self._conn)
+        _fix_v1(self._conn)
         _migrate_metric_names(self._conn)
         _derive_rest_sessions(self._conn)
         self._conn.commit()
@@ -279,7 +361,7 @@ class Store:
         now = int(time.time())
         cur = self._conn.cursor()
         counts = {"samples": 0, "files": 0, "sleep": 0, "sleep_stages": 0,
-                  "rri": 0}
+                  "rri": 0, "workouts": 0}
 
         dev = getattr(result, "device", None)
         if dev is not None and getattr(dev, "mac", ""):
@@ -314,7 +396,8 @@ class Store:
                         rows,
                     )
                     counts["samples"] += len(rows)
-                continue
+                if s.metric_id == 0:
+                    continue          # its samples are packed bytes, not a series
             if not s.samples or not s.interval_s:
                 continue
             metric = metric_name(s.metric_id)
@@ -351,6 +434,16 @@ class Store:
                 counts["sleep"] += 1
                 counts["sleep_stages"] += written[1]
 
+        for w in getattr(result, "workouts", None) or []:
+            cur.execute(
+                "INSERT INTO workouts(start, kind, duration_s, level, steps, "
+                "kcal, source) VALUES(?,?,?,?,?,?,?) ON CONFLICT(start, kind) "
+                "DO UPDATE SET duration_s=excluded.duration_s, "
+                "level=excluded.level, steps=excluded.steps, kcal=excluded.kcal",
+                (_to_ts(w.start), w.kind, w.duration_s, w.level, w.steps,
+                 w.kcal, w.source))
+            counts["workouts"] += 1
+
         for samples in _as_sequence(getattr(result, "rri", None)):
             counts["rri"] += self._write_rri(cur, samples)
         # RRI is the only overnight signal this band sends; derive a rest
@@ -373,19 +466,27 @@ class Store:
         if bedtime is None or wake is None:
             return None
         src = source or _attr(session, "source") or "file"
+        if src != "nap":     # the band's record supersedes our estimate
+            _drop_sessions(self._conn, "source IN ('rri','derived') AND "
+                           "wake>=? AND bedtime<=?", (bedtime, wake))
         cur.execute(
             "INSERT INTO sleep_sessions(bedtime, wake, total_min, deep_min, "
-            "light_min, rem_min, awake_min, quality, source) "
-            "VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(bedtime, wake) DO UPDATE SET "
+            "light_min, rem_min, awake_min, quality, source, latency_min, "
+            "efficiency, time_in_bed_min) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(bedtime, wake) DO UPDATE SET "
             "total_min=excluded.total_min, deep_min=excluded.deep_min, "
             "light_min=excluded.light_min, rem_min=excluded.rem_min, "
             "awake_min=excluded.awake_min, quality=excluded.quality, "
-            "source=excluded.source",
+            "source=excluded.source, latency_min=excluded.latency_min, "
+            "efficiency=excluded.efficiency, "
+            "time_in_bed_min=excluded.time_in_bed_min",
             (
                 bedtime, wake,
                 _attr(session, "total_min"), _attr(session, "deep_min"),
                 _attr(session, "light_min"), _attr(session, "rem_min"),
                 _attr(session, "awake_min"), _attr(session, "quality"), src,
+                _attr(session, "latency_min"), _attr(session, "efficiency"),
+                _attr(session, "time_in_bed_min"),
             ),
         )
         session_id = cur.execute(
@@ -435,6 +536,27 @@ class Store:
             )
             written += 1
         return written
+
+    def write_live(self, sample) -> None:
+        """Keep the latest live report; heart rate also joins ``live_hr``."""
+        data = {k: v for k, v in vars(sample).items() if k != "at"}
+        ts = _to_ts(sample.at)
+        self._conn.execute(
+            "INSERT INTO live(id, ts, json) VALUES(1,?,?) ON CONFLICT(id) DO "
+            "UPDATE SET ts=excluded.ts, json=excluded.json", (ts, json.dumps(data)))
+        if sample.heart_rate:
+            self._conn.execute(
+                "INSERT INTO samples(metric, ts, value) VALUES('live_hr',?,?) "
+                "ON CONFLICT(metric, ts) DO UPDATE SET value=excluded.value",
+                (ts, float(sample.heart_rate)))
+        self._conn.commit()
+
+    def live(self) -> dict | None:
+        """The latest live report with its time, or ``None``."""
+        row = self._conn.execute("SELECT ts, json FROM live WHERE id=1").fetchone()
+        if row is None:
+            return None
+        return {"at": _from_ts(row["ts"]), **json.loads(row["json"])}
 
     def ingest_sleep(self, session, source: str | None = None) -> tuple | None:
         """Upsert a decoded sleep session; return ``(session_id, n_stages)``."""
@@ -503,7 +625,8 @@ class Store:
         """Sessions overlapping ``[start, end]`` (a session overlaps when its
         wake is at/after ``start`` and its bedtime is at/before ``end``)."""
         q = ("SELECT id, bedtime, wake, total_min, deep_min, light_min, "
-             "rem_min, awake_min, quality, source FROM sleep_sessions")
+             "rem_min, awake_min, quality, source, latency_min, efficiency, "
+             "time_in_bed_min FROM sleep_sessions")
         conds, args = [], []
         if start is not None:
             conds.append("wake>=?")
@@ -526,6 +649,9 @@ class Store:
                 "awake_min": r["awake_min"],
                 "quality": r["quality"],
                 "source": r["source"],
+                "latency_min": r["latency_min"],
+                "efficiency": r["efficiency"],
+                "time_in_bed_min": r["time_in_bed_min"],
             }
             for r in self._conn.execute(q, args)
         ]
@@ -559,8 +685,17 @@ class Store:
         return analytics.overnight_rest(self.rri(start, end))
 
     def workouts(self) -> list[dict]:
-        """Stored workout/sport activity files (empty on this band so far)."""
-        return [f for f in self.activity_files() if f["kind"] == "workout"]
+        """Band-detected sessions (newest first), then workout files."""
+        rows = self._conn.execute(
+            "SELECT start, kind, duration_s, level, steps, kcal, source "
+            "FROM workouts ORDER BY start DESC").fetchall()
+        sessions = [{"id": f"{r['kind']} {_from_ts(r['start']):%Y-%m-%d %H:%M}",
+                     "kind": r["kind"], "time": _from_ts(r["start"]),
+                     "duration_s": r["duration_s"], "level": r["level"],
+                     "steps": r["steps"], "kcal": r["kcal"],
+                     "source": r["source"], "size": None} for r in rows]
+        files = [f for f in self.activity_files() if f["kind"] == "workout"]
+        return sessions + files
 
     def last_sync(self) -> dict | None:
         row = self._conn.execute(

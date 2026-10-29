@@ -222,7 +222,7 @@ def insights(summary: RestSummary) -> list[str]:
 # ---------------------------------------------------------------------------
 
 #: Keys always present in :func:`vitals`'s result, in display order.
-VITAL_KEYS = ("resting_hr", "hrv", "stress", "spo2", "temperature")
+VITAL_KEYS = ("resting_hr", "hrv", "stress", "spo2", "resp_rate", "temperature")
 
 
 @dataclass(frozen=True)
@@ -295,40 +295,17 @@ def vitals(store, start=None, end=None) -> dict[str, Vital]:
 
     The result always has every key in :data:`VITAL_KEYS`; a missing metric
     yields ``Vital.value is None`` rather than an invented number.  ``hrv``,
-    ``stress`` and ``spo2`` are the latest stored samples of metrics 21, 22 and
-    4; ``temperature`` is metric 23, labelled a *candidate* because its unit is
-    not established (the vendor capture suggests ~27-31 but a live unworn
-    reading was 213).
+    ``stress``, ``spo2``, ``resp_rate`` and ``temperature`` are the latest
+    stored samples of metrics 27, 22, 4, 19 and 8.  Resting HR is the band's
+    own daily value when it sent one, else a low-decile estimate.
     """
-    hr_rows = store.samples("heart_rate", start, end)
-    resting = resting_hr_estimate(hr_rows)
-    if hr_rows:
-        resting_source = (
-            "computed from heart_rate: median of the lowest 10% of "
-            f"{len(hr_rows):,} readings"
-        )
-    else:
-        resting_source = (
-            "computed from heart_rate: median of the lowest 10% of readings; "
-            "none stored"
-        )
-
-    out: dict[str, Vital] = {
-        "resting_hr": Vital(
-            key="resting_hr",
-            label="Resting HR estimate",
-            value=round(resting, 1) if resting is not None else None,
-            unit="bpm",
-            source=resting_source,
-            confidence="estimate",
-            note="Not the vendor's resting-HR figure; a low-decile estimate.",
-        ),
-    }
-
+    out: dict[str, Vital] = {"resting_hr": _resting_vital(store, start, end)}
     specs = (
-        ("hrv", "Heart Rate Variability", "heart_rate_variability", "ms"),
+        ("hrv", "Heart Rate Variability", "sleep_hrv", "ms"),
         ("stress", "Stress", "stress", None),
         ("spo2", "Blood Oxygen (SpO2)", "blood_oxygen", "%"),
+        ("resp_rate", "Respiratory Rate", "respiratory_rate", "brpm"),
+        ("temperature", "Skin Temperature", "temperature", "°C"),
     )
     for key, label, metric, unit in specs:
         row = _latest(store, metric, start, end)
@@ -341,25 +318,53 @@ def vitals(store, start=None, end=None) -> dict[str, Vital]:
             confidence=metric_confidence(metric) or "candidate",
             at=row[0] if row is not None else None,
         )
-
-    # Metric 23 is an hourly 0-255 array whose meaning is not established.  A
-    # vendor day reads 27-31 (consistent with degrees Celsius) while an unworn
-    # live day reads 0 and 213, so expose it as a candidate without a unit.
-    temp = _latest(store, "metric_23", start, end)
-    # 27-31 appears on a worn vendor day and reads as °C; 213 appears off-wrist
-    # and is most likely a raw sensor/ADC value.  Only show a plausible value.
-    plausible = (temp is not None and 20.0 <= float(temp[1]) <= 45.0)
-    out["temperature"] = Vital(
-        key="temperature",
-        label="Temperature",
-        value=float(temp[1]) if plausible else None,
-        unit=None,
-        source="latest temperature sample",
-        confidence="candidate",
-        at=temp[0] if temp is not None else None,
-        note="Raw values outside 20-45 are treated as sensor/ADC readings.",
-    )
+    if not out["hrv"].available:
+        out["hrv"] = _rri_hrv(store, start, end) or out["hrv"]
     return out
+
+
+def _rri_hrv(store, start, end) -> Vital | None:
+    """Cleaned RMSSD over the longest beat-to-beat (RRI) window in range."""
+    from .scores import nightly_hrv
+
+    fn = getattr(store, "rest_summary", None)
+    summary = fn(start, end) if fn is not None else None
+    if summary is None:
+        return None
+    value = nightly_hrv(store.rri(summary.start, summary.end),
+                        summary.start, summary.end)
+    if value is None:
+        return None
+    return Vital(
+        key="hrv", label="HRV estimate", value=value,
+        unit="ms", confidence="estimate", at=summary.end,
+        source=(f"median 5-min RMSSD of cleaned RR intervals, "
+                f"{summary.start:%H:%M}–{summary.end:%H:%M}"),
+        note=("From the band's 64 ms RR slots, which add peak-timing "
+              "jitter; reads high. The band's own sleep HRV replaces it "
+              "once a sleep record syncs."))
+
+
+def _resting_vital(store, start, end) -> Vital:
+    """The band's daily resting HR when sent, else a low-decile estimate."""
+    band = _latest(store, "resting_hr", start, end)
+    if band is not None:
+        return Vital(key="resting_hr", label="Resting HR",
+                     value=float(band[1]), unit="bpm",
+                     source="band's daily resting_heart_rate_value",
+                     confidence="verified", at=band[0])
+    hr_rows = store.samples("heart_rate", start, end)
+    resting = resting_hr_estimate(hr_rows)
+    count = f"{len(hr_rows):,} readings" if hr_rows else "readings; none stored"
+    return Vital(
+        key="resting_hr",
+        label="Resting HR estimate",
+        value=round(resting, 1) if resting is not None else None,
+        unit="bpm",
+        source=f"computed from heart_rate: median of the lowest 10% of {count}",
+        confidence="estimate",
+        note="Not the vendor's resting-HR figure; a low-decile estimate.",
+    )
 
 
 __all__ = [
@@ -379,3 +384,38 @@ __all__ = [
     "summarize",
     "vitals",
 ]
+
+
+def vital_series(store, key, start=None, end=None):
+    """Series with the same provenance as the displayed vital."""
+    metrics = {"hrv": "sleep_hrv", "resting_hr": "resting_hr",
+               "temperature": "temperature", "spo2": "blood_oxygen",
+               "resp_rate": "respiratory_rate", "stress": "stress"}
+    rows = store.samples(metrics[key], start, end)
+    if rows:
+        return rows
+    if key == "hrv":
+        from .scores import nightly_hrv
+        fn = getattr(store, "rest_summary", None)
+        summary = fn(start, end) if fn else None
+        if summary is None:
+            return []
+        buckets = {}
+        for ts, rr in store.rri(summary.start, summary.end):
+            index = int((ts - summary.start).total_seconds()) // 300
+            buckets.setdefault(index, []).append((ts, rr))
+        out = []
+        for index, pairs in sorted(buckets.items()):
+            lo = summary.start + dt.timedelta(seconds=index * 300)
+            value = nightly_hrv(pairs, lo, lo + dt.timedelta(seconds=299))
+            if value is not None:
+                out.append((lo, value))
+        return out
+    if key == "resting_hr":
+        days = {}
+        for ts, value in store.samples("heart_rate", start, end):
+            days.setdefault(ts.date(), []).append((ts, value))
+        return [(dt.datetime.combine(day, dt.time()), estimate)
+                for day, pairs in sorted(days.items())
+                if (estimate := resting_hr_estimate(pairs)) is not None]
+    return []

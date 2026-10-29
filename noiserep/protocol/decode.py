@@ -6,6 +6,10 @@ import functools
 from dataclasses import dataclass, field as dc_field
 
 from ..wire import field, field_all, parse, sub
+from .files import (
+    STAGE_AWAKE, STAGE_DEEP, STAGE_LIGHT, STAGE_REM, STAGE_UNKNOWN,
+    SleepSession, SleepStage,
+)
 
 
 class DecodeError(Exception):
@@ -76,13 +80,13 @@ def decode_index(payload: bytes) -> DataIndex:
     return DataIndex(records)
 
 
-#: Metric 0 is a composite daily-activity record whose arrays are one value per
+#: Metric 0 (SEDailyData) is a composite record whose arrays are one value per
 #: hour.  Channel name -> body field number.  Arrays are big-endian u16.
 DAILY_CHANNELS: tuple[tuple[str, int], ...] = (
     ("steps", 3),
     ("distance_m", 5),
     ("calories", 7),
-    ("active_minutes", 15),
+    ("active_calories", 15),
 )
 
 #: Vendor-computed day totals that accompany the hourly arrays (field number).
@@ -90,8 +94,25 @@ DAILY_CHANNELS: tuple[tuple[str, int], ...] = (
 DAILY_TOTAL_FIELDS: dict[str, int] = {
     "steps": 9,
     "calories": 10,
-    "active_minutes": 13,
+    "active_calories": 13,
 }
+
+#: Array metrics: id -> (body field with the samples, bytes/sample, scale).
+#: Field numbers are the vendor schema's; u16 is big-endian like metric 0.
+ARRAY_LAYOUT: dict[int, tuple[int, int, float]] = {
+    2: (3, 1, 1), 4: (3, 1, 1), 8: (3, 2, 0.01), 11: (3, 1, 1),
+    12: (3, 1, 1), 14: (2, 1, 1), 18: (2, 1, 1), 19: (2, 1, 1),
+    21: (3, 1, 1), 22: (3, 1, 1), 23: (3, 1, 1), 27: (2, 1, 1),
+}
+
+#: Movement levels NoiseFit counts as active (DataConverter.V).
+ACTIVE_LEVELS = range(1, 4)
+
+#: GoMore stage enum -> canonical STAGE_* codes.
+GOMORE_STAGE = {0: STAGE_AWAKE, 1: STAGE_LIGHT, 2: STAGE_DEEP, 3: STAGE_REM}
+
+AUTO_WORKOUT_KIND = {0: "activity", 1: "walk", 2: "run"}
+AUTO_WORKOUT_LEVEL = {0: "low", 1: "medium", 2: "high"}
 
 #: The activity arrays cover a whole day at one value per hour.
 DAILY_HOURS = 24
@@ -124,12 +145,12 @@ def _hourly_u16(value, hours: int = DAILY_HOURS) -> list[int] | None:
 def decode_daily_channels(body: bytes) -> DailyActivity:
     """Decode one metric-0 series body into hourly channels and day totals.
 
-    The body (a type-113/115 ``f9`` sub-message) carries the hourly arrays in
-    ``f3`` steps, ``f5`` distance in metres, ``f7`` active calories and ``f15``
-    active minutes.  Scalars ``f9``/``f10``/``f13`` are the vendor totals for
-    steps / calories / active minutes; when a scalar is absent (or truncated to
-    a non-integer) the array is summed instead.  ``f14`` is a cumulative
-    calorie array, not an independent total, and is deliberately not exposed.
+    The body (SEDailyData) carries the hourly arrays in ``f3`` steps, ``f5``
+    distance in metres, ``f7`` total calories and ``f15`` active (sport)
+    calories.  Scalars ``f9``/``f10``/``f13`` are the vendor totals for steps /
+    calories / active calories; when a scalar is absent (or truncated to a
+    non-integer) the array is summed instead.  ``f14`` is a cumulative calorie
+    array, not an independent total, and is deliberately not exposed.
 
     Only channels whose field is a valid u16 array are returned; a channel with
     no evidence is omitted rather than filled with zeros.
@@ -188,48 +209,208 @@ class MetricSeries:
     totals: dict[str, int] = dc_field(default_factory=dict)
 
 
-@_guarded
-def decode_series(payload: bytes) -> MetricSeries:
-    """Each series lives in its own f9 sub-field (6, 8, 12, ...); find the one
-    whose message carries an entry (f1 = date + metric id).
+def _find_body(payload: bytes) -> tuple[int, dt.datetime, bytes]:
+    """Locate the f9 sub-message that carries an entry (f1 = date + id).
 
-    samples / interval_s come only from f3 (a byte array whose cadence is f2).
-    Without f3, samples is empty and interval_s is None; if f2 is bytes they
-    are kept untouched in `raw` (structure not yet understood).
-
-    For metric 0 (daily activity) the raw f3 bytes stay in ``samples`` for
-    backwards compatibility, while the decoded 24-hour u16 arrays are added in
-    ``channels`` and ``totals`` (see :func:`decode_daily_channels`).
+    The sub-field number is the vendor's oneof slot and varies per metric, so
+    the body is found by shape, not by number.
     """
     container = field(payload, 9)
     if not isinstance(container, (bytes, bytearray)):
         raise DecodeError("no series container (field 9) in payload")
-    for fno, wt, body in parse(container):
+    for _, wt, body in parse(container):
         if wt != 2:
             continue
         entry = field(body, 1)
         if not isinstance(entry, (bytes, bytearray)):
             continue
-        date_buf = field(entry, 1)
-        metric_id = field(entry, 2)
-        if not isinstance(date_buf, (bytes, bytearray)) or metric_id is None:
-            continue
-        f2, f3 = field(body, 2), field(body, 3)
-        if isinstance(f3, (bytes, bytearray)):
-            samples = list(f3)
-            interval = f2 if isinstance(f2, int) else None
-            raw = b""
-        else:
-            samples, interval = [], None
-            raw = bytes(f2) if isinstance(f2, (bytes, bytearray)) else b""
-        channels: dict[str, list[int]] = {}
-        totals: dict[str, int] = {}
-        if metric_id == 0:
-            activity = decode_daily_channels(body)
-            channels, totals = activity.channels, activity.totals
-        return MetricSeries(decode_date(date_buf), metric_id, interval, samples,
-                            raw, channels, totals)
+        date_buf, metric_id = field(entry, 1), field(entry, 2)
+        if isinstance(date_buf, (bytes, bytearray)) and metric_id is not None:
+            return metric_id, decode_date(date_buf), body
     raise DecodeError("no series body (f9 sub-message with entry) in payload")
+
+
+def _array(value, width: int, scale: float) -> list:
+    """Big-endian samples; an all-ones value (0xff / 0xffff) means no reading."""
+    if not isinstance(value, (bytes, bytearray)) or len(value) < width:
+        return []
+    blank = (1 << (8 * width)) - 1
+    out = []
+    for i in range(0, len(value) - width + 1, width):
+        v = int.from_bytes(value[i:i + width], "big")
+        out.append(0 if v == blank else (round(v * scale, 2) if scale != 1 else v))
+    return out
+
+
+def _active_minutes(levels: list) -> list[int]:
+    """Hourly active minutes: slot length x count of active-level slots."""
+    per_hour = len(levels) // DAILY_HOURS
+    if not per_hour:
+        return []
+    slot_min = 60 // per_hour
+    return [slot_min * sum(1 for v in levels[h * per_hour:(h + 1) * per_hour]
+                           if v in ACTIVE_LEVELS)
+            for h in range(DAILY_HOURS)]
+
+
+def _channels_for(metric_id: int, body: bytes, samples: list) -> dict:
+    """Derived per-day/hour channels for metrics that carry them."""
+    if metric_id == 2 and isinstance(field(body, 6), int) and field(body, 6):
+        return {"resting_hr": [field(body, 6)]}
+    if metric_id == 14:
+        return {"active_minutes": _active_minutes(samples)}
+    if metric_id == 17:
+        score, sedentary = field(body, 2), field(body, 3)
+        out = {}
+        if isinstance(score, int):
+            out["health_score"] = [score]
+        if isinstance(sedentary, int):
+            out["sedentary_min"] = [sedentary // 60]
+        return out
+    return {}
+
+
+@_guarded
+def decode_series(payload: bytes) -> MetricSeries:
+    """Decode one type-113 record body into samples and derived channels.
+
+    Known array metrics use :data:`ARRAY_LAYOUT`; cadence is 86400 / count.
+    Metric 0 keeps its raw f3 bytes in ``samples`` (backwards compatibility)
+    and adds hourly ``channels``/``totals``.  Unknown layouts fall back to the
+    old shape: f3 bytes as samples, else f2 bytes kept in ``raw``.
+    """
+    metric_id, date, body = _find_body(payload)
+    f2, f3 = field(body, 2), field(body, 3)
+    raw = b""
+    if metric_id in ARRAY_LAYOUT:
+        fno, width, scale = ARRAY_LAYOUT[metric_id]
+        samples = _array(field(body, fno), width, scale)
+        interval = 86400 // len(samples) if samples and not 86400 % len(samples) else None
+    elif isinstance(f3, (bytes, bytearray)):
+        samples = list(f3)
+        interval = f2 if isinstance(f2, int) else None
+    else:
+        samples, interval = [], None
+        raw = bytes(f2) if isinstance(f2, (bytes, bytearray)) else b""
+    if metric_id == 0:
+        activity = decode_daily_channels(body)
+        return MetricSeries(date, 0, interval, samples, raw,
+                            activity.channels, activity.totals)
+    return MetricSeries(date, metric_id, interval, samples, raw,
+                        _channels_for(metric_id, body, samples))
+
+
+def _local(ts: int) -> dt.datetime:
+    # ponytail: band epochs are UTC; shown in this machine's zone, assumed to
+    # match the band's (it gets UTC + offset from the phone). Pass the band
+    # offset through here if the two ever differ.
+    return dt.datetime.fromtimestamp(ts)
+
+
+def _minutes(value) -> int | None:
+    return value // 60 if isinstance(value, int) else None
+
+
+def _list_items(body: bytes, fno: int) -> list[bytes]:
+    """Items of a vendor ``SEList`` (repeated field 1) held in ``body.fno``."""
+    holder = sub(body, fno)
+    return field_all(holder, 1) if holder is not None else []
+
+
+def decode_sleep_result(body: bytes) -> SleepSession | None:
+    """GoMore SERingSleepResultData (metric 15): the band's own sleep analysis.
+
+    Durations arrive in seconds.  ``None`` when the band says no sleep.
+    """
+    entry, wake = field(body, 3), field(body, 4)
+    if not field(body, 2) or not entry or not wake:
+        return None
+    stages = []
+    for item in _list_items(body, 14):
+        start, kind = field(item, 1), field(item, 3, 0)
+        if start:
+            stages.append(SleepStage(_local(start),
+                                     GOMORE_STAGE.get(kind, STAGE_UNKNOWN), kind))
+    return SleepSession(
+        bedtime=_local(entry), wake=_local(wake),
+        total_min=_minutes(field(body, 5)), deep_min=_minutes(field(body, 12)),
+        light_min=_minutes(field(body, 11)), rem_min=_minutes(field(body, 13)),
+        awake_min=_minutes(field(body, 10)), quality=field(body, 9),
+        stages=stages, source="band",
+        latency_min=_minutes(field(body, 7)), efficiency=field(body, 8),
+        time_in_bed_min=_minutes(field(body, 6)),
+    )
+
+
+def decode_naps(body: bytes) -> list[SleepSession]:
+    """GoMore SERingSleepNapData (metric 16)."""
+    naps = []
+    for item in _list_items(body, 2):
+        start, end = field(item, 2), field(item, 3)
+        if field(item, 1) and start and end:
+            naps.append(SleepSession(bedtime=_local(start), wake=_local(end),
+                                     total_min=_minutes(field(item, 4)),
+                                     source="nap"))
+    return naps
+
+
+@dataclass(frozen=True)
+class Workout:
+    """One workout session; ``source`` is ``"auto"`` for band-detected ones."""
+
+    start: dt.datetime
+    kind: str
+    duration_s: int | None
+    level: str | None = None
+    steps: int | None = None
+    kcal: int | None = None
+    source: str = "auto"
+
+
+def decode_auto_workouts(body: bytes) -> list[Workout]:
+    """GoMore SEAutoActiveSportData (metric 20): band-detected walks/runs.
+
+    The duration unit is assumed seconds (unverified until a live record).
+    """
+    out = []
+    for item in _list_items(body, 2):
+        start = field(item, 3)
+        if not start:
+            continue
+        out.append(Workout(
+            start=_local(start),
+            kind=AUTO_WORKOUT_KIND.get(field(item, 1, 0), "activity"),
+            duration_s=field(item, 4), level=AUTO_WORKOUT_LEVEL.get(field(item, 2, 0)),
+            steps=field(item, 5), kcal=field(item, 6)))
+    return out
+
+
+#: Record metrics: id -> decoder returning a list of records.
+RECORD_DECODERS = {
+    15: lambda body: [s for s in [decode_sleep_result(body)] if s],
+    16: decode_naps,
+    20: decode_auto_workouts,
+}
+
+
+@dataclass
+class SportIds:
+    """Reply to type 117 (GET_FITNESS_SPORT_ID_LIST): stored workout ids.
+
+    The id encoding is not known yet; ``raw`` is kept for when a workout
+    recorded on the band makes it decodable.
+    """
+
+    raw: bytes
+
+
+@_guarded
+def decode_fitness(payload: bytes):
+    """A type-113/115 payload as a MetricSeries, or a list of records."""
+    metric_id, _, body = _find_body(payload)
+    if metric_id in RECORD_DECODERS:
+        return RECORD_DECODERS[metric_id](body)
+    return decode_series(payload)
 
 
 @dataclass
@@ -275,7 +456,11 @@ def decode_payload(payload: bytes):
     if t == 112:
         return decode_index(payload)
     if t in (113, 115):
-        return decode_series(payload)
+        return decode_fitness(payload)
+    if t == 117:
+        ids = sub(payload, 9)
+        raw = field(ids, 3, b"") if ids is not None else b""
+        return SportIds(bytes(raw) if isinstance(raw, (bytes, bytearray)) else b"")
     if t == 4097:
         return decode_file(payload)
     return Unknown(t, payload)

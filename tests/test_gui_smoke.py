@@ -42,7 +42,7 @@ def _seeded(day: datetime.datetime | None = None, others: bool = True) -> Store:
     r.device = DeviceInfo("1.4.0", "SN-TEST", "aa:bb:cc:dd:ee:ff", "R1")
     r.series = [MetricSeries(day, 2, 30, [0, 93, 95, 104], b"")]
     if others:
-        r.series.append(MetricSeries(day, 21, 60, [0, 10, 12, 14], b""))
+        r.series.append(MetricSeries(day, 27, 60, [0, 10, 12, 14], b""))
     s = Store(":memory:")
     s.ingest(r)
     return s
@@ -68,20 +68,21 @@ def _seeded_with_other() -> Store:
 
 
 def _seeded_vitals() -> Store:
-    """Heart rate plus all five vitals and the four daily-activity channels."""
+    """Heart rate plus all six vitals and the four daily-activity channels."""
     day = _today_at_six()
     r = SyncResult()
     r.device = DeviceInfo("1.4.0", "SN-TEST", "aa:bb:cc:dd:ee:ff", "R1")
     r.series = [
         MetricSeries(day, 2, 30, [0, 72, 74, 76], b""),       # HR
-        MetricSeries(day, 21, 900, [0, 58, 60], b""),         # HRV
+        MetricSeries(day, 27, 900, [0, 58, 60], b""),         # HRV
         MetricSeries(day, 22, 300, [0, 35, 40], b""),         # stress
         MetricSeries(day, 4, 300, [0, 98], b""),              # SpO2
-        MetricSeries(day, 23, 3600, [0, 27], b""),            # temp candidate
+        MetricSeries(day, 8, 3600, [0, 32.5], b""),           # skin temp
+        MetricSeries(day, 19, 300, [0, 15], b""),             # resp rate
         MetricSeries(day, 0, 3600, [], b"", channels={
             "steps": [0, 1200, 1800],
             "distance_m": [0, 850, 1300],
-            "calories": [0, 90, 130],
+            "active_calories": [0, 90, 130],
             "active_minutes": [0, 12, 20],
         }),
     ]
@@ -109,13 +110,29 @@ def test_only_verified_metric_gets_a_unit():
     assert display_unit("heart_rate") == "bpm"
 
 
-def test_light_palette_tokens_kept():
-    assert theme.BG == "#FAFAF7"
+def test_light_is_default_and_dark_is_switchable():
+    assert theme.mode == "light"
+    assert theme.BG == "#F5F5F7"
     assert theme.PANEL == "#FFFFFF"
-    assert theme.FG == "#191919"
-    assert theme.ACCENT == "#CC785C"
-    assert theme.ERROR == "#BF4D43"
-    assert theme.SERIES[0] == "#CC785C"
+    assert theme.SERIES[0] == theme.HEART
+    try:
+        theme.apply("dark")
+        assert theme.BG == "#000000"
+        assert theme.PANEL == "#1C1C1E"
+        assert theme.FG == "#F5F5F7"
+        assert theme.ACCENT == "#0A84FF"
+        assert "#1C1C1E" in theme.QSS
+    finally:
+        theme.apply("light")
+    assert "#1C1C1E" not in theme.QSS
+
+
+def test_gutter_centres_a_capped_column():
+    for width in (1000, 1600, 2560, 3840):
+        g = theme.gutter(width)
+        assert theme.GUTTER_MIN <= g
+        assert width - 2 * g <= max(theme.CONTENT_MAX, theme.CONTENT_MIN)
+    assert theme.gutter(3840) > theme.gutter(2560) > theme.gutter(1600)
 
 
 def test_macos_stylesheet_leaves_native_controls_unstyled():
@@ -138,8 +155,9 @@ def test_macos_stylesheet_leaves_native_controls_unstyled():
     assert "\nQWidget {" not in mac
     assert "\nQWidget {" in other
     # Base text properties move to concrete non-native widget types instead.
-    assert "QLabel { background: transparent; color: #191919; font-size: 13px; }" in mac
-    assert "QMainWindow, QWidget#root { background: #FAFAF7; }" in mac
+    assert (f"QLabel {{ background: transparent; color: {theme.FG}; "
+            "font-size: 13px; }") in mac
+    assert f"QMainWindow, QWidget#root {{ background: {theme.BG}; }}" in mac
     # Shared styling still applies on both platforms.
     for qss in (mac, other):
         assert "QDateEdit" in qss
@@ -156,6 +174,8 @@ def test_is_macos_helper_and_host_stylesheet():
 # -- overview / detail ------------------------------------------------------
 def test_overview_lists_metrics_and_opens_detail():
     w = _window()
+    assert w.stack.currentWidget() is w.today          # Today is home
+    w._show_home("metrics")
     assert "heart_rate" in w._shown_metrics
     assert w.stack.currentIndex() == 0
     w._open_detail("heart_rate")
@@ -182,15 +202,15 @@ def test_vitals_render_values_and_units():
     w = _window(_seeded_vitals())
     texts = {key: _label_texts(card)
              for key, card in w.vital_cards.items()}
-    assert set(texts) == {"hrv", "resting_hr", "spo2", "temperature", "stress"}
+    assert set(texts) == {"hrv", "resting_hr", "spo2", "resp_rate",
+                          "temperature", "stress"}
     assert "60" in texts["hrv"] and "ms" in texts["hrv"]
     assert "72" in texts["resting_hr"] and "bpm" in texts["resting_hr"]
     assert "estimate" not in texts["resting_hr"].lower()
     assert "98" in texts["spo2"] and "%" in texts["spo2"]
-    # Temperature has no verified unit; show the value without inventing one.
-    assert "27" in texts["temperature"]
+    assert "32.5" in texts["temperature"] and "°C" in texts["temperature"]
     assert "candidate" not in texts["temperature"].lower()
-    assert "°" not in texts["temperature"]
+    assert "15" in texts["resp_rate"] and "brpm" in texts["resp_rate"]
     assert "40" in texts["stress"]
     w.close()
 
@@ -233,19 +253,19 @@ def test_movement_totals_progress_and_default_goal_note():
     assert w.goal_progress["active_minutes"].value() == 30   # capped at goal
     assert w.goal_progress["distance_m"].maximum() == 4000
     assert w.goal_progress["distance_m"].value() == 2150
-    assert w.goal_progress["calories"].maximum() == 200
-    assert w.goal_progress["calories"].value() == 200        # 220 capped
+    assert w.goal_progress["active_calories"].maximum() == 500
+    assert w.goal_progress["active_calories"].value() == 220
     steps = _label_texts(w.goal_cards["steps"])
     assert "3,000" in steps and "5,000" in steps
     assert "km" in _label_texts(w.goal_cards["distance_m"])
-    assert "kcal" in _label_texts(w.goal_cards["calories"])
+    assert "kcal" in _label_texts(w.goal_cards["active_calories"])
     assert "min" in _label_texts(w.goal_cards["active_minutes"])
     assert "defaults" in w.goals_note.text().lower()
     w.close()
 
 
 def test_responsive_card_breakpoints():
-    assert [_vitals_columns(w) for w in (1000, 700, 400)] == [5, 3, 2]
+    assert [_vitals_columns(w) for w in (1000, 700, 400)] == [6, 3, 2]
     assert [_movement_columns(w) for w in (1000, 600, 300)] == [4, 2, 1]
 
 
@@ -255,7 +275,7 @@ def test_vitals_grid_reflows_on_resize():
     w.show()
     _app().processEvents()
     w._relayout_tiles()
-    assert w._vitals_cols == 5
+    assert w._vitals_cols == 6
     w.resize(900, 700)
     _app().processEvents()
     w._relayout_tiles()
@@ -320,6 +340,7 @@ def test_range_modes_caption_and_custom_dates():
 
 def test_day_mode_has_calendar_and_prev_next():
     w = _window()
+    w._show_home("metrics")
     w.range_combo.setCurrentIndex(1)     # Day…
     assert w._range_mode == "day"
     assert not w.day_date.isHidden()
@@ -391,7 +412,7 @@ def test_export_control_keeps_menu_actions_and_accessible_name():
 
 def test_icon_guide_button_opens_page_and_names_all_states():
     w = _window()
-    assert w.stack.currentIndex() == 0
+    assert w.stack.currentWidget() is w.today
     assert w.guide_btn.accessibleName() == "Menu-bar icon guide"
 
     w.guide_btn.click()
@@ -412,21 +433,86 @@ def test_icon_guide_button_opens_page_and_names_all_states():
     assert "--lock-on-away" in text
 
     w.guide_back_btn.click()
-    assert w.stack.currentIndex() == 0
+    assert w.stack.currentWidget() is w.today
     w.close()
 
 
 def test_progress_is_hidden_until_sync():
     w = _window()
-    assert w.progress.isHidden()
+    assert not w.sync_bar.active
     w._set_syncing(True)
     w._sync_progress(3, 10, "series")
-    assert not w.progress.isHidden()
+    assert w.sync_bar.active
     assert "Fetching metrics" in w.status.text()
     assert not w.sync_btn.isEnabled()
     w._set_syncing(False)
-    assert w.progress.isHidden()
     assert w.sync_btn.text() == "Sync band"
+    w.close()
+
+
+def test_sync_bar_eases_forward_only_and_fades_out():
+    from noiserep.gui.syncbar import SyncBar
+    _app()
+    bar = SyncBar()
+    bar.progress(5, 10, "series")
+    assert bar.active and bar.target == 0.485
+    bar.progress(2, 10, "series")                  # a late, lower report
+    assert bar.target == 0.485                     # never backwards
+    bar.progress(0, 0, "files")                    # indeterminate: shimmer only
+    assert bar.indeterminate and bar.target == 0.485
+    shown = []
+    for _ in range(40):
+        bar._tick(0.5)
+        shown.append(bar.shown)
+    assert shown == sorted(shown) and abs(shown[-1] - 0.485) < 0.01
+    bar.progress(10, 10, "done")
+    for _ in range(80):
+        bar._tick(0.5)
+    assert bar.shown == 1.0 and bar._fade_t0 is not None
+    bar._fade_t0 -= 700                            # past the 0.6 s fade
+    bar._tick(0.5)
+    assert not bar.active and bar.opacity == 0.0
+
+
+def test_live_button_toggles_menubar_app_and_link(monkeypatch):
+    import subprocess
+
+    class Proc:
+        def __init__(self, *a, **k):
+            self.code = None
+
+        def poll(self):
+            return self.code
+
+        def terminate(self):
+            self.code = -15
+
+        kill = terminate
+
+    w = _window()
+    monkeypatch.setattr(subprocess, "Popen", Proc)
+    monkeypatch.setattr(MainWindow, "_menubar_running", staticmethod(lambda: False))
+    resumed = []
+    monkeypatch.setattr(w, "start_link", lambda: resumed.append(1))
+    w.live_btn.click()                              # no link task: starts at once
+    assert w._menubar_active() and w.live_btn.property("active") == "true"
+    assert "Paused" in w.band_state.text()
+    w.live_btn.click()                              # click again terminates it
+    w._poll_menubar()
+    assert w._menubar_proc is None and resumed == [1]
+    assert w.live_btn.property("active") == "false" and w.error_banner.isHidden()
+    w.close()
+
+
+def test_theme_switch_rebuilds_today_in_dark_and_back():
+    w = _window()
+    try:
+        w.set_theme("dark")
+        assert theme.mode == "dark" and w.stack.currentWidget() is w.today
+        assert "light" in w.theme_btn.toolTip()
+    finally:
+        w.set_theme("light")
+    assert "dark" in w.theme_btn.toolTip()
     w.close()
 
 
@@ -477,17 +563,18 @@ def test_columns_for_width():
 
 def test_tiles_reflow_on_resize():
     w = _window(_seeded_with_other())
+    w._show_home("metrics")
     assert w._tile_widgets
     w.resize(1440, 900)
     w.show()
     _app().processEvents()
     w._relayout_tiles()
-    assert w._tile_cols == 3
+    assert w._tile_cols <= 1          # channel rows are full-width now
 
     w.resize(900, 700)
     _app().processEvents()
     w._relayout_tiles()
-    assert w._tile_cols == 2
+    assert w._tile_cols <= 1
     w.close()
 
 

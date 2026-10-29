@@ -21,15 +21,17 @@ import datetime
 import os
 import subprocess
 import sys
+import tempfile
 import time
 
 import qasync
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from ..errors import BandNotFound, TransportError
+from ..errors import BandNotFound, ConnectionCleanupError, TransportError
 from ..protocol import commands, realtime
 from ..store import Store, default_db_path
 from ..sync import run_sync
+from ..live import basic_data, parse_basic
 
 DEFAULT_POLL_SECONDS = 30.0
 # How long to wait for the first realtime event before falling back to polling.
@@ -166,6 +168,7 @@ class MenubarApp(QtCore.QObject):
         self._source: str | None = None
         self._connected = False
         self._connecting = False
+        self._cleanup_blocked = False
         self._syncing = False
         self._quitting = False
         self._realtime_active = False
@@ -510,7 +513,7 @@ class MenubarApp(QtCore.QObject):
     def _schedule_reconnect(self) -> None:
         """Try again after a failed/lost connection, without a tight loop."""
         if (self.retry_seconds <= 0 or self._connected
-                or self._connecting or self._quitting):
+                or self._connecting or self._quitting or self._cleanup_blocked):
             return
         if self._retry_task is not None and not self._retry_task.done():
             return
@@ -598,6 +601,15 @@ class MenubarApp(QtCore.QObject):
         self.connect()
 
     def connect(self) -> None:
+        window_task = getattr(self._window, "_link_task", None)
+        if window_task is not None and not window_task.done():
+            self._status = "Main window owns the band connection"
+            self._render(force=True)
+            return
+        if self._cleanup_blocked:
+            self._status = "Restart Live HR; Windows cleanup was incomplete"
+            self._render(force=True)
+            return
         if self._connected or self._connecting:
             return
         self._cancel_reconnect()
@@ -607,10 +619,16 @@ class MenubarApp(QtCore.QObject):
         self._connect_task = self._spawn(self._do_connect())
 
     async def _do_connect(self) -> None:
-        from ..ble.connection import connect
+        from ..ble.connection import connect, remembered_address
         try:
-            ctx = connect(self.band_name)
+            ctx = connect(self.band_name, address=remembered_address(self.store, self.band_name))
             band = await ctx.__aenter__()
+        except ConnectionCleanupError as exc:
+            self._cleanup_blocked = True
+            self._connecting = False
+            self._status = str(exc)
+            self._render(force=True)
+            return
         except BandNotFound as exc:
             self._connecting = False
             retry = (f" · retrying in {int(self.retry_seconds)}s"
@@ -686,9 +704,11 @@ class MenubarApp(QtCore.QObject):
         self._hr_misses = 0
         if ctx is not None:
             try:
-                await asyncio.wait_for(ctx.__aexit__(None, None, None), timeout=5.0)
-            except Exception:
-                pass
+                await ctx.__aexit__(None, None, None)
+            except ConnectionCleanupError as exc:
+                self._cleanup_blocked = True
+                self._status = str(exc)
+                self._render(force=True)
 
     def _cancel_away_lock(self) -> None:
         task, self._away_task = self._away_task, None
@@ -720,7 +740,7 @@ class MenubarApp(QtCore.QObject):
             return False
         try:
             async with self._op_lock:
-                await band.send(realtime.start_frame())
+                await band.send(basic_data(True))
         except (TransportError, asyncio.TimeoutError):
             return False                     # NACK/timeout: poll instead
         self._realtime_active = True
@@ -737,10 +757,18 @@ class MenubarApp(QtCore.QObject):
                     now = loop.time()
                     if not got and now >= first_deadline:
                         break
-                    if got and now - last >= self.realtime_silence:
-                        break
+                    if got:
+                        async with self._op_lock:
+                            await band.send(basic_data(True))
                     continue
-                bpm = realtime.parse_bpm(payload)
+                sample = parse_basic(payload)
+                if sample is not None:
+                    got = True
+                    last = loop.time()
+                    self.store.write_live(sample)
+                    if self._window is not None:
+                        self._window._on_live(sample)
+                bpm = sample.heart_rate if sample is not None else None
                 if bpm is None:
                     continue                 # status echoes, other traffic
                 got = True
@@ -750,7 +778,7 @@ class MenubarApp(QtCore.QObject):
             try:
                 async with self._op_lock:
                     await asyncio.wait_for(
-                        band.send(realtime.stop_frame()), timeout=3.0)
+                        band.send(basic_data(False)), timeout=3.0)
                 self._realtime_active = False
             except asyncio.CancelledError:
                 raise                         # pause_worker will retry the stop
@@ -862,15 +890,22 @@ class MenubarApp(QtCore.QObject):
             try:
                 async with self._op_lock:
                     await asyncio.wait_for(
-                        band.send(realtime.stop_frame()), timeout=3.0)
+                        band.send(basic_data(False)), timeout=3.0)
             except Exception:
                 pass
             self._realtime_active = False
 
     def open_main_window(self) -> None:
         """Open the full app. The band allows one central, so release ours."""
+        if getattr(self, "_parent_control", None) is not None:
+            from .app import _focus_existing_window
+            parent_pid = os.environ.get("NOISEREP_PARENT_GUI_PID", "")
+            if parent_pid.isdigit():
+                _focus_existing_window(int(parent_pid))
+            return
+        release = None
         if self._connected or self._connecting:
-            self._spawn(self._do_disconnect(status="Paused (main window open)"))
+            release = self._spawn(self._do_disconnect(status="Paused (main window open)"))
         if self._window is None:
             try:
                 from .app import MainWindow
@@ -883,6 +918,19 @@ class MenubarApp(QtCore.QObject):
         self._window.raise_()
         self._window.activateWindow()
 
+        def connect_window(completed=None):
+            if self._cleanup_blocked or (completed is not None and
+                    (completed.cancelled() or completed.exception() is not None)):
+                self._window._cleanup_blocked = True
+                self._window._show_error("Restart Live HR; its previous connection did not release cleanly.")
+                return
+            self._window.start_link()
+
+        if release is not None:
+            release.add_done_callback(connect_window)
+        else:
+            connect_window()
+
     def quit(self) -> None:
         if self._quitting:
             return
@@ -890,6 +938,11 @@ class MenubarApp(QtCore.QObject):
         self._spawn(self._shutdown())
 
     async def _shutdown(self) -> None:
+        window_task = getattr(self._window, "_link_task", None)
+        if window_task is not None and not window_task.done():
+            self._window._closing = True
+            window_task.cancel()
+            await asyncio.gather(window_task, return_exceptions=True)
         await self._do_disconnect(status="Quitting")
         try:
             self.store.close()
@@ -902,17 +955,51 @@ class MenubarApp(QtCore.QObject):
         self.app.quit()
 
 
+#: Held by the running helper; its owner PID lets the main window stop it.
+MENUBAR_LOCK = os.path.join(tempfile.gettempdir(), "noiserep-menubar.lock")
+
+
+class ParentControl(QtCore.QObject):
+    """A parent pipe requests normal async shutdown, including on parent exit."""
+    quit_requested = QtCore.Signal()
+
+    def __init__(self, owner, stream):
+        super().__init__(owner)
+        import threading
+        self.quit_requested.connect(owner.quit)
+        self._reader = threading.Thread(target=self._read, args=(stream,), daemon=True)
+        self._reader.start()
+
+    def _read(self, stream):
+        try:
+            while True:
+                line = stream.readline(64)
+                if not line or line.strip() == "quit":
+                    self.quit_requested.emit()
+                    return
+        except (OSError, ValueError):
+            self.quit_requested.emit()
+
+
 def main(argv: list[str] | None = None, band_name: str | None = None,
          db_path: str | None = None,
          poll_seconds: float = DEFAULT_POLL_SECONDS,
          lock_on_away: bool = False,
          away_seconds: float = AWAY_GRACE_SECONDS,
-         retry_seconds: float = 60.0) -> int:
+         retry_seconds: float = 60.0, parent_control: bool = False) -> int:
     """Run the menu-bar app until Quit. ``band_name=None`` auto-discovers."""
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(
         list(argv) if argv is not None else sys.argv)
+    from .branding import apply_app_icon
+    apply_app_icon(app)
     app.setApplicationName("NoiseREP")
     app.setQuitOnLastWindowClosed(False)
+    # One helper at a time: a second copy would just fight over the band's
+    # single BLE connection.
+    lock = QtCore.QLockFile(MENUBAR_LOCK)
+    if not lock.tryLock(100):
+        print("menubar: already running", file=sys.stderr)
+        return 0
     loop = qasync.QEventLoop(app)
     asyncio.set_event_loop(loop)
     menubar = MenubarApp(app, band_name=band_name, db_path=db_path,
@@ -923,6 +1010,8 @@ def main(argv: list[str] | None = None, band_name: str | None = None,
     if menubar.tray is None and menubar._status_item is None:
         print("menubar: no system tray available on this desktop", file=sys.stderr)
         return 1
+    if parent_control:
+        menubar._parent_control = ParentControl(menubar, sys.stdin)
     menubar.start()
     with loop:
         loop.run_forever()

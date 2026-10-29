@@ -48,10 +48,11 @@ def test_resting_hr_lowest_decile_resists_one_low_artifact():
 def _vitals_store():
     return _store([
         MetricSeries(DAY, 2, 60, list(range(50, 150)), b""),
-        MetricSeries(DAY, 21, 60, [70, 72, 74], b""),
+        MetricSeries(DAY, 27, 60, [70, 72, 74], b""),
         MetricSeries(DAY, 22, 60, [20, 30, 42], b""),
         MetricSeries(DAY, 4, 60, [0, 98, 0, 97], b""),
-        MetricSeries(DAY, 23, 60, [0, 31, 30], b""),
+        MetricSeries(DAY, 19, 60, [0, 14, 15], b""),
+        MetricSeries(DAY, 8, 60, [0, 31.5, 32.25], b""),
     ])
 
 
@@ -77,18 +78,30 @@ def test_vitals_values_units_and_timestamps():
 
     assert vitals["stress"].value == 42.0
     assert vitals["stress"].unit is None
-    assert vitals["stress"].confidence == "likely"
+    assert vitals["stress"].confidence == "verified"
 
     assert vitals["spo2"].value == 97.0          # zero readings skipped
     assert vitals["spo2"].unit == "%"
     assert vitals["spo2"].at == DAY + datetime.timedelta(minutes=3)
 
+    assert vitals["resp_rate"].value == 15.0
+    assert vitals["resp_rate"].unit == "brpm"
+
     temperature = vitals["temperature"]
-    assert temperature.value == 30.0
-    assert temperature.unit is None              # unit not established
-    assert temperature.confidence == "candidate"
-    assert "temperature" in temperature.source
+    assert temperature.value == 32.25
+    assert temperature.unit == "°C"
+    assert temperature.confidence == "likely"    # /100 scale is inferred
     assert temperature.at == DAY + datetime.timedelta(minutes=2)
+    s.close()
+
+
+def test_band_resting_hr_beats_the_estimate():
+    s = _vitals_store()
+    s.ingest(SyncResult(series=[MetricSeries(
+        DAY, 2, 30, [], b"", channels={"resting_hr": [58]})]))
+    resting = analytics.vitals(s)["resting_hr"]
+    assert resting.value == 58.0
+    assert resting.confidence == "verified"
     s.close()
 
 
@@ -101,7 +114,7 @@ def test_vitals_absent_metrics_are_none_not_invented():
     # Evidence labels still describe what would have been used.
     assert vitals["resting_hr"].confidence == "estimate"
     assert vitals["hrv"].confidence == "likely"
-    assert vitals["temperature"].confidence == "candidate"
+    assert vitals["temperature"].confidence == "likely"
     assert "none stored" in vitals["resting_hr"].source
     s.close()
 

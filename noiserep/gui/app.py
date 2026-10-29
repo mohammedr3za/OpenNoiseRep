@@ -19,12 +19,16 @@ import math
 import os
 import subprocess
 import sys
+import tempfile
 
 import pyqtgraph as pg
 import qasync
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from . import theme
+from .syncbar import SyncBar
+from .window_chrome import AppWindow, TitleSurface, WindowButton
+from .today import TodayPage
 from .. import analytics
 from ..export import export_csv, export_json
 from ..protocol.files import STAGE_NAMES
@@ -186,9 +190,9 @@ def _columns_for_width(width: int) -> int:
 
 
 def _vitals_columns(width: int) -> int:
-    """Five compact vitals at wide widths, reflowing to three then two."""
+    """Six compact vitals at wide widths, reflowing to three then two."""
     if width >= 860:
-        return 5
+        return 6
     if width >= 540:
         return 3
     return 2
@@ -206,16 +210,17 @@ def _movement_columns(width: int) -> int:
 #: Metrics already given a dedicated overview section; they are not repeated
 #: in the generic "Other channels" tile grid.
 _FEATURED_METRICS = frozenset({
-    "heart_rate",
-    "steps", "distance_m", "calories", "active_minutes",
-    "heart_rate_variability", "stress", "blood_oxygen", "metric_23",
+    "heart_rate", "resting_hr",
+    "steps", "distance_m", "active_calories", "active_minutes",
+    "sleep_hrv", "stress", "blood_oxygen", "temperature", "respiratory_rate",
 })
 
-#: Short caption for each of the five vital cards, in display order.
+#: Short caption for each of the six vital cards, in display order.
 _VITAL_CARDS = (
     ("hrv", "HRV"),
     ("resting_hr", "Resting HR"),
     ("spo2", "SpO2"),
+    ("resp_rate", "Resp. Rate"),
     ("temperature", "Temp"),
     ("stress", "Stress"),
 )
@@ -224,14 +229,23 @@ _VITAL_CARDS = (
 VITAL_GUIDE = {
     "hrv": {
         "title": "Heart Rate Variability",
-        "metric": "heart_rate_variability",
+        "metric": "sleep_hrv",
         "meaning": (
-            "HRV is the variation in time between heartbeats. It reflects "
-            "autonomic balance and recovery; a higher value often suggests "
-            "more recovery, but normal varies widely with age and fitness."),
+            "HRV is the variation in time between heartbeats. The band "
+            "records it during sleep, every 30 seconds. It reflects autonomic "
+            "balance and recovery; higher often suggests more recovery, but "
+            "normal varies widely with age and fitness."),
         "typical": (
             "Resting RMSSD is often roughly 20–80 ms in adults. Compare with "
             "your own trend rather than a single reading."),
+    },
+    "resp_rate": {
+        "title": "Respiratory Rate",
+        "metric": "respiratory_rate",
+        "meaning": (
+            "Breaths per minute, estimated by the band from heart-rate "
+            "patterns every 5 minutes. Overnight values are the most stable."),
+        "typical": "About 12–20 breaths per minute at rest in adults.",
     },
     "resting_hr": {
         "title": "Resting Heart Rate",
@@ -253,12 +267,13 @@ VITAL_GUIDE = {
             "warrant medical advice."),
     },
     "temperature": {
-        "title": "Temperature",
-        "metric": "metric_23",
+        "title": "Skin Temperature",
+        "metric": "temperature",
         "meaning": (
-            "The band's temperature channel. Its scale is not established, "
-            "so only plausible values are shown."),
-        "typical": "No established range for this band.",
+            "Wrist skin temperature every 5 minutes. It runs several degrees "
+            "below core body temperature and follows the room and strap fit; "
+            "the overnight trend is the useful part."),
+        "typical": "Roughly 30–35 °C at the wrist.",
     },
     "stress": {
         "title": "Stress",
@@ -276,8 +291,136 @@ _MOVEMENT_GOALS = (
     ("steps", "Steps", "steps", 5000, "5,000 steps"),
     ("active_minutes", "Active Minutes", "min", 30, "30 min"),
     ("distance_m", "Distance", "km", 4000, "4.0 km"),
-    ("calories", "Calories", "kcal", 200, "200 kcal"),
+    ("active_calories", "Active Calories", "kcal", 500, "500 kcal"),
 )
+
+
+#: Live strip: SEBasicData field, caption, unit.
+LIVE_FIELDS = (
+    ("heart_rate", "Heart rate", "bpm"),
+    ("spo2", "SpO2", "%"),
+    ("stress", "Stress", None),
+    ("steps", "Steps", None),
+    ("active_calories", "Active", "kcal"),
+    ("calories", "Total", "kcal"),
+    ("distance_m", "Distance", "m"),
+)
+
+
+class AnimatedNumber(QtWidgets.QLabel):
+    """An integer label that eases to each new value instead of jumping."""
+
+    def __init__(self, parent=None):
+        super().__init__("—", parent)
+        self._value = None
+        self._anim = QtCore.QVariantAnimation(self)
+        self._anim.setDuration(650)
+        self._anim.setEasingCurve(QtCore.QEasingCurve.OutCubic)
+        self._anim.valueChanged.connect(lambda v: self.setText(f"{round(v):,}"))
+
+    def animate_to(self, value) -> None:
+        if value is None:
+            self._anim.stop()
+            self._value = None
+            self.setText("—")
+            return
+        start = self._value if self._value is not None else value
+        self._value = value
+        self._anim.stop()
+        self._anim.setStartValue(float(start))
+        self._anim.setEndValue(float(value))
+        self._anim.start()
+
+
+GUI_LOCK = os.path.join(tempfile.gettempdir(), "noiserep-gui.lock")
+
+
+def _focus_existing_window(pid: int) -> None:
+    if os.name != "nt" or pid <= 0:
+        return
+    import ctypes
+    from ctypes import wintypes
+    user32 = ctypes.windll.user32
+    callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    @callback_type
+    def visit(hwnd, _):
+        owner = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
+        if owner.value == pid and user32.IsWindowVisible(hwnd):
+            user32.ShowWindow(hwnd, 9)
+            user32.SetForegroundWindow(hwnd)
+            return False
+        return True
+
+    user32.EnumWindows(visit, 0)
+
+
+def _take_single_instance() -> QtCore.QLockFile:
+    """Never terminate an existing BLE owner on a duplicate app launch."""
+    lock = QtCore.QLockFile(GUI_LOCK)
+    lock.setStaleLockTime(0)
+    if not lock.tryLock(0):
+        info = lock.getLockInfo()
+        if isinstance(info, tuple) and info[0]:
+            _focus_existing_window(info[1])
+        print("NoiseRep is already running, or its instance lock is unavailable.", flush=True)
+        raise SystemExit(0)
+    return lock
+
+
+def _restart_gui(lock) -> None:
+    """Called only after the window's asynchronous BLE shutdown has finished."""
+    lock.unlock()
+    subprocess.Popen([sys.executable, "-m", "noiserep.cli", "gui", "--reload"],
+                     start_new_session=True)
+
+
+def _profile_age() -> int | None:
+    try:
+        from ..config import ConfigError, load
+        return load().profile.age
+    except (ConfigError, OSError):
+        return None
+
+
+def _fmt_min(minutes) -> str:
+    return _fmt_span(minutes * 60) if minutes is not None else "—"
+
+
+def _chip_row(items) -> QtWidgets.QHBoxLayout:
+    """A row of value-over-label chips."""
+    chips = QtWidgets.QHBoxLayout()
+    chips.setSpacing(26)
+    for label, val in items:
+        cell = QtWidgets.QVBoxLayout()
+        cell.setSpacing(1)
+        num = QtWidgets.QLabel(val)
+        num.setObjectName("chipValue")
+        lab = QtWidgets.QLabel(label)
+        lab.setObjectName("statLabel")
+        cell.addWidget(num)
+        cell.addWidget(lab)
+        chips.addLayout(cell)
+    chips.addStretch(1)
+    return chips
+
+
+def _workout_meta(workout: dict) -> str:
+    """One-line summary: time, then duration/steps/kcal or file size."""
+    parts = []
+    when = workout.get("time")
+    if when:
+        parts.append(f"{when:%d %b, %H:%M}")
+    if workout.get("duration_s"):
+        parts.append(_fmt_span(workout["duration_s"]))
+    if workout.get("steps"):
+        parts.append(f"{workout['steps']:,} steps")
+    if workout.get("kcal"):
+        parts.append(f"{workout['kcal']} kcal")
+    if workout.get("size"):
+        parts.append(f"{workout['size']:,} bytes")
+    return " · ".join(parts)
 
 
 def _shortcut_label(seq: str) -> str:
@@ -288,15 +431,7 @@ def _shortcut_label(seq: str) -> str:
 
 def _add_shadow(widget: QtWidgets.QWidget, blur: int = 26, dy: int = 4,
                 alpha: int = 14) -> None:
-    """Subtle drop shadow; cards stay flat when the platform ignores it."""
-    try:
-        eff = QtWidgets.QGraphicsDropShadowEffect(widget)
-        eff.setBlurRadius(blur)
-        eff.setOffset(0, dy)
-        eff.setColor(QtGui.QColor(25, 25, 25, alpha))
-        widget.setGraphicsEffect(eff)
-    except Exception:  # noqa: BLE001 - purely cosmetic
-        pass
+    """No-op: cards are flat hairline frames (graphics effects are costly)."""
 
 
 class SmartDateAxis(pg.DateAxisItem):
@@ -323,6 +458,39 @@ class SmartDateAxis(pg.DateAxisItem):
             except (ValueError, OSError):
                 out.append("")
         return out
+
+
+class GutterScrollArea(QtWidgets.QScrollArea):
+    """Recalculate page gutters when a previously hidden viewport is shown."""
+
+    def sync_gutters(self):
+        host = self.widget()
+        if host is not None and host.layout() is not None:
+            gutter = theme.page_gutter(self, self.viewport().width())
+            host.layout().setContentsMargins(gutter, 22, gutter, 36)
+
+    def resizeEvent(self, event):  # noqa: N802
+        super().resizeEvent(event)
+        self.sync_gutters()
+
+    def showEvent(self, event):  # noqa: N802
+        super().showEvent(event)
+        self.sync_gutters()
+
+
+class GlassReadout(pg.TextItem):
+    """Rounded translucent chart readout, using the active theme palette."""
+
+    def paint(self, painter, *args):
+        super().paint(painter, *args)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing)
+        surface = QtGui.QColor(theme.PANEL)
+        surface.setAlpha(238)
+        edge = QtGui.QColor(theme.BORDER)
+        edge.setAlpha(220)
+        painter.setPen(QtGui.QPen(edge, 1))
+        painter.setBrush(surface)
+        painter.drawRoundedRect(self.boundingRect().adjusted(0.5, 0.5, -0.5, -0.5), 8, 8)
 
 
 class ChartView(pg.PlotWidget):
@@ -372,14 +540,31 @@ class ChartView(pg.PlotWidget):
         self._marker = pg.ScatterPlotItem(
             [], [], size=9, pen=pg.mkPen(theme.PANEL, width=2),
             brush=pg.mkBrush(theme.ACCENT))
-        self._label = pg.TextItem(
-            "", anchor=(0, 0), color=theme.FG,
-            fill=pg.mkBrush(255, 255, 255, 238),
-            border=pg.mkPen(theme.BORDER))
-        self._hover = False
+        self._label = GlassReadout("", anchor=(0, 0), color=theme.FG)
+        self._label.textItem.document().setDocumentMargin(8)
+        self._hover_anim = QtCore.QVariantAnimation(self)
+        self._hover_anim.setDuration(130)
+        self._hover_anim.setEasingCurve(QtCore.QEasingCurve.OutCubic)
+        self._hover_anim.valueChanged.connect(self._hover_opacity)
+        self._hover_anim.finished.connect(self._hover_finished)
+        self._hover = None
         self._show_hover(False)
         self._proxy = pg.SignalProxy(
             self.scene().sigMouseMoved, rateLimit=30, slot=self._on_mouse)
+
+    def retheme(self) -> None:
+        """Re-read the palette after a light/dark switch."""
+        self.setBackground(theme.PANEL)
+        pi = self.getPlotItem()
+        for side in ("left", "bottom"):
+            axis = pi.getAxis(side)
+            axis.setPen(pg.mkPen(theme.BORDER))
+            axis.setTextPen(pg.mkPen(theme.FG_MUTED))
+        self._vline.setPen(pg.mkPen(theme.FG_MUTED, width=1, style=QtCore.Qt.DashLine))
+        self._marker.setPen(pg.mkPen(theme.PANEL, width=2))
+        self._marker.setBrush(pg.mkBrush(theme.ACCENT))
+        self._label.setColor(theme.FG)
+        self._label.update()
 
     # -- data ------------------------------------------------------------
     def set_data(self, rows, unit: str | None = None, fill: bool = True) -> int:
@@ -433,13 +618,31 @@ class ChartView(pg.PlotWidget):
         return len(plotted)
 
     # -- hover -----------------------------------------------------------
-    def _show_hover(self, visible: bool) -> None:
-        self._hover = visible
+    def _hover_opacity(self, value) -> None:
         for item in (self._vline, self._marker, self._label):
-            try:
-                item.setVisible(visible)
-            except RuntimeError:
-                pass
+            item.setOpacity(float(value))
+
+    def _hover_finished(self) -> None:
+        if not self._hover:
+            for item in (self._vline, self._marker, self._label):
+                item.hide()
+
+    def _show_hover(self, visible: bool) -> None:
+        if self._hover == visible:
+            return
+        initial = self._hover is None
+        self._hover = visible
+        self._hover_anim.stop()
+        if initial:
+            self._hover_opacity(0.0)
+            self._hover_finished()
+            return
+        if visible:
+            for item in (self._vline, self._marker, self._label):
+                item.show()
+        self._hover_anim.setStartValue(self._label.opacity())
+        self._hover_anim.setEndValue(1.0 if visible else 0.0)
+        self._hover_anim.start()
 
     def _on_mouse(self, event) -> None:
         if not self._rows:
@@ -470,12 +673,27 @@ class ChartView(pg.PlotWidget):
         text = f"{when.strftime(fmt)}  ·  {_fmt(value)}"
         if self.unit:
             text += f" {self.unit}"
-        self._label.setText(text)
-        xr, yr = vb.viewRange()
-        right_half = self._x[j] > (xr[0] + xr[1]) / 2
-        self._label.setAnchor((-1, 0) if right_half else (0, 0))
-        self._label.setPos(self._x[j], yr[1] - (yr[1] - yr[0]) * 0.06)
+        # Position in scene pixels: data-space offsets can clip long labels
+        # at either edge, especially after zooming or on a narrow card.
+        rect = vb.sceneBoundingRect().adjusted(8, 8, -8, -8)
+        font = self._label.textItem.font()
+        metrics = QtGui.QFontMetricsF(font)
+        text = metrics.elidedText(text, QtCore.Qt.ElideRight,
+                                  max(1, int(rect.width() - 20)))
+        self._label.setText(text, color=theme.FG)
+        self._label.setAnchor((0, 0))
         self._show_hover(True)
+        width = self._label.boundingRect().width()
+        sample_x = vb.mapViewToScene(QtCore.QPointF(self._x[j], value)).x()
+        left = sample_x + 10
+        if left + width > rect.right():
+            left = sample_x - width - 10
+        left = max(rect.left(), min(left, rect.right() - width))
+        self._label.setPos(vb.mapSceneToView(QtCore.QPointF(left, rect.top())))
+
+    def leaveEvent(self, event):  # noqa: N802 - Qt override
+        self._show_hover(False)
+        super().leaveEvent(event)
 
     def mouseReleaseEvent(self, event):  # noqa: N802 - Qt override
         if (not self.interactive and self._rows
@@ -535,7 +753,7 @@ class ClickableCard(QtWidgets.QFrame):
         super().keyPressEvent(event)
 
 
-class MainWindow(QtWidgets.QMainWindow):
+class MainWindow(AppWindow):
     def __init__(self, store: Store, band_name: str | None = DEFAULT_BAND):
         super().__init__()
         if band_name is None:
@@ -554,6 +772,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._detail_metric: str | None = None
         self._range_mode = "today"
         self._syncing = False
+        self._sync_ok = False
         self._tile_widgets: list[QtWidgets.QWidget] = []
         self.tiles_grid: QtWidgets.QGridLayout | None = None
         self._tile_cols = 0
@@ -570,9 +789,21 @@ class MainWindow(QtWidgets.QMainWindow):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
         outer.addWidget(self._build_appbar())
+        self._link_task = None
+        self._sync_now = None
+        self._menubar_proc = None
+        self._menubar_stopping = False
+        self._last_live = None
+        self._closing = False
+        self._history_busy = False
+        self._cleanup_blocked = False
+        self._menubar_poll = QtCore.QTimer(self)
+        self._menubar_poll.setInterval(1000)
+        self._menubar_poll.timeout.connect(self._poll_menubar)
 
         banner_host = QtWidgets.QWidget()
         banners = QtWidgets.QVBoxLayout(banner_host)
+        self._banner_layout = banners
         banners.setContentsMargins(26, 14, 26, 0)
         banners.setSpacing(8)
         banners.addWidget(self._build_error_banner())
@@ -586,39 +817,40 @@ class MainWindow(QtWidgets.QMainWindow):
         self.guide_page = self._build_guide()
         self.stack.addWidget(self.guide_page)             # index 3
         self.stack.addWidget(self._build_vital_detail())  # index 4
+        self.today = TodayPage(store, _profile_age(), on_open_metric=self._open_detail)
+        self.stack.addWidget(self.today)                  # index 5
+        self.settings_page = self._build_settings()
+        self.stack.addWidget(self.settings_page)          # index 6
         outer.addWidget(self.stack, 1)
 
         self._install_shortcuts()
         self._load()
+        self._clock = QtCore.QTimer(self)
+        self._clock.timeout.connect(lambda: self.ov_title.setText(self._greeting()))
+        self._clock.start(60_000)
+        self._show_home("today")
+        self._apply_gutter()
 
     # ------------------------------------------------------------------
     # app bar
     # ------------------------------------------------------------------
     def _build_appbar(self) -> QtWidgets.QWidget:
-        bar = QtWidgets.QFrame()
+        bar = TitleSurface()
         bar.setObjectName("appbar")
         outer = QtWidgets.QVBoxLayout(bar)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
-        top = QtWidgets.QWidget()
+        top = TitleSurface()
         h = QtWidgets.QHBoxLayout(top)
-        h.setContentsMargins(26, 13, 26, 13)
-        h.setSpacing(12)
+        self._bar_layout = h
+        h.setContentsMargins(26, 10, 26, 10)
+        h.setSpacing(10)
 
-        brand = QtWidgets.QHBoxLayout()
-        brand.setSpacing(8)
-        dot = QtWidgets.QLabel("●")
-        dot.setObjectName("brandDot")
         name = QtWidgets.QLabel("NoiseREP")
         name.setObjectName("appName")
-        self.app_tag = QtWidgets.QLabel("SYNC")
-        self.app_tag.setObjectName("appTag")
-        brand.addWidget(dot)
-        brand.addWidget(name)
-        brand.addWidget(self.app_tag)
-        h.addLayout(brand)
-        h.addSpacing(6)
+        h.addWidget(name)
+        h.addSpacing(10)
 
         pill = QtWidgets.QFrame()
         pill.setObjectName("devicePill")
@@ -628,35 +860,54 @@ class MainWindow(QtWidgets.QMainWindow):
         self.dev_model = QtWidgets.QLabel("Noise REP")
         self.dev_fw = QtWidgets.QLabel("")
         self.dev_sync = QtWidgets.QLabel("")
-        for label, obj in ((self.dev_model, "devicePill"),
-                           (self.dev_fw, "muted"),
-                           (self.dev_sync, "muted")):
+        self.band_dot = QtWidgets.QLabel("●")
+        self.band_dot.setObjectName("bandDot")
+        self.band_state = QtWidgets.QLabel("Band link off")
+        self.band_state.setObjectName("bandState")
+        pl.addWidget(self.band_dot)
+        pl.addWidget(self.band_state)
+        for label, obj in ((self.dev_model, "settingValue"),
+                           (self.dev_fw, "settingValue"),
+                           (self.dev_sync, "settingValue")):
             label.setObjectName(obj)
-            pl.addWidget(label)
+        self._set_band_state("off", "Band link off")
         h.addWidget(pill)
+        h.addStretch(1)
+        self.nav_tabs = {}
+        seg = QtWidgets.QFrame()
+        seg.setObjectName("segmented")
+        sl = QtWidgets.QHBoxLayout(seg)
+        sl.setContentsMargins(3, 3, 3, 3)
+        sl.setSpacing(2)
+        group = QtWidgets.QButtonGroup(self)
+        for key, text in (("today", "Today"), ("metrics", "Health Trends"),
+                          ("settings", "Settings")):
+            tab = QtWidgets.QPushButton(text)
+            tab.setObjectName("navTab")
+            tab.setCheckable(True)
+            tab.setCursor(QtCore.Qt.PointingHandCursor)
+            tab.clicked.connect(lambda _=False, k=key: self._show_home(k))
+            group.addButton(tab)
+            self.nav_tabs[key] = tab
+            sl.addWidget(tab)
+        h.addWidget(seg)
         h.addStretch(1)
 
         # QComboBox is native AppKit on macOS (theme.QSS omits its styling
         # there); the explicit height keeps it aligned with the app bar.
         self.range_combo = QtWidgets.QComboBox()
-        for _, text in RANGE_MODES:
-            self.range_combo.addItem(text)
+        for key, text in RANGE_MODES:
+            if key not in ("today", "day"):
+                self.range_combo.addItem(text, key)
+        self.range_combo.setPlaceholderText("Date range")
+        self.range_combo.setCurrentIndex(-1)
         self.range_combo.setAccessibleName("Date range")
         self.range_combo.setToolTip("Choose the period shown")
         self.range_combo.setMinimumHeight(32)
         self.range_combo.currentIndexChanged.connect(self._on_range_mode_changed)
-        h.addWidget(self.range_combo)
 
         # Single-day navigation: ‹ [calendar date] ›.  Hidden until "Day…" is
         # selected so the app bar stays calm in the preset modes.
-        self.prev_day_btn = QtWidgets.QPushButton("‹")
-        self.prev_day_btn.setObjectName("ghost")
-        self.prev_day_btn.setFixedWidth(34)
-        self.prev_day_btn.setMinimumHeight(32)
-        self.prev_day_btn.setToolTip("Previous day")
-        self.prev_day_btn.setAccessibleName("Previous day")
-        self.prev_day_btn.clicked.connect(lambda: self._shift_day(-1))
-        h.addWidget(self.prev_day_btn)
 
         self.day_date = QtWidgets.QDateEdit()
         self.day_date.setCalendarPopup(True)
@@ -666,19 +917,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.day_date.setAccessibleName("Selected day")
         self.day_date.setToolTip("Pick any day with stored data")
         self.day_date.dateChanged.connect(self._on_day_changed)
-        h.addWidget(self.day_date)
 
-        self.next_day_btn = QtWidgets.QPushButton("›")
-        self.next_day_btn.setObjectName("ghost")
-        self.next_day_btn.setFixedWidth(34)
-        self.next_day_btn.setMinimumHeight(32)
-        self.next_day_btn.setToolTip("Next day")
-        self.next_day_btn.setAccessibleName("Next day")
-        self.next_day_btn.clicked.connect(lambda: self._shift_day(1))
-        h.addWidget(self.next_day_btn)
 
-        for _widget in (self.prev_day_btn, self.day_date, self.next_day_btn):
-            _widget.hide()
+        self.day_date.hide()
 
         # A QToolButton whose "ghost" frame exists only off macOS.  QPushButton
         # would inherit the app's custom rounded QPushButton rule, so on macOS
@@ -701,26 +942,34 @@ class MainWindow(QtWidgets.QMainWindow):
         self.export_menu_btn.setPopupMode(
             QtWidgets.QToolButton.ToolButtonPopupMode.InstantPopup)
         self.export_menu_btn.setMinimumHeight(36)
-        h.addWidget(self.export_menu_btn)
 
         self.live_btn = QtWidgets.QPushButton("♥ Live")
-        self.live_btn.setObjectName("ghost")
-        self.live_btn.setMinimumHeight(36)
-        self.live_btn.setToolTip(
-            "Open live heart rate in the macOS menu bar (separate app; the "
-            "band accepts one central)")
-        self.live_btn.setAccessibleName("Open live heart rate in the menu bar")
-        self.live_btn.clicked.connect(self._launch_menubar)
-        h.addWidget(self.live_btn)
+        self.live_btn.setObjectName("liveBtn")
+        self.live_btn.setMinimumHeight(34)
+        self.live_btn.setCursor(QtCore.Qt.PointingHandCursor)
+        self.live_btn.clicked.connect(self._toggle_menubar)
+        self._set_live_btn(False)
 
         self.guide_btn = QtWidgets.QPushButton("? Icon guide")
         self.guide_btn.setObjectName("ghost")
-        self.guide_btn.setMinimumHeight(36)
+        self.guide_btn.setMinimumHeight(34)
         self.guide_btn.setToolTip("How to read the menu-bar heart icon")
         self.guide_btn.setAccessibleName("Menu-bar icon guide")
         self.guide_btn.clicked.connect(self._show_guide)
-        h.addWidget(self.guide_btn)
 
+        from .icons import IconButton
+        self.theme_btn = IconButton("moon", 38)
+        self.theme_btn.setAccessibleName("Switch light or dark theme")
+        self.theme_btn.clicked.connect(self._toggle_theme)
+        self._sync_theme_btn()
+        h.addWidget(self.theme_btn)
+
+        self.sync_pct = QtWidgets.QLabel("0%")
+        self.sync_pct.setObjectName("syncPct")
+        self.sync_pct.setMinimumWidth(40)
+        self.sync_pct.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+        self.sync_pct.hide()
+        h.addWidget(self.sync_pct)
         self.sync_btn = QtWidgets.QPushButton("Sync band")
         self.sync_btn.setObjectName("primary")
         self.sync_btn.setMinimumHeight(40)
@@ -730,8 +979,25 @@ class MainWindow(QtWidgets.QMainWindow):
             "Scan for the band and download new history")
         self.sync_btn.clicked.connect(self._on_sync)
         h.addWidget(self.sync_btn)
+        self.window_controls = QtWidgets.QWidget(bar)
+        controls = QtWidgets.QHBoxLayout(self.window_controls)
+        controls.setContentsMargins(0, 0, 0, 0)
+        controls.setSpacing(3)
+        self.minimize_button = WindowButton("minimize")
+        self.maximize_button = WindowButton("maximize")
+        self.close_button = WindowButton("close")
+        self.minimize_button.clicked.connect(self.showMinimized)
+        self.maximize_button.clicked.connect(self._toggle_maximized)
+        self.close_button.clicked.connect(self.close)
+        for button in (self.minimize_button, self.maximize_button, self.close_button):
+            controls.addWidget(button)
+        self.window_controls.setFixedSize(108, 32)
 
         outer.addWidget(top)
+        self.sync_bar = SyncBar()
+        self.sync_bar.percent.connect(lambda n: self.sync_pct.setText(f"{n}%"))
+        self.sync_bar.activeChanged.connect(self.sync_pct.setVisible)
+        outer.addWidget(self.sync_bar)
 
         self.custom_row = QtWidgets.QWidget()
         cr = QtWidgets.QHBoxLayout(self.custom_row)
@@ -778,11 +1044,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.status.setWordWrap(True)
         self.status.setAccessibleName("Status")
         v.addWidget(self.status)
-        self.progress = QtWidgets.QProgressBar()
-        self.progress.setTextVisible(False)
-        self.progress.setFixedHeight(4)
-        self.progress.hide()
-        v.addWidget(self.progress)
         h.addLayout(v, 1)
         self.info_banner = frame
         return frame
@@ -814,28 +1075,32 @@ class MainWindow(QtWidgets.QMainWindow):
     # overview
     # ------------------------------------------------------------------
     def _make_page(self):
-        """A scroll page whose content is centred and capped at a readable width."""
-        scroll = QtWidgets.QScrollArea()
+        """Detail pages use the same window-aware gutters as Today and Trends."""
+        scroll = GutterScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        inner = QtWidgets.QWidget()
+        scroll.setWidget(inner)
+        lay = QtWidgets.QVBoxLayout(inner)
+        lay.setSpacing(16)
+        scroll.sync_gutters()
+        return scroll, inner, lay
+
+    def _build_overview(self) -> QtWidgets.QWidget:
+        scroll = GutterScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
         scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
         host = QtWidgets.QWidget()
         scroll.setWidget(host)
-        h = QtWidgets.QHBoxLayout(host)
-        h.setContentsMargins(0, 0, 0, 0)
-        h.addStretch(1)
-        inner = QtWidgets.QWidget()
-        inner.setMaximumWidth(1040)
-        h.addWidget(inner, 10)
-        h.addStretch(1)
-        lay = QtWidgets.QVBoxLayout(inner)
-        lay.setContentsMargins(28, 24, 28, 24)
+        lay = QtWidgets.QVBoxLayout(host)
         lay.setSpacing(16)
-        return scroll, inner, lay
+        self._trends_scroll, self._trends_layout = scroll, lay
+        g = theme.page_gutter(self, scroll.viewport().width())
+        lay.setContentsMargins(g, 22, g, 36)
 
-    def _build_overview(self) -> QtWidgets.QWidget:
-        scroll, _inner, lay = self._make_page()
-
+        row = QtWidgets.QHBoxLayout()
         head = QtWidgets.QVBoxLayout()
         head.setSpacing(2)
         self.ov_title = QtWidgets.QLabel("Good morning")
@@ -844,7 +1109,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ov_sub.setObjectName("muted")
         head.addWidget(self.ov_title)
         head.addWidget(self.ov_sub)
-        lay.addLayout(head)
+        row.addLayout(head)
+        row.addStretch(1)
+        from .today import DayNav
+        self.ov_day_nav = DayNav()
+        self.ov_day_nav.shifted.connect(self._overview_shift)
+        self.prev_day_btn, self.next_day_btn = self.ov_day_nav.prev, self.ov_day_nav.next
+        for w in (self.range_combo, self.day_date, self.ov_day_nav):
+            row.addWidget(w, 0, QtCore.Qt.AlignBottom)
+        lay.addLayout(row)
 
         self.ov_stack = QtWidgets.QStackedWidget()
 
@@ -1058,11 +1331,11 @@ class MainWindow(QtWidgets.QMainWindow):
         v.setContentsMargins(15, 12, 15, 12)
         v.setSpacing(2)
 
-        label = QtWidgets.QLabel(caption.upper())
+        label = QtWidgets.QLabel((caption + (" ESTIMATE" if vital.confidence == "estimate" else "")).upper())
         label.setObjectName("vitalLabel")
         v.addWidget(label)
 
-        value_text = _fmt(vital.value) if vital.available else "—"
+        value_text = (f"{vital.value:.1f}" if key == "temperature" else _fmt(vital.value)) if vital.available else "—"
         row = QtWidgets.QHBoxLayout()
         row.setSpacing(4)
         value = QtWidgets.QLabel(value_text)
@@ -1075,6 +1348,10 @@ class MainWindow(QtWidgets.QMainWindow):
         row.addStretch(1)
         v.addLayout(row)
 
+        if vital.at:
+            recorded = QtWidgets.QLabel(f"Recorded {vital.at:%d %b %H:%M}")
+            recorded.setObjectName("muted")
+            v.addWidget(recorded)
         v.addStretch(1)
 
         card.setToolTip(self._vital_tooltip(vital))
@@ -1458,27 +1735,24 @@ class MainWindow(QtWidgets.QMainWindow):
         row.addStretch(1)
         v.addLayout(row)
 
+        if session.get("quality") is not None:
+            v.addLayout(_chip_row((
+                ("SCORE", f"{session['quality']}"),
+                ("DEEP", _fmt_min(session.get("deep_min"))),
+                ("LIGHT", _fmt_min(session.get("light_min"))),
+                ("REM", _fmt_min(session.get("rem_min"))),
+                ("AWAKE", _fmt_min(session.get("awake_min"))),
+                ("EFFICIENCY", f"{session['efficiency']}%"
+                 if session.get("efficiency") is not None else "—"),
+            )))
         if summary is not None:
-            chips = QtWidgets.QHBoxLayout()
-            chips.setSpacing(26)
-            for label, val in (
+            v.addLayout(_chip_row((
                 ("AVG", f"{summary.avg_hr:.0f} bpm" if summary.avg_hr else "—"),
                 ("HRV", f"{summary.rmssd_ms:.0f} ms" if summary.rmssd_ms else "—"),
                 ("COVERAGE", f"{summary.coverage_pct:.0f}%"
                  if summary.coverage_pct is not None else "—"),
-            ):
-                cell = QtWidgets.QVBoxLayout()
-                cell.setSpacing(1)
-                num = QtWidgets.QLabel(val)
-                num.setObjectName("chipValue")
-                lab = QtWidgets.QLabel(label)
-                lab.setObjectName("statLabel")
-                cell.addWidget(num)
-                cell.addWidget(lab)
-                chips.addLayout(cell)
-            chips.addStretch(1)
-            v.addLayout(chips)
-        else:
+            )))
+        elif session.get("quality") is None:
             hint = QtWidgets.QLabel("No RRI beats recorded in this window.")
             hint.setObjectName("muted")
             v.addWidget(hint)
@@ -1521,9 +1795,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 name.setObjectName("chipValue")
                 row.addWidget(name)
                 row.addStretch(1)
-                meta = QtWidgets.QLabel(
-                    f"{when:%d %b, %H:%M} · {workout.get('size', 0):,} bytes"
-                    if when else f"{workout.get('size', 0):,} bytes")
+                meta = QtWidgets.QLabel(_workout_meta(workout))
                 meta.setObjectName("muted")
                 row.addWidget(meta)
                 v.addLayout(row)
@@ -1532,9 +1804,9 @@ class MainWindow(QtWidgets.QMainWindow):
             title.setObjectName("chipValue")
             v.addWidget(title)
             hint = QtWidgets.QLabel(
-                "This band's sync has only pushed RRI files so far. Record a "
-                "workout on the band and sync again; sport files will appear "
-                "here when the band sends them.")
+                "The band holds a workout only until one app syncs it. Keep "
+                "the phone's Bluetooth off after a walk, run or recorded "
+                "workout, then sync here.")
             hint.setObjectName("muted")
             hint.setWordWrap(True)
             v.addWidget(hint)
@@ -1571,61 +1843,54 @@ class MainWindow(QtWidgets.QMainWindow):
         return card
 
     def _tiles_section(self, metrics, start, end) -> QtWidgets.QWidget:
+        """A readable channel list; no interpolated miniature curves for codes."""
         host = QtWidgets.QWidget()
         grid = QtWidgets.QGridLayout(host)
         grid.setContentsMargins(0, 0, 0, 0)
-        grid.setSpacing(16)
+        grid.setSpacing(8)
         self.tiles_grid = grid
-        cols = _columns_for_width(self._content_width())
         for i, metric in enumerate(metrics):
-            tile = self._tile(metric, start, end)
-            self._tile_widgets.append(tile)
-            grid.addWidget(tile, i // cols, i % cols)
-        for c in range(cols):
-            grid.setColumnStretch(c, 1)
-        self._tile_cols = cols
+            row = self._tile(metric, start, end)
+            self._tile_widgets.append(row)
+            grid.addWidget(row, i, 0)
+        grid.setColumnStretch(0, 1)
+        self._tile_cols = 1
         return host
 
     def _tile(self, metric: str, start, end) -> QtWidgets.QWidget:
-        rows = self.store.samples(metric, start, end)
-        y = [v for _, v in rows]
+        rows = sorted(self.store.samples(metric, start, end), key=lambda r: r[0])
         unit = display_unit(metric)
         card = ClickableCard("tile")
-        card.setMinimumHeight(152)
         card.setAccessibleName(f"{display_name(metric)} channel, open details")
+        card.setFocusPolicy(QtCore.Qt.StrongFocus)
         card.clicked.connect(lambda _=None, m=metric: self._open_detail(m))
-        v = QtWidgets.QVBoxLayout(card)
-        v.setContentsMargins(18, 15, 18, 13)
-        v.setSpacing(4)
-
-        top = QtWidgets.QHBoxLayout()
+        layout = QtWidgets.QHBoxLayout(card)
+        layout.setContentsMargins(18, 14, 18, 14)
+        layout.setSpacing(16)
+        details = QtWidgets.QVBoxLayout()
         name = QtWidgets.QLabel(display_name(metric))
         name.setObjectName("tileName")
-        top.addWidget(name)
-        top.addStretch(1)
-        chev = QtWidgets.QLabel("›")
-        chev.setObjectName("chevron")
-        top.addWidget(chev)
-        v.addLayout(top)
-
-        value_row = QtWidgets.QHBoxLayout()
-        value_row.setSpacing(6)
-        big = QtWidgets.QLabel(_fmt(y[-1]) if y else "—")
-        big.setObjectName("tileValue")
-        value_row.addWidget(big, 0, QtCore.Qt.AlignBottom)
-        if unit and y:
-            u = QtWidgets.QLabel(unit)
-            u.setObjectName("tileUnit")
-            value_row.addWidget(u, 0, QtCore.Qt.AlignBottom)
-        value_row.addStretch(1)
-        v.addLayout(value_row)
-
-        hint = QtWidgets.QLabel(
-            f"{len(y)} reading{'' if len(y) == 1 else 's'}"
-            if y else "No readings in this period")
+        name.setWordWrap(True)
+        details.addWidget(name)
+        if rows:
+            when, value = rows[-1]
+            summary = f"Latest recorded · {when:%d %b, %H:%M} · {len(rows):,} readings"
+        else:
+            summary = "No readings in this period"
+        hint = QtWidgets.QLabel(summary)
         hint.setObjectName("muted")
-        v.addWidget(hint)
-        v.addWidget(_sparkline(rows, height=44))
+        hint.setWordWrap(True)
+        details.addWidget(hint)
+        layout.addLayout(details, 1)
+        value_text = _fmt(rows[-1][1]) if rows else "—"
+        if unit and rows:
+            value_text += f" {unit}"
+        value_label = QtWidgets.QLabel(value_text)
+        value_label.setStyleSheet("font-size: 18px; font-weight: 600;")
+        layout.addWidget(value_label)
+        arrow = QtWidgets.QLabel("›")
+        arrow.setObjectName("chevron")
+        layout.addWidget(arrow)
         return card
 
     def _chips(self, y) -> QtWidgets.QWidget:
@@ -1787,7 +2052,21 @@ class MainWindow(QtWidgets.QMainWindow):
         self.back_btn.setFocus(QtCore.Qt.OtherFocusReason)
 
     def _show_overview(self) -> None:
-        self.stack.setCurrentIndex(0)
+        self._show_home(self._home)
+
+    def _show_home(self, key: str) -> None:
+        """Switch between the Today page and the all-metrics overview."""
+        self._home = key
+        self.nav_tabs[key].setChecked(True)
+        if key == "today":
+            self.stack.setCurrentWidget(self.today)
+            self.today.refresh()
+        elif key == "settings":
+            self.stack.setCurrentWidget(self.settings_page)
+        else:
+            self.stack.setCurrentIndex(0)
+            QtCore.QTimer.singleShot(0, self._relayout_tiles)
+        self._show_day_nav()
 
     def _plot_detail(self) -> None:
         metric = self._detail_metric
@@ -1927,109 +2206,214 @@ class MainWindow(QtWidgets.QMainWindow):
     # -- menu-bar icon guide ---------------------------------------------
     def _build_guide(self) -> QtWidgets.QWidget:
         scroll, _inner, lay = self._make_page()
+        lay.setSpacing(18)
 
-        header = QtWidgets.QWidget()
-        h = QtWidgets.QHBoxLayout(header)
-        h.setContentsMargins(0, 0, 0, 0)
-        h.setSpacing(8)
         self.guide_back_btn = QtWidgets.QPushButton("‹  Back")
         self.guide_back_btn.setObjectName("backBtn")
         self.guide_back_btn.setCursor(QtCore.Qt.PointingHandCursor)
-        self.guide_back_btn.setFixedWidth(110)
-        self.guide_back_btn.setMinimumHeight(36)
+        self.guide_back_btn.setFixedWidth(96)
+        self.guide_back_btn.setMinimumHeight(34)
         self.guide_back_btn.setAccessibleName("Back to overview")
         self.guide_back_btn.clicked.connect(self._show_overview)
-        h.addWidget(self.guide_back_btn, 0, QtCore.Qt.AlignLeft)
-        h.addStretch(1)
-        center = QtWidgets.QVBoxLayout()
-        center.setSpacing(1)
+        lay.addWidget(self.guide_back_btn, 0, QtCore.Qt.AlignLeft)
+
         title = QtWidgets.QLabel("Menu-bar icon guide")
-        title.setObjectName("metricTitle")
-        title.setAlignment(QtCore.Qt.AlignCenter)
+        title.setObjectName("guideTitle")
         sub = QtWidgets.QLabel(
             "The Live HR app sits in the macOS menu bar and shows the band's "
             "state as a heart and a value.")
-        sub.setObjectName("rangeLabel")
-        sub.setAlignment(QtCore.Qt.AlignCenter)
+        sub.setObjectName("guideLead")
         sub.setWordWrap(True)
-        sub.setMinimumWidth(420)
-        center.addWidget(title)
-        center.addWidget(sub)
-        h.addLayout(center)
-        h.addStretch(1)
-        spacer = QtWidgets.QWidget()
-        spacer.setFixedWidth(110)
-        h.addWidget(spacer)
-        lay.addWidget(header)
+        head = QtWidgets.QVBoxLayout()
+        head.setSpacing(4)
+        head.addWidget(title)
+        head.addWidget(sub)
+        lay.addLayout(head)
 
         states = [
-            ("♥ 72", "guideGlyph",
+            ("♥ 72", True,
              "Connected — heart rate live",
              "The band is connected and a heart rate is being read (worn). "
              "The number is the current beats per minute."),
-            ("♡ ~", "guideGlyphMuted",
+            ("♡ ~", False,
              "Connected — no heart rate",
              "The band is connected but no heart rate is available: it may be "
              "off the wrist, removed, or the sensor has no reading yet."),
-            ("♡ —", "guideGlyphMuted",
+            ("♡ —", False,
              "Not connected",
              "The band is not connected: asleep or off its charger, out of "
              "range, or the phone is holding the BLE link."),
         ]
-        for glyph, glyph_obj, state, detail in states:
-            lay.addWidget(
-                self._guide_state_card(glyph, glyph_obj, state, detail))
+        row = QtWidgets.QHBoxLayout()
+        row.setSpacing(14)
+        for glyph, on, state, detail in states:
+            row.addWidget(self._guide_state_card(glyph, on, state, detail), 1)
+        lay.addLayout(row)
 
-        notes_label = QtWidgets.QLabel("NOTES")
-        notes_label.setObjectName("sectionLabel")
-        lay.addWidget(notes_label)
         notes = QtWidgets.QFrame()
-        notes.setObjectName("card")
+        notes.setObjectName("guideCard")
         nv = QtWidgets.QVBoxLayout(notes)
-        nv.setContentsMargins(20, 14, 20, 14)
-        nv.setSpacing(7)
-        for line in (
+        nv.setContentsMargins(22, 18, 22, 18)
+        nv.setSpacing(12)
+        heading = QtWidgets.QLabel("Good to know")
+        heading.setObjectName("guideState")
+        nv.addWidget(heading)
+        for i, line in enumerate((
             "The number is bpm — beats per minute.",
             "The app tries the realtime stream first; when that is unavailable "
             "or goes silent, it polls the confirmed 113 heart-rate series.",
             "A failed connection retries every 60 seconds.",
             "Run the menu-bar app with --lock-on-away to lock the Mac after "
             "the band disconnects.",
-        ):
+        ), 1):
+            r = QtWidgets.QHBoxLayout()
+            r.setSpacing(12)
+            num = QtWidgets.QLabel(str(i))
+            num.setObjectName("guideNum")
+            num.setAlignment(QtCore.Qt.AlignCenter)
             label = QtWidgets.QLabel(line)
-            label.setObjectName("muted")
+            label.setObjectName("guideBody")
             label.setWordWrap(True)
-            nv.addWidget(label)
+            r.addWidget(num, 0, QtCore.Qt.AlignTop)
+            r.addWidget(label, 1)
+            nv.addLayout(r)
         lay.addWidget(notes)
         lay.addStretch(1)
         return scroll
 
-    def _guide_state_card(self, glyph: str, glyph_obj: str, state: str,
+    def _guide_state_card(self, glyph: str, on: bool, state: str,
                           detail: str) -> QtWidgets.QWidget:
         card = QtWidgets.QFrame()
-        card.setObjectName("card")
+        card.setObjectName("guideCard")
         card.setAccessibleName(f"{state}: {glyph}")
-        h = QtWidgets.QHBoxLayout(card)
-        h.setContentsMargins(20, 14, 20, 14)
-        h.setSpacing(16)
+        v = QtWidgets.QVBoxLayout(card)
+        v.setContentsMargins(22, 20, 22, 22)
+        v.setSpacing(10)
         preview = QtWidgets.QLabel(glyph)
-        preview.setObjectName(glyph_obj)
-        preview.setFixedWidth(92)
-        preview.setMinimumHeight(46)
+        preview.setObjectName("guidePill")
+        preview.setProperty("on", "true" if on else "false")
         preview.setAlignment(QtCore.Qt.AlignCenter)
-        h.addWidget(preview)
-        v = QtWidgets.QVBoxLayout()
-        v.setSpacing(3)
+        v.addWidget(preview, 0, QtCore.Qt.AlignLeft)
+        v.addSpacing(4)
         state_label = QtWidgets.QLabel(state)
-        state_label.setObjectName("chipValue")
+        state_label.setObjectName("guideState")
+        state_label.setWordWrap(True)
         body = QtWidgets.QLabel(detail)
-        body.setObjectName("muted")
+        body.setObjectName("guideBody")
         body.setWordWrap(True)
         v.addWidget(state_label)
         v.addWidget(body)
-        h.addLayout(v, 1)
-        _add_shadow(card)
+        v.addStretch(1)
         return card
+
+    def _build_settings(self) -> QtWidgets.QWidget:
+        """Device details, pairing help, live menu-bar app, export, guide."""
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        host = QtWidgets.QWidget()
+        scroll.setWidget(host)
+        outer = QtWidgets.QVBoxLayout(host)
+        self._settings_layout = outer
+        outer.setSpacing(18)
+        title = QtWidgets.QLabel("Settings")
+        title.setObjectName("pageTitle")
+        outer.addWidget(title)
+
+        def section(name: str, note: str = "") -> QtWidgets.QVBoxLayout:
+            card = QtWidgets.QFrame()
+            card.setObjectName("settingsCard")
+            v = QtWidgets.QVBoxLayout(card)
+            v.setContentsMargins(24, 20, 24, 20)
+            v.setSpacing(10)
+            head = QtWidgets.QLabel(name)
+            head.setObjectName("settingsHead")
+            v.addWidget(head)
+            if note:
+                n = QtWidgets.QLabel(note)
+                n.setObjectName("settingsNote")
+                n.setWordWrap(True)
+                v.addWidget(n)
+            outer.addWidget(card)
+            return v
+
+        band = section("Band")
+        for caption, label in (("Model", self.dev_model), ("Firmware", self.dev_fw),
+                               ("Last sync", self.dev_sync)):
+            row = QtWidgets.QHBoxLayout()
+            cap = QtWidgets.QLabel(caption)
+            cap.setObjectName("settingsNote")
+            row.addWidget(cap)
+            row.addStretch(1)
+            row.addWidget(label)
+            band.addLayout(row)
+
+        pair = section("Connecting your band", (
+            "There is no pairing step. The app finds the band by name and "
+            "connects on its own whenever it is open."))
+        for i, step in enumerate((
+                "Turn your phone's Bluetooth off, or close NoiseFit — the band "
+                "talks to one device at a time.",
+                "Keep the band within a few metres of this PC, on your wrist or "
+                "on the charger. Either works.",
+                "If it is not found within a minute, set it on the charger for a "
+                "few seconds; that wakes its Bluetooth, then you can wear it "
+                "again.",
+                "Press Sync band: it stops anything else in this app that is "
+                "holding the band, then syncs.",
+                "Do not pair it in Windows Bluetooth settings; the app connects "
+                "directly."), 1):
+            lab = QtWidgets.QLabel(f"{i}.  {step}")
+            lab.setObjectName("settingsStep")
+            lab.setWordWrap(True)
+            pair.addWidget(lab)
+
+        live = section("Live heart rate in the menu bar", (
+            "Runs as a separate small app. While it is on, this window pauses "
+            "its own band connection, since the band accepts one connection."))
+        live.addWidget(self.live_btn, 0, QtCore.Qt.AlignLeft)
+
+        export = section("Export", "Save stored readings as CSV or JSON.")
+        export.addWidget(self.export_menu_btn, 0, QtCore.Qt.AlignLeft)
+
+        data = section("Your data", (
+            "Everything the band sends is saved on this PC in one SQLite file "
+            "and kept across restarts; nothing is uploaded. The band itself "
+            "only holds data until it is synced, so older days appear here "
+            "only from the first sync on."))
+        path = QtWidgets.QLabel(self.store.path)
+        path.setObjectName("settingValue")
+        path.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        path.setWordWrap(True)
+        data.addWidget(path)
+        open_btn = QtWidgets.QPushButton("Open folder")
+        open_btn.setCursor(QtCore.Qt.PointingHandCursor)
+        open_btn.clicked.connect(lambda: QtGui.QDesktopServices.openUrl(
+            QtCore.QUrl.fromLocalFile(os.path.dirname(self.store.path))))
+        data.addWidget(open_btn, 0, QtCore.Qt.AlignLeft)
+
+        guide = section("Menu-bar icon guide", "What each heart icon state means.")
+        guide.addWidget(self.guide_btn, 0, QtCore.Qt.AlignLeft)
+        outer.addStretch(1)
+        return scroll
+
+    def _crossfade_from_snapshot(self) -> None:
+        """Freeze the current look in an overlay, then fade it away."""
+        if not self.isVisible():
+            return
+        shot = QtWidgets.QLabel(self)
+        shot.setPixmap(self.grab())
+        shot.setGeometry(self.rect())
+        fx = QtWidgets.QGraphicsOpacityEffect(shot)
+        shot.setGraphicsEffect(fx)
+        shot.show()
+        shot.raise_()
+        fade = QtCore.QPropertyAnimation(fx, b"opacity", shot)
+        fade.setDuration(420)
+        fade.setStartValue(1.0)
+        fade.setEndValue(0.0)
+        fade.setEasingCurve(QtCore.QEasingCurve.InOutCubic)
+        fade.finished.connect(shot.deleteLater)
+        QtCore.QTimer.singleShot(0, fade.start)
 
     def _show_guide(self) -> None:
         self.stack.setCurrentWidget(self.guide_page)
@@ -2269,15 +2653,18 @@ class MainWindow(QtWidgets.QMainWindow):
             vital = analytics.vitals(self.store, start, end).get(key)
         except Exception:  # noqa: BLE001
             vital = None
-        rows = self.store.samples(guide["metric"], start, end)
+        rows = analytics.vital_series(self.store, key, start, end)
 
-        self.vital_detail_title.setText(guide["title"])
+        self.vital_detail_title.setText(vital.label if vital else guide["title"])
         self.vital_detail_sub.setText(self._range_caption())
         self.vital_detail_value.setText(
             _fmt(vital.value) if vital is not None and vital.available else "—")
         self.vital_detail_unit.setText(
             (vital.unit or "") if vital is not None and vital.available else "")
-        self.vital_meaning.setText(guide["meaning"])
+        provenance = (f"Source: {vital.source}. {vital.note or ''}" if vital else "")
+        self.vital_meaning.setText(provenance + "\n\n" + guide["meaning"])
+        if vital and vital.at:
+            self.vital_detail_sub.setText(self._range_caption() + f" · Recorded {vital.at:%d %b %H:%M}")
         self.vital_typical.setText(guide["typical"])
 
         self._clear_layout(self.vital_stat_row)
@@ -2296,6 +2683,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.vital_stat_row.addStretch(1)
 
         self.vital_chart.set_data(rows, vital.unit if vital else None)
+        self.vital_chart.getPlotItem().setTitle(
+            "5-minute RMSSD estimates · not official nightly HRV" if key == "hrv" and vital and vital.confidence == "estimate"
+            else "No samples synced for this period" if not rows else None)
         self.stack.setCurrentIndex(4)
 
     # -- stat row helpers ------------------------------------------------
@@ -2358,11 +2748,11 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             mode = "all"
         self._range_mode = mode
-        index = next((i for i, (m, _) in enumerate(RANGE_MODES) if m == mode), 0)
+        index = self.range_combo.findData(mode)
         self.range_combo.blockSignals(True)
         self.range_combo.setCurrentIndex(index)
         self.range_combo.blockSignals(False)
-        self.custom_row.setVisible(mode == "custom")
+        self.custom_row.hide()
         self._show_day_nav()
 
     def _default_day(self) -> None:
@@ -2393,10 +2783,10 @@ class MainWindow(QtWidgets.QMainWindow):
     def _refresh_device(self) -> None:
         d = self.store.device()
         self.dev_model.setText((d and d["model"]) or "Noise REP")
-        self.dev_fw.setText(f"FW {d['fw']}" if d and d["fw"] else "")
+        self.dev_fw.setText(d["fw"] if d and d["fw"] else "—")
         last = self.store.last_sync()
         if last:
-            self.dev_sync.setText(f"synced {_to_local(last['time']):%d %b, %H:%M}")
+            self.dev_sync.setText(f"{_to_local(last['time']):%d %b, %H:%M}")
         else:
             self.dev_sync.setText("never synced")
 
@@ -2411,7 +2801,7 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             self.status.setText(
                 "No sync yet — connect the band and press Sync.")
-        self.info_banner.show()
+        self._flash_info()
         self.error_banner.hide()
 
     def _refresh_header(self) -> None:
@@ -2422,11 +2812,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _greeting(self) -> str:
         hour = datetime.datetime.now().hour
-        if hour < 12:
+        if 5 <= hour < 12:
             return "Good morning."
-        if hour < 18:
+        if 12 <= hour < 17:
             return "Good afternoon."
-        return "Good evening."
+        if 17 <= hour < 21:
+            return "Good evening."
+        return "Good night."
 
     def _range(self):
         mode = self._range_mode
@@ -2475,22 +2867,68 @@ class MainWindow(QtWidgets.QMainWindow):
         return f"{start:%d %b} – {end:%d %b}"
 
     def _on_range_mode_changed(self, index: int) -> None:
-        self._range_mode = RANGE_MODES[max(0, index)][0]
-        self.custom_row.setVisible(self._range_mode == "custom")
+        mode = self.range_combo.itemData(index)
+        if mode is None:
+            return
+        if mode == "custom":
+            dialog = QtWidgets.QDialog(self)
+            dialog.setWindowTitle("Custom date range")
+            layout = QtWidgets.QFormLayout(dialog)
+            layout.setContentsMargins(24, 24, 24, 24)
+            start = QtWidgets.QDateEdit(self.date_from.date())
+            end = QtWidgets.QDateEdit(self.date_to.date())
+            for field in (start, end):
+                field.setCalendarPopup(True)
+                field.setDisplayFormat("dd MMM yyyy")
+            end.setMinimumDate(start.date())
+            start.dateChanged.connect(end.setMinimumDate)
+            layout.addRow("From", start)
+            layout.addRow("To", end)
+            buttons = QtWidgets.QDialogButtonBox(
+                QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+            buttons.accepted.connect(dialog.accept)
+            buttons.rejected.connect(dialog.reject)
+            layout.addRow(buttons)
+            if dialog.exec() != QtWidgets.QDialog.Accepted:
+                blocker = QtCore.QSignalBlocker(self.range_combo)
+                self.range_combo.setCurrentIndex(self.range_combo.findData(self._range_mode))
+                return
+            self.date_from.setDate(start.date())
+            self.date_to.setDate(end.date())
+        self._range_mode = mode
+        self.custom_row.hide()
         self._show_day_nav()
-        if self._range_mode == "custom":
-            self._sync_dates_to_bounds()
-        elif self._range_mode == "day":
-            self._default_day()
         self._refresh_header()
         self._populate_overview()
         if self._detail_metric:
             self._plot_detail()
 
     def _show_day_nav(self) -> None:
-        visible = self._range_mode == "day"
-        for widget in (self.prev_day_btn, self.day_date, self.next_day_btn):
-            widget.setVisible(visible)
+        day = self._range_mode == "day"
+        self.day_date.hide()
+        if hasattr(self, "ov_day_nav"):
+            self.ov_day_nav.set_day(
+                self.day_date.date().toPython() if day
+                else datetime.date.today() if self._range_mode == "today" else None)
+
+    def _overview_shift(self, delta: int) -> None:
+        """‹ Today › on Health Trends: step through single days."""
+        today = QtCore.QDate.currentDate()
+        if delta == 0:
+            target = today
+        else:
+            base = self.day_date.date() if self._range_mode == "day" else today
+            target = min(base.addDays(delta), today)
+        mode = "today" if target == today else "day"
+        self.day_date.setDate(target)
+        self._range_mode = mode
+        blocker = QtCore.QSignalBlocker(self.range_combo)
+        self.range_combo.setCurrentIndex(-1)
+        self._show_day_nav()
+        self._refresh_header()
+        self._populate_overview()
+        if self._detail_metric:
+            self._plot_detail()
 
     def _shift_day(self, delta: int) -> None:
         self.day_date.setDate(self.day_date.date().addDays(delta))
@@ -2512,15 +2950,76 @@ class MainWindow(QtWidgets.QMainWindow):
             self._plot_detail()
 
     def _show_all_data(self) -> None:
-        index = next(i for i, (m, _) in enumerate(RANGE_MODES) if m == "all")
+        index = self.range_combo.findData("all")
         self.range_combo.setCurrentIndex(index)
+
+    def _apply_gutter(self) -> None:
+        """Align the app bar and banners with the centred content column."""
+        width = self.width()
+        g = theme.page_gutter(self, width)
+        bar = max(26, min(g, (width - 1000) // 2))
+        self._bar_layout.setContentsMargins(bar, 10, max(bar, 128), 10)
+        self.window_controls.move(width - 118, 14)
+        self.window_controls.raise_()
+        self._banner_layout.setContentsMargins(g, 14, g, 0)
+        self._settings_layout.setContentsMargins(g, 30, g, 40)
+        if hasattr(self, "_trends_scroll"):
+            content_gutter = theme.page_gutter(self, self._trends_scroll.viewport().width())
+            self._trends_layout.setContentsMargins(content_gutter, 22, content_gutter, 36)
+
+    def _sync_theme_btn(self) -> None:
+        dark = theme.mode == "dark"
+        self.theme_btn.set_icon("sun" if dark else "moon")
+        self.theme_btn.setToolTip("Switch to the %s theme" % ("light" if dark else "dark"))
+
+    def _toggle_theme(self) -> None:
+        self.set_theme("light" if theme.mode == "dark" else "dark", save=True)
+
+    def set_theme(self, mode: str, save: bool = False) -> None:
+        """Switch light/dark everywhere, cross-fading from the old look."""
+        self._crossfade_from_snapshot()
+        theme.apply(mode)
+        app = QtWidgets.QApplication.instance()
+        app.setStyleSheet(theme.QSS)
+        self._sync_theme_btn()
+        old = self.today
+        showing = self.stack.currentWidget() is old
+        new = TodayPage(self.store, _profile_age(), on_open_metric=self._open_detail,
+                        cache=old._cache)
+        self.stack.insertWidget(self.stack.indexOf(old), new)
+        self.stack.removeWidget(old)
+        old.deleteLater()
+        self.today = new
+        if showing:
+            self.stack.setCurrentWidget(new)
+        new.refresh(animate=False)
+        if self._last_live is not None:
+            new.on_live(self._last_live)
+        for chart in self.findChildren(ChartView):
+            chart.retheme()
+        if save:
+            QtCore.QSettings("NoiseREP", "Sync").setValue("theme", mode)
+
+    def _toggle_maximized(self):
+        self.showNormal() if self.isMaximized() else self.showMaximized()
+
+    def changeEvent(self, event):  # noqa: N802
+        super().changeEvent(event)
+        if event.type() == QtCore.QEvent.WindowStateChange and hasattr(self, "maximize_button"):
+            label = "Restore" if self.isMaximized() else "Maximize"
+            self.maximize_button.setAccessibleName(label)
+            self.maximize_button.setToolTip(label)
+            self.maximize_button.update()
+            if hasattr(self, "today"):
+                self._apply_gutter()
+                self.today._apply_gutter()
+                self.today._relayout()
+                for page in self.findChildren(GutterScrollArea):
+                    page.sync_gutters()
 
     def resizeEvent(self, event):  # noqa: N802 - Qt override
         super().resizeEvent(event)
-        width = self.width()
-        self.dev_sync.setVisible(width >= 1000)
-        self.dev_fw.setVisible(width >= 900)
-        self.app_tag.setVisible(width >= 1040)
+        self._apply_gutter()
         self._resize_timer.start()
 
     def showEvent(self, event):  # noqa: N802 - Qt override
@@ -2535,52 +3034,163 @@ class MainWindow(QtWidgets.QMainWindow):
             root.setFocus(QtCore.Qt.OtherFocusReason)
 
     def _content_width(self) -> int:
-        # `stack.width()` can still be its pre-show hint width during the
-        # first populate; the window width is already authoritative.
-        return max(0, max(self.stack.width(), self.width() - 56) - 56)
+        width = self.width()
+        return max(0, width - 2 * theme.page_gutter(self, width))
 
     def _relayout_tiles(self) -> None:
-        # Keep the vitals/goal rows responsive even when there are no generic
-        # channel tiles to reflow.
+        # Channel rows remain full-width; vitals and goals still reflow.
+        self._apply_gutter()
         self._relayout_vitals()
         self._relayout_movement()
-        if self.tiles_grid is None or not self._tile_widgets:
-            return
-        cols = _columns_for_width(self._content_width())
-        if cols == self._tile_cols:
-            return
-        while self.tiles_grid.count():
-            self.tiles_grid.takeAt(0)
-        for c in range(3):
-            self.tiles_grid.setColumnStretch(c, 0)
-        for i, widget in enumerate(self._tile_widgets):
-            self.tiles_grid.addWidget(widget, i // cols, i % cols)
-        for c in range(cols):
-            self.tiles_grid.setColumnStretch(c, 1)
-        self._tile_cols = cols
 
     # ------------------------------------------------------------------
     # banner helpers
     # ------------------------------------------------------------------
-    def _launch_menubar(self) -> None:
-        """Open the separate menu-bar HR app, or say it is already running."""
-        if self._menubar_running():
-            self._set_status("Live HR is already in the menu bar (♥ icon).")
+    def _set_live_btn(self, active: bool, text: str | None = None) -> None:
+        self.live_btn.setText(text or ("● Live on" if active else "♥ Live"))
+        self.live_btn.setProperty("active", "true" if active else "false")
+        self.live_btn.style().unpolish(self.live_btn)
+        self.live_btn.style().polish(self.live_btn)
+        self.live_btn.setToolTip(
+            "Stop the menu-bar Live HR app and resume the in-app band link"
+            if active else
+            "Start live heart rate in the macOS menu bar (separate app; the "
+            "band accepts one central, so the in-app link pauses meanwhile)")
+        self.live_btn.setAccessibleName(
+            "Stop live heart rate in the menu bar" if active
+            else "Start live heart rate in the menu bar")
+
+    def _menubar_active(self) -> bool:
+        proc = self._menubar_proc
+        return proc is not None and proc.poll() is None
+
+    def _toggle_menubar(self) -> None:
+        """Start the menu-bar HR app (pausing our band link), or stop it."""
+        if self._menubar_active():
+            self._stop_menubar()
+        elif self._menubar_proc is None and self._menubar_running():
+            self._set_status("Live HR is already running outside this window; "
+                             "quit it from the menu bar first.")
+        elif self._menubar_proc is None:
+            self._set_live_btn(True, "Starting…")
+            self.live_btn.setEnabled(False)
+            self._release_link(self._start_menubar)
+
+    def _release_link(self, then) -> None:
+        """Cancel the in-app band link, then call ``then`` once it let go."""
+        task = self._link_task
+        if task is not None and task.done():
+            self._link_finished(task)
+        if self._cleanup_blocked:
+            self.live_btn.setEnabled(True)
+            self._set_live_btn(False)
+            self._show_error("Restart the app before opening another band connection; cleanup was incomplete.")
             return
+        if task is None or task.done():
+            self._link_task = None
+            return then()
+        self._set_band_state("idle", "Releasing the band…")
+        fired = []
+
+        def go(completed=None):
+            if not fired and not self._closing:
+                fired.append(1)
+                self._link_task = None
+                if completed is not None and not getattr(completed, "cancelled", lambda: False)():
+                    error = getattr(completed, "exception", lambda: None)()
+                    if error is not None:
+                        self.live_btn.setEnabled(True)
+                        self._set_live_btn(False)
+                        self._show_error(f"Could not release the old band connection: {error}")
+                        return
+                then()
+
+        task.add_done_callback(go)
+        # A timer must never create a second owner while teardown is pending.
+        def still_releasing():
+            if self._link_task is task and not task.done():
+                self._set_status("Still releasing the band; Live will start after cleanup.")
+        QtCore.QTimer.singleShot(5000, still_releasing)
+        task.cancel()
+
+    def _start_menubar(self) -> None:
+        self.live_btn.setEnabled(True)
         try:
-            proc = subprocess.Popen(
-                [sys.executable, "-m", "noiserep.cli", "menubar"],
+            self._menubar_proc = subprocess.Popen(
+                [sys.executable, "-m", "noiserep.cli", "menubar", "--db", self.store.path,
+                 "--parent-control"], stdin=subprocess.PIPE, text=True,
+                env={**os.environ, "NOISEREP_PARENT_GUI_PID": str(os.getpid())},
                 start_new_session=True)
         except OSError as exc:
+            self._set_live_btn(False)
             self._show_error(f"Could not open the menu-bar app: {exc}")
+            self.start_link()
             return
-        self._set_status(
-            "Live HR opened in the menu bar. It runs separately because the "
-            "band accepts one BLE central.")
-        # An import or tray failure kills the child within a second or two;
-        # say so instead of leaving the success message up.
-        QtCore.QTimer.singleShot(
-            3000, lambda: self._check_menubar_started(proc))
+        self._menubar_stopping = False
+        self._set_live_btn(True)
+        self._set_band_state("idle", "Paused · Live HR app has the band")
+        self._set_status("Live HR is running in the menu bar. The in-app band "
+                         "link is paused until you click Live again.")
+        self._menubar_poll.start()
+
+    def _free_band(self) -> bool:
+        """Request a graceful helper release; callers wait for process exit."""
+        if self._menubar_active():
+            self._stop_menubar()
+            return False
+        if self._menubar_running():
+            self._set_status("Live HR is running separately. Quit it from its tray menu before syncing.")
+            return False
+        return True
+
+    def _stop_menubar(self) -> None:
+        if self._menubar_stopping:
+            return
+        proc = self._menubar_proc
+        self._menubar_stopping = True
+        self.live_btn.setEnabled(False)
+        self._set_live_btn(True, "Stopping…")
+        try:
+            if proc is None or proc.stdin is None:
+                raise OSError("helper has no parent control channel")
+            proc.stdin.write("quit\n")
+            proc.stdin.flush()
+        except OSError as exc:
+            self._menubar_stopping = False
+            self.live_btn.setEnabled(True)
+            self._show_error(f"Could not request Live HR shutdown: {exc}. Quit it from the tray menu.")
+
+    def _poll_menubar(self) -> None:
+        proc = self._menubar_proc
+        if proc is None:
+            return
+        if proc.poll() is None:
+            from ..live import LiveSample
+            report = self.store.live()
+            if report is not None:
+                age = (datetime.datetime.now() - report["at"]).total_seconds()
+                if 0 <= age <= 45:
+                    self._on_live(LiveSample(**report))
+                else:
+                    self.today.live_hr.set(None)
+                    self.today.live_card.setToolTip("Waiting for a fresh reading from the band…")
+            return
+        self._menubar_poll.stop()
+        if getattr(proc, "stdin", None) is not None:
+            try:
+                proc.stdin.close()
+            except (OSError, ValueError):
+                pass  # an exited helper can leave buffered writes on the pipe
+        self._menubar_proc = None
+        if not getattr(self, "_menubar_stopping", False):
+            self._check_menubar_started(proc)
+        self.live_btn.setEnabled(True)
+        self._set_live_btn(False)
+        if self._closing:
+            self.close()
+            return
+        self._set_status("Live HR stopped; resuming the band link.")
+        self.start_link()
 
     def _check_menubar_started(self, proc) -> None:
         code = proc.poll()
@@ -2591,28 +3201,41 @@ class MainWindow(QtWidgets.QMainWindow):
 
     @staticmethod
     def _menubar_running() -> bool:
-        try:
-            proc = subprocess.run(
-                ["pgrep", "-f", "noiserep.cli menubar"],
-                capture_output=True)
-            return proc.returncode == 0
-        except OSError:
+        from .menubar import MENUBAR_LOCK
+        lock = QtCore.QLockFile(MENUBAR_LOCK)
+        lock.setStaleLockTime(0)
+        info = lock.getLockInfo()
+        if isinstance(info, tuple) and info[0] and info[1] == os.getpid():
+            return False  # a standalone helper can host its own main window
+        if lock.tryLock(0):
+            lock.unlock()
             return False
+        return True
+
+    def _flash_info(self, ms: int = 4500) -> None:
+        """Show the info banner briefly; status is never left on screen."""
+        timer = getattr(self, "_info_timer", None)
+        if timer is None:
+            timer = self._info_timer = QtCore.QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(self.info_banner.hide)
+        self.info_banner.show()
+        timer.start(ms)
 
     def _set_status(self, text: str) -> None:
         self.status.setText(text)
-        self.info_banner.show()
+        self._flash_info()
 
     def _show_error(self, message: str) -> None:
         self.error_text.setText(message)
         self.error_banner.setAccessibleName("Error: " + message)
         self.error_banner.show()
         self.info_banner.hide()
-        self.progress.hide()
+        self.sync_bar.finish(ok=False)
 
     def _clear_error(self) -> None:
         self.error_banner.hide()
-        self.info_banner.show()
+        self._flash_info()
 
     # ------------------------------------------------------------------
     # keyboard shortcuts
@@ -2660,21 +3283,137 @@ class MainWindow(QtWidgets.QMainWindow):
             f"Exported {count} rows to {os.path.basename(path)} · {fmt.upper()}")
 
     # ------------------------------------------------------------------
+    # live band link
+    # ------------------------------------------------------------------
+    def _set_band_state(self, kind: str, text: str) -> None:
+        self.band_state.setText(text)
+        self.band_dot.setProperty("state", kind)
+        self.band_dot.style().unpolish(self.band_dot)
+        self.band_dot.style().polish(self.band_dot)
+
+    def start_link(self) -> None:
+        """Keep the band connected for as long as the window is open."""
+        import asyncio
+        from ..live import keep_linked
+
+        if self._link_task is not None and self._link_task.done():
+            self._link_finished(self._link_task)
+            self._link_task = None
+        if self._cleanup_blocked:
+            self._show_error("Restart the app before retrying; the previous Bluetooth cleanup was incomplete.")
+            return
+        if self._link_task is not None:
+            return
+        if self._menubar_running():
+            self._set_band_state("idle", "Live HR app owns the band")
+            return
+        self._sync_now = asyncio.Event()
+        self._set_band_state("searching", "Searching for band…")
+        self._link_task = asyncio.ensure_future(keep_linked(
+            self.store, self.band_name, on_sample=self._on_live,
+            on_status=self._on_link_status, sync_now=self._sync_now,
+            on_history=self._after_history, on_progress=self._sync_progress))
+        self._link_task.add_done_callback(self._link_finished)
+
+    def _link_finished(self, task) -> None:
+        from ..errors import ConnectionCleanupError
+
+        if task.cancelled():
+            return
+        error = task.exception()
+        if isinstance(error, ConnectionCleanupError):
+            self._cleanup_blocked = True
+        if error is not None and not self._closing:
+            self._on_link_status(f"disconnected ({error}); band link stopped")
+            self._set_band_state("idle", "Band link stopped")
+            self._show_error(f"Band connection stopped: {error}")
+
+    def _on_link_status(self, text: str) -> None:
+        print(f"{datetime.datetime.now():%H:%M:%S} [band link] {text}", flush=True)
+        if text == "connected":
+            self._linked = True
+            self._set_band_state("live", "Connected")
+        elif text in ("connecting remembered band", "opening band services"):
+            self._set_band_state("searching", "Connecting to band…")
+        elif text.startswith("scanning") or text.startswith("direct reconnect failed"):
+            self._set_band_state("searching", "Looking for band…")
+            self.band_state.setToolTip(text)
+        elif text == "syncing history":
+            self._history_busy = True
+            self._set_band_state("live", "Syncing history…")
+            self._set_status("Syncing history from the band…")
+        elif text.startswith("disconnected"):
+            self._history_busy = False
+            self.sync_bar.finish(ok=False)
+            self._set_band_state("searching", "Band unavailable · retrying")
+            self.band_state.setToolTip(text)
+            self._set_status(text)
+            self._linked = False
+            self._last_live = None
+            self.today.live_hr.set(None)
+            self.today.live_spo2.set(None)
+            self.today.live_stress.set(None)
+            self.today.live_card.setToolTip(text)
+        elif text == "live":
+            self._history_busy = False
+        elif text.startswith("retrying in"):
+            self._set_status(text.capitalize())
+
+    def _on_live(self, sample) -> None:
+        self._last_live = sample
+        place = {"charging": ("charging", f"⚡ Charging · {sample.battery}%"),
+                 "wrist": ("live", f"On wrist · {sample.battery}%"),
+                 "off_wrist": ("idle", f"Off wrist · {sample.battery}%"),
+                 "unknown": ("live", f"Live · {sample.battery}%")}[sample.place]
+        self._set_band_state(*place)
+        self.today.on_live(sample)
+
+    def closeEvent(self, event) -> None:  # noqa: N802 - Qt API
+        """Disconnect the band before closing.
+
+        A link that is dropped without a clean disconnect makes the band
+        refuse the next connection until its supervision timeout passes.
+        """
+        if self._menubar_active():
+            event.ignore()
+            self._closing = True
+            self._stop_menubar()
+            return
+        task = self._link_task
+        if task is None or task.done():
+            return super().closeEvent(event)
+        event.ignore()
+        if self._closing:
+            return
+        self._closing = True
+        self._set_band_state("idle", "Disconnecting…")
+        task.add_done_callback(lambda _: self.close())
+        QtCore.QTimer.singleShot(15000, lambda: task.done() or self._shutdown_slow())
+        task.cancel()
+
+    def _shutdown_slow(self) -> None:
+        self._set_status("Waiting for Windows to release Bluetooth before closing…")
+
+    def _after_history(self) -> None:
+        self._refresh_device()
+        self._sync_dates_to_bounds()
+        self._refresh_header()
+        self._populate_overview()
+        if self._detail_metric:
+            self._plot_detail()
+        self.today.invalidate()
+        if self.stack.currentWidget() is self.today:
+            self.today.refresh(animate=False)
+        self._set_status("History synced from the band.")
+
+    # ------------------------------------------------------------------
     # sync
     # ------------------------------------------------------------------
     def _sync_progress(self, done: int, total: int, stage: str) -> None:
-        self._set_status(_STAGE_TEXT.get(stage, "Syncing…"))
-        if stage == "done":
-            self.progress.setRange(0, 1)
-            self.progress.setValue(1)
-        elif total > 0:
-            if self.progress.maximum() != total:
-                self.progress.setRange(0, total)
-            self.progress.setValue(done)
-            self._set_status(
-                f"{_STAGE_TEXT.get(stage, 'Syncing…')}  {done}/{total}")
-        else:
-            self.progress.setRange(0, 0)  # indeterminate / busy
+        text = _STAGE_TEXT.get(stage, "Syncing…")
+        self._set_status(f"{text}  {done}/{total}" if total > 0 and stage != "done"
+                         else text)
+        self.sync_bar.progress(done, total, stage)
 
     def _set_syncing(self, syncing: bool) -> None:
         self._syncing = syncing
@@ -2683,21 +3422,36 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sync_btn.setText("Syncing…" if syncing else "Sync band")
         self.empty_sync_btn.setText("Syncing…" if syncing else "Sync band")
         if syncing:
-            self.progress.show()
-            self.progress.setRange(0, 0)
+            self.sync_bar.begin()
         else:
-            self.progress.hide()
-
-    def _hide_progress(self) -> None:
-        if not self._syncing:
-            self.progress.hide()
+            self.sync_bar.finish(ok=self._sync_ok)
 
     @qasync.asyncSlot()
     async def _on_sync(self) -> None:
         if self._syncing:
             return
+        if not self._free_band():
+            return
+        if self._sync_now is not None:
+            # The link owns the band's one connection: (re)start it and
+            # have it sync right away.
+            if self._link_task is None or self._link_task.done():
+                self.start_link()
+                if self._cleanup_blocked:
+                    return
+            self._sync_now.set()
+            if getattr(self, "_linked", False):
+                self._set_status("Syncing…")
+            else:
+                self._set_status(
+                    "Waiting for the band — worn, it only announces itself "
+                    "every ~30 s, so connecting can take a minute. A few "
+                    "seconds on the charger wakes it at once. It syncs as "
+                    "soon as it connects.")
+            return
 
         self._clear_error()
+        self._sync_ok = False
         self._set_syncing(True)
         self._set_status("Scanning for band…")
         try:
@@ -2710,8 +3464,7 @@ class MainWindow(QtWidgets.QMainWindow):
             async with connect(self.band_name) as band:
                 result = await run_sync(band, since, progress=self._sync_progress)
             counts = self.store.ingest(result, note="gui sync")
-            self.progress.setRange(0, 1)
-            self.progress.setValue(1)
+            self._sync_ok = True
             self._clear_error()
             extra = ""
             if counts.get("rri"):
@@ -2742,24 +3495,41 @@ class MainWindow(QtWidgets.QMainWindow):
             self._show_error(message)
         finally:
             self._set_syncing(False)
-            QtCore.QTimer.singleShot(1600, self._hide_progress)
 
 
 def main(argv: list[str] | None = None) -> int:
     import asyncio
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(
         sys.argv if argv is None else argv)
+    from .branding import apply_app_icon
+    apply_app_icon(app)
     app.setApplicationName("NoiseREP Sync")
     app.setApplicationDisplayName("NoiseREP Sync")
+    saved = QtCore.QSettings("NoiseREP", "Sync").value("theme", "light")
+    theme.apply("dark" if saved == "dark" else "light")
     app.setStyleSheet(theme.QSS)
     loop = qasync.QEventLoop(app)
     asyncio.set_event_loop(loop)
+    lock = _take_single_instance()
     store = Store(default_db_path())
     app.aboutToQuit.connect(store.close)
     win = MainWindow(store)
+    win._instance_lock = lock
+    reloader = None
+    if "--reload" in (argv or []):
+        from .dev_reload import DevReloader
+        settings = QtCore.QSettings("NoiseREP", "Development")
+        geometry = settings.value("geometry")
+        if geometry is not None:
+            win.restoreGeometry(geometry)
+        win._show_home(settings.value("page", "today"))
+        reloader = DevReloader(win)
     win.show()
+    win.start_link()
     with loop:
         loop.run_forever()
+    if reloader is not None and reloader.requested:
+        _restart_gui(lock)
     return 0
 
 

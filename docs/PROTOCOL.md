@@ -100,6 +100,37 @@ around 15:15) plus the live captures. **likely** means the range, cadence and
 cross-metric behaviour agree but a vendor-app label has not been read side by
 side; ids without satisfactory evidence stay `metric_N` / "Channel N".
 
+**Superseded (2026-10-28):** the metric id is the vendor `SEFitnessFunctionType`
+enum, and each reply body is a vendor oneof message, both recovered from the
+NoiseFit APK's protobuf descriptors. `noiserep/protocol/metrics.py` and
+`decode.ARRAY_LAYOUT` are now the source of truth. Cadence = 86400 / count.
+
+| id | vendor type | body field, width | live range |
+|---:|---|---|---|
+| 0 | DAILY_DATA | f3 steps, f5 m, f7 total kcal, f15 active kcal (hourly u16-BE); totals f9/f10/f13 | totals match hourly sums |
+| 2 | CONTINUOUS_HEART_RATE | f3 u8 (30 s); f4 max, f5 min, f6 resting | 49-152 bpm |
+| 4 | CONTINUOUS_BLOOD_OXYGEN | f3 u8 (5 min) | 75-100 % |
+| 8 | CONTINUOUS_TEMPERATURE | f3 u16-BE /100 (5 min) | 30.9-33.8 °C |
+| 11 | EFFECTIVE_STANDING | f3 u8 hourly flags | 0/1 |
+| 12 | ACTIVITY_DURATION | f3 u8 hourly minutes | 13-20 |
+| 14 | GoMore overall-day movement | f2 u8 level (5 min); active = levels 1-3 | 1-5 |
+| 15 | GoMore sleep result | entry/exit epochs, stages, score, latency, efficiency | — |
+| 16 | GoMore naps | list of {asleep, wake, duration} | — |
+| 17 | GoMore health score | f2 score, f3 sedentary seconds | 75 |
+| 18 | GoMore activity indicator | f2 u8 codes (5 min), 0xff = none | 1-5 |
+| 19 | GoMore respiratory rate | f2 u8 (5 min) | 6-22 brpm |
+| 20 | GoMore auto workout | list of {walk/run, level, start, duration, steps, kcal} | — |
+| 21 | GoMore body battery | f3 u8 (15 min) | 69-97 |
+| 22 | GoMore stress | f3 u8 (5 min) | 5-61 |
+| 23 | band battery | f3 u8 hourly | 57-69 % |
+| 25 | post-workout HR | list of {start, data} | — |
+| 26 | sleep RRI | f2 bytes | empty |
+| 27 | sleep HRV | f2 u8 (30 s) | zero with no sleep |
+
+`115` is CONFIRM (the band may drop a confirmed record), so the sync confirms
+only records that arrived and decoded. `117` is GET_FITNESS_SPORT_ID_LIST
+(recorded workouts). The earlier inferred table, kept for history:
+
 | id | meaning | unit | cadence | evidence | confidence |
 |---:|---------|------|---------|----------|------------|
 | 0 | daily activity (composite) | — | 60 min | 24 hourly u16-BE values per channel: f3 sums to f9 (total steps), f7 to f10 (total calories), f15 to f13 (active minutes) | likely |

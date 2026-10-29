@@ -77,8 +77,8 @@ def test_legacy_metric_keys_are_migrated(tmp_path):
     s.close()
 
     s = Store(path)
-    assert s.metrics() == ["heart_rate_variability"]
-    assert [v for _, v in s.samples("heart_rate_variability")] == [70.0]
+    assert s.metrics() == ["body_battery"]
+    assert [v for _, v in s.samples("body_battery")] == [70.0]
     s.close()
 
 
@@ -87,12 +87,38 @@ def test_legacy_metric_migration_keeps_the_newer_row(tmp_path):
     s = Store(path)
     s._conn.execute("INSERT INTO samples(metric, ts, value) VALUES('metric_21', 1000, 1)")
     s._conn.execute("INSERT INTO samples(metric, ts, value) "
-                    "VALUES('heart_rate_variability', 1000, 2)")
+                    "VALUES('body_battery', 1000, 2)")
     s._conn.commit()
     s.close()
 
     s = Store(path)
-    assert [v for _, v in s.samples("heart_rate_variability")] == [2.0]
+    assert [v for _, v in s.samples("body_battery")] == [2.0]
+    s.close()
+
+
+def test_pre_schema_rows_are_fixed_once(tmp_path):
+    path = str(tmp_path / "v0.db")
+    s = Store(path)
+    s._conn.executescript(
+        "PRAGMA user_version=0;"
+        "INSERT INTO samples VALUES('heart_rate', 1000, 70);"
+        "INSERT INTO samples VALUES('heart_rate_variability', 1000, 80);"
+        "INSERT INTO samples VALUES('stress', 1005, 30);"
+        "INSERT INTO samples VALUES('active_minutes', 1000, 23);"
+        "INSERT INTO samples VALUES('metric_8', 1000, 12);")
+    s.close()
+
+    s = Store(path)
+    # Mis-timed series are dropped; f15 rows become active calories.
+    assert s.metrics() == ["active_calories", "heart_rate"]
+    # A real active-minutes row written after the fix must stay put.
+    s._conn.execute("INSERT INTO samples VALUES('active_minutes', 2000, 30)")
+    s._conn.commit()
+    s.close()
+
+    s = Store(path)
+    assert [v for _, v in s.samples("active_minutes")] == [30.0]
+    assert [v for _, v in s.samples("active_calories")] == [23.0]
     s.close()
 
 
